@@ -3674,7 +3674,7 @@ worker_process_notifyq(register struct worker *w)
 static int
 get_next_epoll_timeout_ms(struct worker *w)
 {
-	int64_t time_to_wait_us, expiry_us;
+	int64_t time_to_wait_us = 0, expiry_us = 0;
 	int time_to_wait_ms = TASK_DEFAULT_EPOLL_MS;
 	void *timer_node;
 
@@ -3707,14 +3707,15 @@ get_next_epoll_timeout_ms(struct worker *w)
 		}
 	}
 
+	// Only use timer-fd for time resolutions under 50ms
 	if (time_to_wait_ms > 0) {
-		if (time_to_wait_us > 0) {
+		if ((time_to_wait_us > 0) && (time_to_wait_us < 50000000)) {
 			if (w->tmfd >= 0) {
 				struct itimerspec expiry = {0};
 
-				expiry.it_value.tv_sec = (w->curtime_us + time_to_wait_us) / 1000000;
-				expiry.it_value.tv_nsec = ((w->curtime_us + time_to_wait_us) % 1000000) * 1000;
-				timerfd_settime(w->tmfd, TFD_TIMER_ABSTIME, &expiry, NULL);
+				expiry.it_value.tv_sec = time_to_wait_us / 1000000;
+				expiry.it_value.tv_nsec = (time_to_wait_us % 1000000) * 1000;
+				timerfd_settime(w->tmfd, 0, &expiry, NULL);
 			}
 		}
 	}

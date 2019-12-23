@@ -175,7 +175,7 @@ heap_detach(int (*cmp)(void *, void *), register struct heap *d)
 
 	// d->prev can never be NULL, since we are not the root node
 	// We can eliminate some checking for speed as a result
-	if (likely(d->sub != NULL)) {
+	if (unlikely(d->sub != NULL)) {
 		s = heap_merge_pairs(cmp, d->sub);
 		s->prev = d->prev;
 		if ((s->next = d->next))
@@ -185,7 +185,7 @@ heap_detach(int (*cmp)(void *, void *), register struct heap *d)
 			s->prev = d->prev;
 	}
 
-	if (unlikely(d->prev->sub == d))
+	if (d->prev->sub == d)
 		d->prev->sub = s;
 	else
 		d->prev->next = s;
@@ -391,23 +391,27 @@ pheap_detach_node(void *oph, void *opn)
 	register struct pheap *ph = (struct pheap *)oph;
 	register struct heap *pn = (struct heap *)opn;
 
-	if ((ph == NULL) || (pn == NULL))
-		return;
+	if (unlikely(ph == NULL))	return;
+	if (unlikely(pn == NULL))	return;
+	if (pn->prev)			goto pheap_do_detach;
+	if (unlikely(ph->root == pn))	goto pheap_do_detach;
+	if (unlikely(pn->sub != NULL))	goto pheap_do_detach;
+	if (unlikely(pn->next != NULL))	goto pheap_do_detach;
+	return;
 
-	if (pn->prev || (ph->root == pn) || pn->sub || pn->next) {
-		if (ph->root != pn) {		// Not Root
-			heap_detach(ph->cmp, pn);
-		} else if (pn->sub) {		// Is Root with children
-			ph->root = heap_merge_pairs(ph->cmp, pn->sub);
-		} else {			// Is Root without children
-			ph->root = NULL;
-		}
-
-		// Make sure pn references nothing else
-		pn->next = NULL;
-		pn->prev = NULL;
-		pn->sub = NULL;
+pheap_do_detach:
+	if (likely(ph->root != pn)) {		// Not Root
+		heap_detach(ph->cmp, pn);
+	} else if (pn->sub) {			// Is Root with children
+		ph->root = heap_merge_pairs(ph->cmp, pn->sub);
+	} else {				// Is Root without children
+		ph->root = NULL;
 	}
+
+	// Make sure pn references nothing else
+	pn->next = NULL;
+	pn->prev = NULL;
+	pn->sub = NULL;
 } // pheap_detach_node
 
 
@@ -419,18 +423,19 @@ pheap_attach_node(void *oph, void *opn)
 	register struct pheap *ph = (struct pheap *)oph;
 	register struct heap *pn = (struct heap *)opn;
 
-	if ((ph == NULL) || (pn == NULL))
-		return;
+	if (unlikely(ph == NULL)) return;
+	if (unlikely(pn == NULL)) return;
 
-	if (pn->prev || (ph->root == pn) || pn->sub || pn->next)
-		return;
+	if (pn->prev)		return;
+	if (ph->root == pn)	return;
+	if (pn->sub)		return;
+	if (pn->next)		return;
 
-	if (ph->root == NULL) {
+	if (likely(ph->root != NULL)) {
+		ph->root = heap_merge(ph->cmp, pn, ph->root);
+	} else {
 		ph->root = pn;
-		return;
 	}
-
-	ph->root = heap_merge(ph->cmp, pn, ph->root);
 } // pheap_attach_node
 
 
@@ -442,8 +447,8 @@ pheap_release_node(void *oph, void *opn)
 	register struct pheap *ph = (struct pheap *)oph;
 	register struct heap *pn = (struct heap *)opn;
 
-	if ((ph == NULL) || (pn == NULL))
-		return;
+	if (unlikely(ph == NULL)) return;
+	if (unlikely(pn == NULL)) return;
 
 	pheap_detach_node(ph, pn);
 	free(pn);
@@ -460,8 +465,9 @@ pheap_change_key(void *oph, void *opd, void *newkey)
 
 	// Don't try to modify an empty or non-existent heap
 	// Don't try to modify a NULL node
-	if (unlikely(oph == NULL) || unlikely(opd == NULL) || unlikely(ph->root == NULL))
-		return;
+	if (unlikely(oph == NULL))	return;
+	if (unlikely(opd == NULL))	return;
+	if (unlikely(ph->root == NULL))	return;
 
 	res = ph->cmp(newkey, pd->key);		// Record the key change type
 
@@ -471,8 +477,7 @@ pheap_change_key(void *oph, void *opd, void *newkey)
 	pd->key = newkey;
 
 	// Handle mega-easy key equivalence scenario
-	if (unlikely(res == 0))
-		return;
+	if (unlikely(res == 0))		return;
 
 	if (pd == ph->root) { 				// The node == root-node scenarios
 		if (unlikely(res < 0))			// Handle decrease key on root node
@@ -504,13 +509,17 @@ pheap_set_key(void *oph, void *opn, void *newkey)
 	register struct pheap *ph = (struct pheap *)oph;
 	register struct heap *pn = (struct heap *)opn;
 
-	if ((ph == NULL) || (pn == NULL))
-		return;
+	if (unlikely(ph == NULL)) return;
+	if (unlikely(pn == NULL)) return;
 
-	if (pn->prev || (ph->root == pn) || pn->sub || pn->next) {
-		return pheap_change_key(ph, pn, newkey);
-	}
+	if (pn->prev)		goto pheap_do_change_key;
+	if (ph->root == pn)	goto pheap_do_change_key;
+	if (pn->sub)		goto pheap_do_change_key;
+	if (pn->next)		goto pheap_do_change_key;
 	pn->key = newkey;
+	return;
+pheap_do_change_key:
+	pheap_change_key(ph, pn, newkey);
 } // pheap_set_key
 
 
@@ -520,8 +529,7 @@ pheap_set_data(void *opd, void *newdata)
 {
 	struct heap *pd = (struct heap *)opd;
 
-	if (pd)
-		pd->data = newdata;
+	if (likely(pd != NULL)) pd->data = newdata;
 } // pheap_set_data
 
 

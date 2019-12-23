@@ -76,7 +76,7 @@ typedef struct {
 
 static inline void spin_lock2(register int64_t volatile *p)
 {
-	while(!__sync_bool_compare_and_swap(p, 0, 1)) {
+	while(unlikely(!__sync_bool_compare_and_swap(p, 0, 1))) {
 		do {_mm_pause(); _mm_pause(); } while(*p);
 	}
 }
@@ -693,14 +693,14 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 	}
 
 	// Validate the flags if set
-	if (action == FLG_NONE) {	// Cannot have no flags set
+	if (unlikely(action == FLG_NONE)) {	// Cannot have no flags set
 		errno = EINVAL;
 		return NULL;
 	}
 
 	// Can't lookup more than one flag at once.  The correct procdure is to just
 	// pick one, look that up, and then set any others when the task is returned
-	if (__builtin_popcount((uint32_t)action) > 1) {
+	if (unlikely(__builtin_popcount((uint32_t)action) > 1)) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -731,25 +731,29 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 
 	// Set the thread IDs
 	__thr_task_id = t->worker->thr;
-	if(__thr_current_id == 0) {
+	if(unlikely(__thr_current_id == 0)) {
 		__thr_current_id = pthread_self();
 	}
 
-	if (unlikely(t->type != TASK_TYPE_TIMER)) {
+	if (likely(t->type != TASK_TYPE_TIMER)) {
 		if (unlikely(t->fd < 0)) {
 			task_unlock(t, action);
 			errno = EBADF;
 			return NULL;
 		}
-		if (unlikely(t->rd_shut) && unlikely((action == FLG_RD))) {
-			task_unlock(t, action);
-			errno = EPIPE;
-			return NULL;
+		if (unlikely(t->rd_shut)) {
+			if (action == FLG_RD) {
+				task_unlock(t, action);
+				errno = EPIPE;
+				return NULL;
+			}
 		}
-		if (unlikely(t->wr_shut) && unlikely((action == FLG_WR))) {
-			task_unlock(t, action);
-			errno = EPIPE;
-			return NULL;
+		if (unlikely(t->wr_shut)) {
+			if (unlikely(action == FLG_WR)) {
+				task_unlock(t, action);
+				errno = EPIPE;
+				return NULL;
+			}
 		}
 	}
 
@@ -3206,8 +3210,8 @@ worker_check_timeouts(struct worker *w)
 		}
 
 		if (likely(expiry_us > w->curtime_us)) {
-			// We'll assume that 1 event takes 10us to process on average
-			w->processed_tc = w->processed_total + ((expiry_us - w->curtime_us) / 50);
+			// We'll assume that 1 event takes 100us to process on average
+			w->processed_tc = w->processed_total + ((expiry_us - w->curtime_us) / 100);
 			break;
 		}
 
@@ -3433,7 +3437,7 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 static void
 worker_do_timeout_check(struct worker *w)
 {
-	if (++w->processed_total < w->processed_tc) {
+	if (likely(++w->processed_total < w->processed_tc)) {
 		return;
 	}
 
@@ -3444,15 +3448,15 @@ worker_do_timeout_check(struct worker *w)
 		timer_node = (void *)pheap_get_min_node(w->timer_queue, (void **)&expiry_us, NULL);
 		w->curtime_us = get_time_us(TASK_TIME_PRECISE);
 
-		if(timer_node == NULL) {
+		if(unlikely(timer_node == NULL)) {
 			w->processed_tc = UINT64_MAX;
 			return;
 		}
 
 		time_to_wait_us = expiry_us - w->curtime_us;
 		if (time_to_wait_us > 0) {
-			// We'll assume that 1 event takes 10us to process on average
-			w->processed_tc = w->processed_total + (time_to_wait_us / 50);
+			// We'll assume that 1 event takes 100us to process on average
+			w->processed_tc = w->processed_total + (time_to_wait_us / 100);
 			return;
 		}
 
@@ -3477,8 +3481,8 @@ worker_process_notifyq(register struct worker *w)
 		return;
 	}
 
-	if (unlikely(TAILQ_EMPTY(&w->notifyq))) {
-		if (TAILQ_EMPTY(&w->notifyq_locked)) {
+	if (TAILQ_EMPTY(&w->notifyq)) {
+		if (likely(TAILQ_EMPTY(&w->notifyq_locked))) {
 			return;		// Nothing to do
 		}
 	}
@@ -3589,13 +3593,13 @@ worker_process_notifyq(register struct worker *w)
 		// It's a change action from here on.  Process the action we got
 
 		// IO actions are usually the most common. Test for them first
-		if (action == FLG_RD) {
-			task_handle_io_event(t, FLG_RD);	// Releases the task lock
+		if (action == FLG_WR) {
+			task_handle_io_event(t, FLG_WR);	// Releases the task lock
 			continue;
 		}
 
-		if (action == FLG_WR) {
-			task_handle_io_event(t, FLG_WR);	// Releases the task lock
+		if (action == FLG_RD) {
+			task_handle_io_event(t, FLG_RD);	// Releases the task lock
 			continue;
 		}
 
@@ -3686,7 +3690,7 @@ get_next_epoll_timeout_ms(struct worker *w)
 	w->curtime_us = get_time_us(TASK_TIME_PRECISE);
 	worker_check_timeouts(w);
 
-	if(timer_node != NULL) {
+	if(likely(timer_node != NULL)) {
 		time_to_wait_us = expiry_us - w->curtime_us;
 		if (time_to_wait_us <= 0) {
 			time_to_wait_ms = 0;
@@ -3804,7 +3808,12 @@ worker_do_io_epoll(register struct worker *w)
 	// Determine the initial time we want to be waiting in epoll for
 	wait_time = get_next_epoll_timeout_ms(w);
 	while (true) {
-		if (w->notifyqlen > TASK_MAX_EVENTS) {
+		if (unlikely(w->notifyqlen > 0)) {
+			// Prevent queue jumping
+			do_direct = false;
+		}
+		if (unlikely(w->notifyqlen_locked > 0)) {
+			// Prevent queue jumping
 			do_direct = false;
 		}
 
@@ -3843,7 +3852,7 @@ worker_do_io_epoll(register struct worker *w)
 			worker_do_timeout_check(w);
 
 			// Handle non-IO items first
-			if (tfd < 0) {
+			if (unlikely(tfd < 0)) {
 				if (tfd == (int64_t)TFD_NONE) {
 					worker_handle_event(w, revents);
 				}

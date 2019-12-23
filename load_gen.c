@@ -73,7 +73,9 @@ loadgen_read_cb(int64_t tfd, void *buf, ssize_t result, void *user_data)
 		if (errno == ETIMEDOUT) {
 			fprintf(stderr, "Reads starving on tfd=%ld.  Shutting connection down\n", (tfd & 0xffffffff));
 		} else {
-			perror("loadgen_read");
+			if (errno != EOWNERDEAD) {
+				perror("loadgen_read");
+			}
 		}
 		TASK_close(tfd);
 		return;
@@ -126,7 +128,9 @@ loadgen_write_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 			ioctl(fd, TIOCOUTQ, &out);
 			fprintf(stderr, "Writes blocked on tfd=%ld.  Shutting connection down.  InQ=%d, OutQ=%d\n", (tfd & 0xffffffff), in, out);
 		} else {
-			perror("loadgen_read");
+			if (errno != EOWNERDEAD) {
+				perror("loadgen_write");
+			}
 		}
 		TASK_close(tfd);
 		return;

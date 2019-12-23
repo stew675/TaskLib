@@ -58,7 +58,9 @@ write_done_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 		} else {
 //			perror("TASK_socket_write");
 		}
-		TASK_close(tfd);
+		if (TASK_close(tfd) < 0) {
+			perror("TASK_close");
+		}
 		return;
 	}
 
@@ -81,7 +83,9 @@ read_done_cb(int64_t tfd, void *buf, ssize_t result, void *user_data)
 		} else {
 //			perror("TASK_socket_read");
 		}
-		TASK_close(tfd);
+		if (TASK_close(tfd) < 0) {
+			perror("TASK_close");
+		}
 		return;
 	} else if (result == 0) {
 		return;		// It's queued.  Just return
@@ -285,7 +289,7 @@ main(int argc, const char *argv[])
 		return 1;
 	}
 
-	if ((task_instance = TASK_instance_create(0, 0, max_conns, 0)) < 0) {
+	if ((task_instance = TASK_instance_create(0, 0, max_conns, 128 * 1024)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

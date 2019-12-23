@@ -741,7 +741,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 	}
 
 	if (likely(t->type != TASK_TYPE_TIMER)) {
-		if (unlikely(t->fd < 0)) {
+		if (unlikely(t->fd < 0) && (action != FLG_CL)) {
 			task_unlock(t, action);
 			errno = EBADF;
 			return NULL;
@@ -2409,6 +2409,11 @@ task_create_event_flag(register struct task *t)
 static inline int
 task_raise_event_flag(struct task *t, uint32_t flags)
 {
+	if (t->rd_shut && t->wr_shut) {
+		errno = EPIPE;
+		return -1;
+	}
+
 	t->ev.events |= flags;
 
 	if (likely(t->ev.data.u64 != TFD_NONE)) {
@@ -3061,8 +3066,8 @@ sock_set_sndbuf(int sock)
 	// that the TCP stack doesn't go into hysteresis with huge numbers of clients
 	if (sndbuf_size > 524288) {
 		sndbuf_size = 524288;
-	} else if (sndbuf_size < 65536) {
-		sndbuf_size = 65536;
+	} else if (sndbuf_size < 32768) {
+		sndbuf_size = 32768;
 	}
 	return setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
 } // sock_set_sndbuf
@@ -3894,32 +3899,32 @@ worker_do_io_epoll(register struct worker *w)
 
 			// Handle ERROR/HUP events first
 			if (unlikely(unlikely(!!(revents & EPOLLERR)) || unlikely(!!(revents & EPOLLHUP)))) {
-				bool do_shut = true;
-
 				// Shutdown both connection sides and force an IO event
 				// which should make a system call to detect what happened
 				t->rd_shut = true;
 				t->wr_shut = true;
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
+				epoll_ctl(w->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 				if (t->active_flags & FLG_RD) {
-					do_shut = false;
-					task_notify_action(t, FLG_RD);
+					task_handle_io_event(t, FLG_RD);	// Releases the task
+					continue;
 				}
 				if (t->active_flags & FLG_WR) {
-					do_shut = false;
-					task_notify_action(t, FLG_WR);
+					task_handle_io_event(t, FLG_WR);	// Releases the task
+					continue;
 				}
-				if (do_shut) {
-					task_do_close_cb(t, FLG_NONE);
-				} else {
-					task_unlock(t, FLG_NONE);
-				}
+				task_do_close_cb(t, FLG_PW);
 				continue;
 			}
 
 			// Handle RDHUP case now
 			if (unlikely(!!(revents & EPOLLRDHUP))) {
 				t->rd_shut = true;
+				if (t->active_flags & FLG_RD) {
+					task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
+					task_handle_io_event(t, FLG_RD);	// Releases the task
+					continue;
+				}
 				task_lower_event_flag(t, EPOLLIN);
 				revents &= ~(EPOLLRDHUP);
 				if (revents == 0) {

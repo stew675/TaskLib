@@ -224,7 +224,7 @@ loadgen_connect(struct loadgen *lg)
 
 
 #define RESPAWN_PERIOD_US	20000		// 20000us = 20ms
-#define MAX_SPAWN_PER_LOOP	20		// (1000ms / 20ms) * 20 => 1000TPS maximum
+#define MAX_SPAWN_PER_LOOP	10		// (1000ms / 20ms) * 10 => 500TPS maximum
 
 static void
 loadgen_start(int64_t tfd, int64_t lateness_us, void *user_data)
@@ -404,7 +404,9 @@ main(int argc, const char *argv[])
 	}
 
 	fprintf(stderr, "Generating Load for %u clients\n", maxgens);
-	if ((task_instance = TASK_instance_create(0, 0, maxgens, 0)) < 0) {	// Max 1GB of TCP out buffer
+
+	uint64_t tcp_mem = 536870912 / maxgens;
+	if ((task_instance = TASK_instance_create(0, 0, maxgens, tcp_mem)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

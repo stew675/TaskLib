@@ -2592,23 +2592,27 @@ task_write_vector(struct task *t, bool queued)
 		if (written < 0) {
 			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
-				if (queued) {
-					// Write is still active, don't disable its reference
-					task_unlock(t, FLG_NONE);
+				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
+					if (queued) {
+						// Write is still active, don't disable its reference
+						task_unlock(t, FLG_NONE);
+					}
+					errno = 0;
+					return 0;
 				}
-				return 0;
 			}
 
 			if (errno == EINTR) {
 				continue;
 			}
 
-			t->cb_errno = errno;
 			// Some other write or event flag raising error.  Inform caller
 			if (t->wrv_bufpos > 0) {
 				// If we had written something before the error.  Inform caller of how
 				// much that was.  They'll have to catch the error on their next write
+				errno = 0;
 				if (queued) {
+					t->cb_errno = 0;
 					task_do_writev_cb(t, (ssize_t)t->wrv_bufpos);	// Unlocks task
 					return 0;
 				}
@@ -2632,9 +2636,11 @@ task_write_vector(struct task *t, bool queued)
 
 	// We wrote it all.  Make the callback
 	if (queued) {
+		t->cb_errno = 0;
 		task_do_writev_cb(t, (ssize_t)t->wrv_bufpos);	// Unlocks task
 		return 0;
 	}
+	errno = 0;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 	return (ssize_t)t->wrv_bufpos;
 } // task_write_vector
@@ -2688,6 +2694,7 @@ task_write_buffer(struct task *t, bool queued)
 						// Write is still active, don't disable its reference
 						task_unlock(t, FLG_NONE);
 					}
+					errno = 0;
 					return 0;
 				}
 			}
@@ -2697,11 +2704,12 @@ task_write_buffer(struct task *t, bool queued)
 			}
 
 			// Some other write or event flag raising error.  Inform caller
-			t->cb_errno = errno;
 			if (t->wr_bufpos > 0) {
 				// If we had written something before the error.  Inform caller of how
 				// much that was.  They'll have to catch the error on their next write
+				errno = 0;
 				if (queued) {
+					t->cb_errno = 0;
 					task_do_write_cb(t, (ssize_t)t->wr_bufpos);	// Unlocks task
 					return 0;
 				}
@@ -2726,9 +2734,11 @@ task_write_buffer(struct task *t, bool queued)
 
 	// We read it all.  Make the callback
 	if (queued) {
+		t->cb_errno = 0;
 		task_do_write_cb(t, (ssize_t)t->wr_bufpos);	// Unlocks task
 		return 0;
 	}
+	errno = 0;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 	return (ssize_t)t->wr_bufpos;
 } // task_write_buffer
@@ -2755,7 +2765,6 @@ task_handle_connect_event(struct task *t)
 	// Turn task into a regular IO task and make callback
 	t->type = TASK_TYPE_IO;
 	t->cb_errno = err;
-	errno = 0;
 
 	if (err != 0) {
 		task_do_connect_cb(t, -1);		// Unlocks task
@@ -2783,8 +2792,6 @@ task_read_vector(struct task *t, bool queued)
 	// Read what we can
 	while (t->rdv_bufpos < t->rdv_buflen) {
 		ssize_t reddin;
-
-		t->cb_errno = 0;
 
 		if (t->rdv_bufpos > 0) {
 			struct iovec iov[IOV_MAX];
@@ -2824,9 +2831,11 @@ task_read_vector(struct task *t, bool queued)
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (t->rdv_bufpos > 0) {
 					if (queued) {
+						t->cb_errno = 0;
 						task_do_readv_cb(t, (ssize_t)t->rdv_bufpos);	// Unlocks task
 						return 0;
 					}
+					errno = 0;
 					t->rd_state = TASK_READ_STATE_IDLE;
 					return (ssize_t)t->rdv_bufpos;
 				}
@@ -2861,9 +2870,11 @@ task_read_vector(struct task *t, bool queued)
 			// condition will have to get picked up on the next read attempt
 			if (t->rdv_bufpos > 0) {
 				if (queued) {
+					t->cb_errno = 0;
 					task_do_readv_cb(t, (ssize_t)t->rdv_bufpos);	// Unlocks task
 					return 0;
 				}
+				errno = 0;
 				t->rd_state = TASK_READ_STATE_IDLE;
 				return (ssize_t)t->rdv_bufpos;
 			}
@@ -2874,6 +2885,7 @@ task_read_vector(struct task *t, bool queued)
 				task_do_readv_cb(t, -1);	// Unlocks task
 				return 0;
 			}
+			errno = EPIPE;
 			t->rd_state = TASK_READ_STATE_IDLE;
 			return -1;
 		}
@@ -2884,9 +2896,11 @@ task_read_vector(struct task *t, bool queued)
 
 	// We read it all.  Make the callback
 	if (queued) {
+		t->cb_errno = 0;
 		task_do_readv_cb(t, (ssize_t)t->rdv_bufpos);	// Unlocks task
 		return 0;
 	}
+	errno = 0;
 	t->rd_state = TASK_READ_STATE_IDLE;
 	return (ssize_t)t->rdv_bufpos;
 } // task_read_vector
@@ -2940,9 +2954,11 @@ task_read_buffer(struct task *t, int queued)
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (t->rd_bufpos > 0) {
 					if (queued) {
+						t->cb_errno = 0;
 						task_do_read_cb(t, (ssize_t)t->rd_bufpos);	// Unlocks task
 						return 0;
 					}
+					errno = 0;
 					t->rd_state = TASK_READ_STATE_IDLE;
 					return (ssize_t)t->rd_bufpos;
 				}
@@ -2961,8 +2977,8 @@ task_read_buffer(struct task *t, int queued)
 			}
 
 			// Some other read or event flag raise error.
-			t->cb_errno = errno;
 			if (queued) {
+				t->cb_errno = errno;
 				task_do_read_cb(t, -1);	// Unlocks task
 				return 0;
 			}
@@ -2979,9 +2995,11 @@ task_read_buffer(struct task *t, int queued)
 			// condition will have to get picked up on the next read attempt
 			if (t->rd_bufpos > 0) {
 				if (queued) {
+					t->cb_errno = 0;
 					task_do_read_cb(t, (ssize_t)t->rd_bufpos);	// Unlocks task
 					return 0;
 				}
+				errno = 0;
 				t->rd_state = TASK_READ_STATE_IDLE;
 				return (ssize_t)t->rd_bufpos;
 			}
@@ -3004,9 +3022,11 @@ task_read_buffer(struct task *t, int queued)
 
 	// We read it all.  Make the callback
 	if (queued) {
+		t->cb_errno = 0;
 		task_do_read_cb(t, t->rd_bufpos);		// Unlocks task
 		return 0;
 	}
+	errno = 0;
 	t->rd_state = TASK_READ_STATE_IDLE;
 	return (ssize_t)t->rd_bufpos;
 } // task_read_buffer

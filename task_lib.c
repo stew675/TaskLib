@@ -43,7 +43,6 @@
 #define TASK_MAX_IO_DEPTH	2			// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768			// The maximum amount that may be read/written in one go
 #define TASK_MAX_EVENTS		128			// Usually enough for most things
-#define TASK_MAX_NOTIFIES	(TASK_MAX_EVENTS << 4)	// The number of notifyq events we'll process in one go
 #define TASK_MAX_EPOLL_WAIT_MS	500			// Wait at most for 500ms per epoll_wait() call to keep times fresh
 #define TASK_DEFAULT_EPOLL_MS	500			// Default to wait for 500ms per epoll_wait() call
 #define TASK_LISTEN_BACKLOG	((int)1024)		// System auto-truncates it to system limit anyway
@@ -2935,12 +2934,12 @@ task_read_buffer(struct task *t, int queued)
 		reddin = read(t->fd, t->rd_buf + t->rd_bufpos, to_read);
 		if (unlikely(reddin < 0)) {
 			// We read until we're blocked.
+			t->cb_errno = 0;
 			if (errno == EAGAIN) {
 				// Make a callback now if we got anything at all
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (t->rd_bufpos > 0) {
 					if (queued) {
-						t->cb_errno = errno;
 						task_do_read_cb(t, (ssize_t)t->rd_bufpos);	// Unlocks task
 						return 0;
 					}
@@ -2962,8 +2961,8 @@ task_read_buffer(struct task *t, int queued)
 			}
 
 			// Some other read or event flag raise error.
+			t->cb_errno = errno;
 			if (queued) {
-				t->cb_errno = errno;
 				task_do_read_cb(t, -1);	// Unlocks task
 				return 0;
 			}
@@ -3521,11 +3520,7 @@ worker_process_notifyq(register struct worker *w)
 		register bool locked;
 		register task_action_flag_t action;
 
-		if (likely(num_processed < TASK_MAX_NOTIFIES)) {
-			num_processed++;
-		} else {
-			break;
-		}
+		num_processed++;
 
 		worker_do_timeout_check(w);
 
@@ -3537,7 +3532,6 @@ worker_process_notifyq(register struct worker *w)
 		tq->action = FLG_NONE;
 		tq->locked = false;
 		TAILQ_INSERT_TAIL(&freeq, tq, list);
-
 
 		t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
 

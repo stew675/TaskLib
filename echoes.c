@@ -289,7 +289,8 @@ main(int argc, const char *argv[])
 		return 1;
 	}
 
-	if ((task_instance = TASK_instance_create(0, 0, max_conns, 128 * 1024)) < 0) {
+	uint64_t tcp_mem = 335544320 / max_conns;	// 320M
+	if ((task_instance = TASK_instance_create((get_nprocs_conf() / 2), 0, max_conns, tcp_mem)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

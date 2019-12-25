@@ -81,15 +81,14 @@ loadgen_read_cb(int64_t tfd, void *buf, ssize_t result, void *user_data)
 		return;
 	}
 
-	pthread_spin_lock(receive_lock);
+	ck_pr_add_64(&total_received, result);
 	lg->received += result;
-	total_received += result;
-	pthread_spin_unlock(receive_lock);
-
-	if (lg->done && (lg->delivered == lg->received)) {
-		// We're done
-		TASK_close(lg->tfd);
-		return;
+	if (lg->done) {
+		if (lg->delivered == lg->received) {
+			// We're done
+			TASK_close(lg->tfd);
+			return;
+		}
 	}
 
 	// Go back to the beginning
@@ -136,11 +135,8 @@ loadgen_write_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 		return;
 	}
 
-	pthread_spin_lock(deliver_lock);
+	ck_pr_add_64(&total_deliver, result);
 	lg->delivered += result;
-	total_deliver += result;
-	pthread_spin_unlock(deliver_lock);
-
 	loadgen_start_wr(lg);
 } // loadgen_write_cb
 
@@ -149,17 +145,12 @@ static void
 loadgen_start_wr(struct loadgen *lg)
 {
 	ssize_t result;
-	uint64_t amount_left;
-	int wr_size = 0;
+	size_t wr_size = 0;
 
-	amount_left = deliver_size - lg->delivered;
-	if (amount_left > BUFLEN) {
+	wr_size = deliver_size - lg->delivered;
+	if (wr_size > BUFLEN) {
 		wr_size = BUFLEN;
-	} else {
-		wr_size = (int)amount_left;
-	}
-
-	if (wr_size == 0) {
+	} else if (wr_size == 0) {
 		lg->done = 1;
 		return;
 	}
@@ -405,8 +396,8 @@ main(int argc, const char *argv[])
 
 	fprintf(stderr, "Generating Load for %u clients\n", maxgens);
 
-	uint64_t tcp_mem = 536870912 / maxgens;
-	if ((task_instance = TASK_instance_create(0, 0, maxgens, tcp_mem)) < 0) {
+	uint64_t tcp_mem = 335544320 / maxgens;		// 320M
+	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, maxgens, tcp_mem)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

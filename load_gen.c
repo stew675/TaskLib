@@ -397,9 +397,7 @@ main(int argc, const char *argv[])
 
 	fprintf(stderr, "Generating Load for %u clients\n", maxgens);
 
-	uint64_t tcp_mem = 536870912 / maxgens;		// 512M
-	tcp_mem = 98304;
-	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, maxgens, tcp_mem)) < 0) {
+	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, maxgens, 98304)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

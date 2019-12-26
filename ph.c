@@ -377,7 +377,7 @@ pheap_node_attached(void *oph, void *opn)
 	register struct pheap *ph = (struct pheap *)oph;
 	register struct heap *pn = (struct heap *)opn;
 
-	if (pn->prev || (ph->root == pn) || pn->sub || pn->next)
+	if (pn->prev || (ph->root == pn))
 		return 1;
 	return 0;
 } // pheap_node_attached
@@ -395,8 +395,6 @@ pheap_detach_node(void *oph, void *opn)
 	if (unlikely(pn == NULL))	return;
 	if (pn->prev)			goto pheap_do_detach;
 	if (unlikely(ph->root == pn))	goto pheap_do_detach;
-	if (unlikely(pn->sub != NULL))	goto pheap_do_detach;
-	if (unlikely(pn->next != NULL))	goto pheap_do_detach;
 	return;
 
 pheap_do_detach:
@@ -428,8 +426,6 @@ pheap_attach_node(void *oph, void *opn)
 
 	if (pn->prev)		return;
 	if (ph->root == pn)	return;
-	if (pn->sub)		return;
-	if (pn->next)		return;
 
 	if (likely(ph->root != NULL)) {
 		ph->root = heap_merge(ph->cmp, pn, ph->root);
@@ -514,8 +510,6 @@ pheap_set_key(void *oph, void *opn, void *newkey)
 
 	if (pn->prev)		goto pheap_do_change_key;
 	if (ph->root == pn)	goto pheap_do_change_key;
-	if (pn->sub)		goto pheap_do_change_key;
-	if (pn->next)		goto pheap_do_change_key;
 	pn->key = newkey;
 	return;
 pheap_do_change_key:

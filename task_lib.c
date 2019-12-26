@@ -3161,6 +3161,22 @@ sock_set_sndbuf(int sock)
 } // sock_set_sndbuf
 
 
+static int
+sock_set_rcvbuf(int sock)
+{
+	int rcvbuf_size = __thr_current_instance->per_task_sndbuf;
+
+	// Placing an upper limit of 1MB on outgoing buffer size appears to ensure
+	// that the TCP stack doesn't go into hysteresis with huge numbers of clients
+	if (rcvbuf_size > (TASK_MAX_IO_UNIT * 32)) {
+		rcvbuf_size = (TASK_MAX_IO_UNIT * 32);
+	} else if (rcvbuf_size < TASK_MAX_IO_UNIT) {
+		rcvbuf_size = TASK_MAX_IO_UNIT;
+	}
+	return setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+} // sock_set_rcvbuf
+
+
 static inline int
 sock_set_linger(int sock, int on_or_off)
 {
@@ -3235,6 +3251,7 @@ task_handle_accept_event(struct task *t)
 		sock_set_nonblocking(cfd);
 		sock_set_nodelay(cfd);
 		sock_set_sndbuf(cfd);
+		sock_set_rcvbuf(cfd);
 		sock_set_linger(cfd, 0);
 
 		// Inherit the close callback from the accept task until the user sets their
@@ -5392,6 +5409,7 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 	sock_set_nonblocking(sock);
 	sock_set_nodelay(sock);
 	sock_set_sndbuf(sock);
+	sock_set_rcvbuf(sock);
 
 	// task_create() will return the task as already locked
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, false)) == NULL) {
@@ -5453,6 +5471,7 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 	sock_set_nonblocking(sock);
 	sock_set_nodelay(sock);
 	sock_set_sndbuf(sock);
+	sock_set_rcvbuf(sock);
 
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, true)) == NULL) {
 		return -1;
@@ -5767,7 +5786,6 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	struct instance *i = NULL;
 	int num_io_to_spawn = 0;
 
-fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
 	pthread_mutex_lock(&creation_lock);
 	do {
 		struct sigaction sa[1];

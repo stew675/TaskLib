@@ -1,3 +1,5 @@
 Library To Do List
 
-Done for now
+UDP Support
+Async DNS Lookups via UDP/TCP
+Auto-spawning a blocking thread to handle blocking IO

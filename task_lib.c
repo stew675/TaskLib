@@ -42,10 +42,10 @@
 
 #define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768				// The maximum amount that may be read/written in one go
-#define TASK_MAX_EVENTS		256				// Usually enough for most things
+#define TASK_MAX_EVENTS		1024				// More than this impacts CPU cache lines negatively
 #define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
-#define	TASK_MAX_TFD_LOCKS	256				// Number of TFD spinlocks in an instance's lock pool
+#define	TASK_MAX_TFD_LOCKS	253				// Number of TFD spinlocks in an instance's lock pool
 
 // I highly recommend NOT fiddling with the COLT1 value unless you understand what it will impact
 #define	WORKER_TIME_COLT1	4500000				// 4s (expressed in microseconds)
@@ -3946,17 +3946,15 @@ worker_do_io_epoll(register struct worker *w)
 {
 	struct epoll_event events[TASK_MAX_EVENTS];
 	register int wait_time = 0, nfds = TASK_MAX_EVENTS;
-	bool do_direct = true;
+	register bool do_direct = true;
 
 	// Determine the initial time we want to be waiting in epoll for
 	wait_time = get_next_epoll_timeout_ms(w);
 	while (true) {
-		if (unlikely(w->notifyqlen > 0)) {
-			// Prevent queue jumping
-			do_direct = false;
-		}
-		if (unlikely(w->notifyqlen_locked > 0)) {
-			// Prevent queue jumping
+		// Disable direct callbacks if notifyq's are too long
+		// It's not essential here to get an exact notifyqlen_locked
+		// value, which is why we don't atomically examine it
+		if ((w->notifyqlen + w->notifyqlen_locked) > TASK_MAX_EVENTS) {
 			do_direct = false;
 		}
 
@@ -3979,8 +3977,8 @@ worker_do_io_epoll(register struct worker *w)
 			break;
 		}
 
-		// Quick load check.  If there's too much going on just
-		// queue the events, otherwise, do direct callbacks
+		// Quick load check.  If there's too much going on just put the events
+		// directly onto the notify queue, otherwise, make direct callbacks
 		if (nfds == TASK_MAX_EVENTS) {
 			do_direct = false;
 		}
@@ -4123,6 +4121,8 @@ worker_loop_io(void *arg)
 #else
 		worker_do_io_epoll(w);
 #endif
+		// Call it twice, because first pass can generate events
+		worker_process_notifyq(w);
 		worker_process_notifyq(w);
 	}
 

@@ -42,7 +42,7 @@
 
 #define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768				// The maximum amount that may be read/written in one go
-#define TASK_MAX_EVENTS		512				// Usually enough for most things
+#define TASK_MAX_EVENTS		256				// Usually enough for most things
 #define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
 #define	TASK_MAX_TFD_LOCKS	256				// Number of TFD spinlocks in an instance's lock pool
@@ -3782,17 +3782,29 @@ worker_process_notifyq(register struct worker *w)
 		assert(0);
 	}
 
+	w->notifyqlen -= num_processed;
+
 	// Concat any remainder back to the actual lists
-	if (likely(tq == NULL)) {
-		w->notifyqlen = 0;
-	} else {
-		w->notifyqlen -= num_processed;
+	if (likely(tq != NULL)) {
 		TAILQ_CONCAT(&w->notifyq, &notifyq, list);
 	}
 
 	if (likely(!TAILQ_EMPTY(&freeq))) {
 		TAILQ_CONCAT(&w->freeq, &freeq, list);
 	}
+
+// Uncomment the following definition to turn on notifyqlen validation
+//#define VALIDATE_QLEN
+#ifdef VALIDATE_QLEN
+	uint64_t actual_len = 0;
+	TAILQ_FOREACH(tq, &w->notifyq, list) {
+		actual_len++;
+	}
+
+	if(actual_len > 0)
+		fprintf(stderr, "Actual Length = %lu\n", actual_len);
+	assert(w->notifyqlen == actual_len);
+#endif
 } // worker_process_notifyq
 
 

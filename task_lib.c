@@ -37,7 +37,7 @@
 #define USE_EPOLLET
 #define USE_EPOLLONESHOT
 
-// Uncomment the following to turn on using pthread spinlocks for TFD table locking
+// Uncomment the following to turn on using pthread spinlocks for TFD table and worker locking
 //#define USE_PTHREAD_SPINLOCKS
 
 #define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
@@ -362,10 +362,16 @@ struct worker {
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
 	void				*work_cb_data;
 
-	pthread_spinlock_t		spinlock;
 	struct instance			*instance;
 	TAILQ_ENTRY(worker)		list;
-};
+
+	// Put this all by itself at the end
+#ifdef USE_PTHREAD_SPINLOCKS
+	pthread_spinlock_t		spinlock;
+#else
+__attribute__ ((aligned(64))) spin_lock_t lock[1];
+#endif
+}  __attribute__ ((aligned(64)));
 
 // The ordering of these tasks states is important
 typedef enum {
@@ -586,14 +592,22 @@ get_time_us(time_precision_t prec)
 static inline void
 worker_lock(struct worker *w)
 {
+#ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_lock(&w->spinlock);
+#else
+	spin_lock(w->lock[0]);
+#endif
 } // worker_lock
 
 
 static inline void
 worker_unlock(struct worker *w)
 {
+#ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_unlock(&w->spinlock);
+#else
+	spin_unlock(w->lock[0]);
+#endif
 } // worker_lock
 
 
@@ -2161,7 +2175,9 @@ worker_destroy(struct worker *w)
 	}
 #endif
 
+#ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_destroy(&w->spinlock);
+#endif
 	free(w);
 	w = NULL;
 } // worker_destroy
@@ -2760,8 +2776,8 @@ task_write_buffer(register struct task *t, register bool queued)
 	// Keep trying to write until we're done, or we're blocked
 	t->cb_errno = 0;
 	while (t->wr_bufpos < t->wr_buflen) {
-		size_t to_write;
-		ssize_t written;
+		register size_t to_write;
+		register ssize_t written;
 
 		// Restrict the amount that can be written in one go for fairness
 		if (max_can_do == 0) {
@@ -3020,8 +3036,8 @@ task_read_buffer(register struct task *t, register int queued)
 	// Read what we can
 	t->cb_errno = 0;
 	while (t->rd_bufpos < t->rd_buflen) {
-		size_t to_read;
-		ssize_t reddin;
+		register size_t to_read;
+		register ssize_t reddin;
 
 		// Restrict the amount that can be read in one go for fairness
 		if (max_can_do == 0) {
@@ -4030,7 +4046,6 @@ worker_do_io_epoll(register struct worker *w)
 			// Handle accepts directly, no queueing
 			if (unlikely((t->active_flags & FLG_LI) != 0)) {
 				assert(revents == EPOLLIN);
-				task_lower_event_flag(t, EPOLLIN);
 				task_handle_io_event(t, FLG_RD);
 				continue;
 			}
@@ -4238,7 +4253,11 @@ worker_create(struct instance *i, int worker_type)
 	w->type = worker_type;
 	w->affined_cpu = -1;
 	w->curtime_us = get_time_us(TASK_TIME_PRECISE);
+#ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_init(&w->spinlock, PTHREAD_PROCESS_PRIVATE);
+#else
+	spin_init(w->lock[0]);
+#endif
 	TAILQ_INIT(&w->notifyq_locked);
 	TAILQ_INIT(&w->freeq_locked);
 	TAILQ_INIT(&w->notifyq);

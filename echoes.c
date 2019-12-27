@@ -19,6 +19,7 @@ static void start_read(struct echo *e);
 
 static int32_t task_instance = 0;
 static uint32_t	num_conns = 0, total_conns = 0, max_conns = 100;
+static int run_time = 0;
 
 struct sockaddr_storage acpt_storage[MAX_ADDRS];
 struct sockaddr_in *    acpt_addrs[MAX_ADDRS];
@@ -212,12 +213,25 @@ echoes_start(int64_t tfd, int64_t lateness_us, void *user_data)
 } // echoes_start
 
 
+static void
+done_hammer_cb(int64_t tfd, int64_t lateness_us, void *user_data)
+{
+        (void)tfd;
+        (void)lateness_us;
+        (void)user_data;
+
+        fprintf(stderr, "RUN TIME REACHED!  SHUTTING DOWN!\n");
+        TASK_instance_shutdown(task_instance, NULL, NULL);
+        exit(0);
+} // done_hammer_cb
+
+
 // Parses the command line to set up the configuration for the acceptor
 #define WORKER_STATE_SPEC_LEN		1024
 static void
 parse_acceptor_args(int argc, const char *argv[])
 {
-	int is_listen = false, is_numclients = false;
+	int is_listen = false, is_numclients = false, is_runtime = false;
 
 	for(int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-l") == 0) {
@@ -227,6 +241,18 @@ parse_acceptor_args(int argc, const char *argv[])
 
 		if (strcmp(argv[i], "-n") == 0) {
 			is_numclients = true;
+			continue;
+		}
+
+		if (strcmp(argv[i], "-t") == 0) {
+			is_runtime = true;
+			continue;
+		}
+
+		if (is_runtime) {
+			is_runtime = false;
+			run_time = atoi(argv[i]);
+			run_time = run_time * 1000000;
 			continue;
 		}
 
@@ -303,6 +329,13 @@ main(int argc, const char *argv[])
 	if (TASK_timeout_create(task_instance, 0, NULL, ticker_cb) < 0) {
 		perror("TASK_timeout_set");
 	}
+
+        // Create big hammer timeout
+        if (run_time > 0) {
+                if (TASK_timeout_create(task_instance, run_time, NULL, done_hammer_cb) < 0) {
+                        perror("TASK_timeout_set");
+                }
+        }
 
 	// Set it off
 	TASK_instance_start(task_instance);

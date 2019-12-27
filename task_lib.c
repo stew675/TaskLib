@@ -42,10 +42,10 @@
 
 #define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768				// The maximum amount that may be read/written in one go
-#define TASK_MAX_EVENTS		128				// Usually enough for most things
+#define TASK_MAX_EVENTS		512				// Usually enough for most things
 #define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
-#define	TASK_MAX_TFD_LOCKS	73				// Number of TFD spinlocks in an instance's lock pool
+#define	TASK_MAX_TFD_LOCKS	256				// Number of TFD spinlocks in an instance's lock pool
 
 // I highly recommend NOT fiddling with the COLT1 value unless you understand what it will impact
 #define	WORKER_TIME_COLT1	4500000				// 4s (expressed in microseconds)

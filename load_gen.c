@@ -129,7 +129,6 @@ loadgen_write_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 		} else {
 			if (errno != EOWNERDEAD) {
 				perror("loadgen_write");
-				assert(0);
 			}
 		}
 		TASK_close(tfd);
@@ -397,7 +396,7 @@ main(int argc, const char *argv[])
 
 	fprintf(stderr, "Generating Load for %u clients\n", maxgens);
 
-	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, maxgens, 98304)) < 0) {
+	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, maxgens, 131072)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

@@ -40,6 +40,11 @@
 // Uncomment the following to turn on using pthread spinlocks for TFD table and worker locking
 //#define USE_PTHREAD_SPINLOCKS
 
+// Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
+// be logged to __thr_current_instance->stragglers, which allows us to attach a debugger and
+// quickly find any active TFD's within the pool that probably should not still be active
+//#define TFD_POOL_DEBUG
+
 #define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768				// The maximum amount that may be read/written in one go
 #define TASK_MAX_EVENTS		1024				// More than this impacts CPU cache lines negatively
@@ -108,31 +113,34 @@ typedef enum {
 
 // The ordering of these tasks states is important
 typedef enum {
-	TASK_STATE_CREATED,		// Just created
+	TASK_STATE_UNUSED = 0,		// Idle
 	TASK_STATE_ACTIVE,		// In the FD table
 	TASK_STATE_DESTROY,		// Waiting for worker to kill it
-	TASK_STATE_UNUSED = INT32_MAX	// Not attached to anything
+	TASK_STATE_MAX = INT32_MAX	// Force 32-bit size
 } task_state_t;
 
 typedef enum {
-	TASK_TYPE_IO = 0,
-	TASK_TYPE_TIMER = 1,
-	TASK_TYPE_CONNECT = 2,
-	TASK_TYPE_ACCEPT_PARENT = 3,
-	TASK_TYPE_ACCEPT_CHILD = 4,
-	TASK_TYPE_NONE = INT32_MAX
+	TASK_TYPE_NONE = 0,
+	TASK_TYPE_IO = 1,
+	TASK_TYPE_TIMER = 2,
+	TASK_TYPE_CONNECT = 3,
+	TASK_TYPE_ACCEPT_PARENT = 4,
+	TASK_TYPE_ACCEPT_CHILD = 5,
+	TASK_TYPE_MAX = INT32_MAX
 } task_type_t;
 
 typedef enum {
-	TASK_READ_STATE_VECTOR = 0,
-	TASK_READ_STATE_BUFFER = 1,
-	TASK_READ_STATE_IDLE = INT32_MAX
+	TASK_READ_STATE_IDLE = 0,
+	TASK_READ_STATE_VECTOR = 1,
+	TASK_READ_STATE_BUFFER = 2,
+	TASK_READ_STATE_MAX = INT32_MAX
 } task_rd_state_t;
 
 typedef enum {
-	TASK_WRITE_STATE_VECTOR = 0,
-	TASK_WRITE_STATE_BUFFER = 1,
-	TASK_WRITE_STATE_IDLE = INT32_MAX
+	TASK_WRITE_STATE_IDLE = 0,
+	TASK_WRITE_STATE_VECTOR = 1,
+	TASK_WRITE_STATE_BUFFER = 2,
+	TASK_WRITE_STATE_MAX = INT32_MAX
 } task_wr_state_t;
 
 enum {
@@ -447,6 +455,10 @@ __attribute__ ((aligned(64))) spin_lock_t tfd_locks[TASK_MAX_TFD_LOCKS];
 	int				num_blocking_workers;
 	int				num_blocking_idle;
 
+#ifdef TFD_POOL_DEBUG
+#define NUM_STRAGGLERS 50
+	uint32_t			stragglers[NUM_STRAGGLERS];
+#endif
 	void				(*shutdown_cb)(intptr_t ti, void *shutdown_data);
 	void				*shutdown_data;
 };
@@ -506,10 +518,7 @@ task_dump(struct task *t)
 	}
 	switch (t->state) {
 	case	TASK_STATE_UNUSED:
-		fprintf(stderr, "LIMBO\n");
-		break;
-	case	TASK_STATE_CREATED:
-		fprintf(stderr, "CREATED\n");
+		fprintf(stderr, "UNUSED\n");
 		break;
 	case	TASK_STATE_ACTIVE:
 		fprintf(stderr, "ACTIVE\n");
@@ -1321,11 +1330,12 @@ static int
 instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 {
 	uint32_t n;
-	// Don't allow less than 200 tfd entries for pool size
-	pool_size = (pool_size < 200) ? 200 : pool_size;
+	// Don't allow less than 250 tfd entries for pool size
+	pool_size = (pool_size < 250) ? 250 : pool_size;
 
-	// Make actual pool size be 140% of what was asked for hashing efficiency
-	pool_size *= 1.4;
+	// Make actual pool size be 130% of what was asked for hashing efficiency
+	pool_size += 200;	// To allow for any listener and timer tasks
+	pool_size *= 1.3;
 
 	i->tfd_pool_used = 0;
 	i->tfd_pool_size = pool_size;
@@ -2427,7 +2437,7 @@ task_activate_wr_timeout(register struct task *t)
 		return;
 	}
 
-	worker_timer_update(w, &t->rd_tt, t->tfd);
+	worker_timer_update(w, &t->wr_tt, t->tfd);
 	if (likely(t->wr_tt.expiry_us >= 0)) {
 		t->active_flags |= FLG_WT;
 	} else {
@@ -3097,8 +3107,8 @@ task_read_buffer(register struct task *t, register int queued)
 
 		// End of file response check
 		if (unlikely(reddin == 0)) {
-			t->rd_shut = true;
 			task_lower_event_flag(t, EPOLLIN);	// Ensure poll event flag is lowered
+			t->rd_shut = true;
 
 			// Notify first if we have anything in the buffer.  The actual EOF
 			// condition will have to get picked up on the next read attempt
@@ -3616,6 +3626,24 @@ worker_process_notifyq(register struct worker *w)
 	register struct ntfyq *tq;
 	struct ntfyq_list notifyq, freeq;
 
+#ifdef TFD_POOL_DEBUG
+	// Update straggler debug list
+	if (w == w->instance->instance_worker) {
+		uint32_t n, k;
+		struct instance *i = w->instance;
+
+		for (n = 0; n < NUM_STRAGGLERS; n++) i->stragglers[n] = UINT32_MAX;
+		for (n = 0, k = 0; k < i->tfd_pool_size; k++) {
+			if (i->tfd_pool[k].type == TASK_TYPE_IO) {
+				i->stragglers[n++] = k;
+				if (n == NUM_STRAGGLERS)
+					break;
+			}
+		}
+	}
+#endif
+
+
 	// Process nothing if we're shutting down
 	// Everything will get cleaned up when the worker shuts down
 	if ((__thr_current_instance->state > INSTANCE_STATE_RUNNING) || (w->state > WORKER_STATE_RUNNING)) {
@@ -4043,7 +4071,7 @@ worker_do_io_epoll(register struct worker *w)
 					task_handle_io_event(t, FLG_RD);	// Releases the task
 					continue;
 				}
-				task_lower_event_flag(t, EPOLLIN);
+				task_lower_event_flag(t, EPOLLRDHUP);
 				revents &= ~(EPOLLRDHUP);
 				if (revents == 0) {
 					task_unlock(t, FLG_NONE);
@@ -4905,6 +4933,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	t->wr_state = TASK_WRITE_STATE_VECTOR;
 	t->wrv_cb = wrv_cb;
 	t->wr_cb_data = wr_cb_data;
+	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
 
 	// Check if we can call the writev handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -4913,7 +4942,11 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 
 			t->io_depth++;
 			if ((result = task_write_vector(t, false)) == 0) {
-				goto TASK_socket_writev_queued;
+				task_unlock(t, FLG_NONE);
+				return 0;
+			}
+			if (result > 0) {
+				t->wr_total += result;
 			}
 			task_unlock(t, FLG_WR);
 			return result;
@@ -4930,9 +4963,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		return -1;
 	}
 
-TASK_socket_writev_queued:
 	// The operation is queued.  Update the timeout, unlock the task and go
-	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
 	task_unlock(t, FLG_NONE);
 	return 0;
 } // TASK_socket_writev
@@ -4980,6 +5011,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	t->wr_buflen = buflen;
 	t->wr_cb = wr_cb;
 	t->wr_cb_data = wr_cb_data;
+	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
 
 	// Check if we can call the write handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -4988,7 +5020,11 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 
 			t->io_depth++;
 			if ((result = task_write_buffer(t, false)) == 0) {
-				goto TASK_socket_write_queued;
+				task_unlock(t, FLG_NONE);
+				return 0;
+			}
+			if (result > 0) {
+				t->wr_total += result;
 			}
 			task_unlock(t, FLG_WR);
 			return result;
@@ -5005,9 +5041,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		return -1;
 	}
 
-TASK_socket_write_queued:
 	// The operation is queued.  Update the timeout, unlock the task and go
-	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
 	task_unlock(t, FLG_NONE);
 	return 0;
 } // TASK_socket_write
@@ -5070,6 +5104,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	t->rd_state = TASK_READ_STATE_VECTOR;
 	t->rdv_cb = rdv_cb;
 	t->rd_cb_data = rd_cb_data;
+	task_socket_update_timeout(expires_in_us, &t->rd_tt.expiry_us);
 
 	// Check if we can call the readv handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -5078,7 +5113,11 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 
 			t->io_depth++;
 			if ((result = task_read_vector(t, false)) == 0) {
-				goto TASK_socket_readv_queued;
+				task_unlock(t, FLG_NONE);
+				return 0;
+			}
+			if (result > 0) {
+				t->rd_total += result;
 			}
 			task_unlock(t, FLG_RD);
 			return result;
@@ -5095,9 +5134,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		return -1;
 	}
 
-TASK_socket_readv_queued:
 	// The operation is queued.  Update the timeout, unlock the task and go
-	task_socket_update_timeout(expires_in_us, &t->rd_tt.expiry_us);
 	task_unlock(t, FLG_NONE);
 	return 0;
 } // TASK_socket_readv
@@ -5144,6 +5181,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	t->rd_buflen = buflen;
 	t->rd_cb = rd_cb;
 	t->rd_cb_data = rd_cb_data;
+	task_socket_update_timeout(expires_in_us, &t->rd_tt.expiry_us);
 
 	// Check if we can call the read handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -5152,7 +5190,11 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 
 			t->io_depth++;
 			if ((result = task_read_buffer(t, false)) == 0) {
-				goto TASK_socket_read_queued;
+				task_unlock(t, FLG_NONE);
+				return 0;
+			}
+			if (result > 0) {
+				t->rd_total += result;
 			}
 			task_unlock(t, FLG_RD);
 			return result;
@@ -5169,9 +5211,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		return -1;
 	}
 
-TASK_socket_read_queued:
 	// The operation is queued.  Update the timeout, unlock the task and go
-	task_socket_update_timeout(expires_in_us, &t->rd_tt.expiry_us);
 	task_unlock(t, FLG_NONE);
 	return 0;
 } // TASK_socket_read

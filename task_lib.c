@@ -29,10 +29,6 @@
 #include "ph.h"
 #include "task_lib.h"
 
-// Uncomment to turn on poll() instead of epoll(). poll() mode is about 15% slower than
-// epoll() and burns way more CPU on array set management.  Use epoll() if you can
-// #define USE_POLL		// DO NOT ENABLE - DOES NOT WORK
-
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
 #define USE_EPOLLONESHOT
@@ -181,9 +177,6 @@ struct ntfyq {
 	uint64_t			tfd;
 	task_action_flag_t		action;
 	bool				locked;
-#ifdef USE_POLL
-	uint32_t			fd;
-#endif
 };
 
 struct task_timer {
@@ -352,17 +345,6 @@ struct worker {
 	int64_t				colt_next;
 	struct task_timer		*colt1;
 	struct task_timer		*colt2;
-
-#ifdef USE_POLL
-	struct pollfd 			*poll_events;
-	int32_t				*poll_tfds;
-	uint32_t			nfds;
-
-	struct pollfd			*poll_event_set1;
-	int32_t				*poll_tfd_set1;
-	struct pollfd			*poll_event_set2;
-	int32_t				*poll_tfd_set2;
-#endif
 
 	// Blocking worker call info
 	void				(*work_func)(void *work_data);
@@ -1580,7 +1562,7 @@ task_cancel_write(struct task *t)
 	task_lower_event_flag(t, EPOLLOUT);
 
 #ifdef USE_EPOLLONESHOT
-		// Ensure to call EPOLL_CTL_MOD
+	// Ensure to call EPOLL_CTL_MOD
 	if (epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) == 0) {
 		t->committed_events = (t->ev.events & 0xff);
 	}
@@ -2170,21 +2152,6 @@ worker_destroy(struct worker *w)
 		w->timer_queue = NULL;
 	}
 
-#ifdef USE_POLL
-	if (w->poll_event_set1) {
-		free(w->poll_event_set1);
-	}
-	if (w->poll_event_set2) {
-		free(w->poll_event_set2);
-	}
-	if (w->poll_tfd_set1) {
-		free(w->poll_tfd_set1);
-	}
-	if (w->poll_tfd_set2) {
-		free(w->poll_tfd_set2);
-	}
-#endif
-
 #ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_destroy(&w->spinlock);
 #endif
@@ -2446,51 +2413,6 @@ task_activate_wr_timeout(register struct task *t)
 } // task_activate_wr_timeout
 
 
-#ifdef USE_POLL
-// Raises the given event flag(s)
-static inline int
-task_raise_event_flag(struct task *t, uint32_t flags)
-{
-	register uint32_t tfdi = (uint32_t)(t->tfd & 0xffffffff);
-	register struct tfd_pool_node *tpn = __thr_current_instance->tfd_pool + tfdi;
-	struct worker *w = t->worker;
-	int wnfds;
-
-	// We only allow EPOLLIN and EPOLLOUT. We auto add EPOLLRDHUP
-	if (unlikely(t->rdhup)) {
-		flags &= (EPOLLIN | EPOLLOUT);
-	} else {
-		flags = (flags & (EPOLLIN | EPOLLOUT)) | EPOLLRDHUP;
-	}
-
-	// Grab a refcnt for what we're going to place on the poll() notification set
-	pthread_spin_lock(&tpn->lock);
-	tpn->refcnt++;
-	pthread_spin_unlock(&tpn->lock);
-
-	// Place the event onto the poll() notification set
-	worker_lock(w);
-	wnfds = w->nfds++;
-	w->poll_events[wnfds].fd = t->fd;
-	w->poll_events[wnfds].events = flags;
-	w->poll_events[wnfds].revents = 0;
-	w->poll_tfds[wnfds] = t->tfd;
-	worker_unlock(w);
-
-	return worker_notify(w);;
-} // task_raise_event_flag
-
-
-// Lowers the given event flag(s)
-static inline int
-task_lower_event_flag(struct task *t, uint32_t flags)
-{
-	t->ev.events &= ~flags;
-	return 0;
-} // task_lower_event_flag
-
-#else
-
 // Creates the given event flag(s)
 static inline int
 task_create_event_flag(register struct task *t)
@@ -2521,35 +2443,13 @@ task_create_event_flag(register struct task *t)
 
 // Raises the given event flag(s)
 static inline int
-task_raise_event_flag(struct task *t, uint32_t flags)
+task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
-	if (t->rd_shut && t->wr_shut) {
-		errno = EPIPE;
-		return -1;
-	}
-
-	t->ev.events |= flags;
-
-	if (likely(t->ev.data.u64 != TFDU_NONE)) {
-		if (unlikely(epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
-			return -1;
-		}
-	} else {
-		// We need to to EPOLL_CTL_ADD instead
-		if (task_create_event_flag(t) < 0) {
-			return -1;
-		}
-	}
-
-	t->committed_events = (t->ev.events & 0xff);
-
 	if (flags & EPOLLIN) {
 		if (unlikely(t->rd_shut)) {
 			errno = EPIPE;
 			return -1;
 		}
-		t->active_flags |= FLG_PI;
-		task_activate_rd_timeout(t);
 	}
 
 	if (flags & EPOLLOUT) {
@@ -2557,6 +2457,35 @@ task_raise_event_flag(struct task *t, uint32_t flags)
 			errno = EPIPE;
 			return -1;
 		}
+	}
+
+	t->ev.events |= flags;
+
+	if (likely(t->ev.data.u64 != TFDU_NONE)) {
+		if (unlikely(epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
+			t->ev.events &= ~flags;
+			return -1;
+		}
+	} else {
+		// We need to to EPOLL_CTL_ADD instead
+		if (task_create_event_flag(t) < 0) {
+			t->ev.events &= ~flags;
+			return -1;
+		}
+	}
+
+	t->committed_events = (t->ev.events & 0xff);
+
+	if (flags & EPOLLIN) {
+		if (flags & EPOLLOUT) {
+			t->active_flags |= (FLG_PI | FLG_PO);
+			task_activate_rd_timeout(t);
+			task_activate_wr_timeout(t);
+		} else {
+			t->active_flags |= FLG_PI;
+			task_activate_rd_timeout(t);
+		}
+	} else if (flags & EPOLLOUT) {
 		t->active_flags |= FLG_PO;
 		task_activate_wr_timeout(t);
 	}
@@ -2601,7 +2530,6 @@ task_lower_event_flag(struct task *t, uint32_t flags)
 	}
 	return res;
 } // task_lower_event_flag
-#endif
 
 
 static struct task *
@@ -3882,93 +3810,6 @@ get_next_epoll_timeout_ms(struct worker *w)
 } // get_next_epoll_timeout_ms
 
 
-#ifdef USE_POLL
-static void
-worker_loop_io_poll(struct worker *w)
-{
-	while(w->state == WORKER_STATE_RUNNING) {
-		struct pollfd *poll_events;
-		int32_t *poll_tfds;
-		int nfds, wait_time = 0;
-
-		// Swap the FD sets
-		worker_lock(w);
-		poll_events = w->poll_events;
-		poll_tfds = w->poll_tfds;
-		nfds = w->nfds;
-
-		if (w->poll_events == w->poll_event_set1) {
-			w->poll_events = w->poll_event_set2;
-			w->poll_tfds = w->poll_tfd_set2;
-		} else {
-			w->poll_events = w->poll_event_set1;
-			w->poll_tfds = w->poll_tfd_set1;
-		}
-		w->nfds = 1;
-		worker_unlock(w);
-
-		// The first entry is always reserved for the worker notification FD
-		poll_events[0].fd = w->evfd;
-		poll_events[0].events = POLLIN;
-		poll_events[0].revents = 0;
-		poll_tfds[0] = -1;
-
-		// Wait for something to happen!
-		wait_time = get_next_epoll_timeout_ms(w);
-		if (poll(poll_events, nfds, wait_time) < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			perror("epoll_wait");
-			worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
-			continue;
-		}
-
-		// Process the worker notification first
-		if (poll_events[0].revents) {
-			worker_handle_event(w, poll_events[0].revents);
-		}
-
-		// Now scan through the full list of events
-		for (int n = 1; likely(n < nfds); n++) {
-			int32_t revents = poll_events[n].revents;
-			int64_t tfd = poll_tfds[n];
-
-			if (revents) {
-				struct task *t = __thr_current_instance->tfd_pool[tfd].t;
-
-				if (instance_tfd_pool_refcnt_dec(tfd)) {
-					continue;
-				}
-				task_notify_action(t, action);
-			} else {
-				int wnfds;
-
-				// Put the event back onto the redo list. We still have the reference
-				worker_lock(w);
-				wnfds = w->nfds++;
-				worker_unlock(w);
-
-				w->poll_events[wnfds].fd = poll_events[n].fd;
-				w->poll_events[wnfds].events = poll_events[n].events;
-				w->poll_events[wnfds].revents = 0;
-				w->poll_tfds[wnfds] = tfd;
-			}
-		}
-
-		// Reap any tasks that finished up here.  We do it in this two step fashion because a task
-		// may have both timeout and I/O events to be processed after an epoll_wait() call and we
-		// don't want to destroy the task state until everyone who needs to touch it has done so
-		w->curtime_us = get_time_us(TASK_TIME_PRECISE);
-		worker_check_timeouts(w);
-
-		// Update the worker time and check for anything that's timed out
-		worker_process_notifyq(w);
-	}
-} // worker_loop_poll
-
-#else
-
 static void
 worker_do_io_epoll(register struct worker *w)
 {
@@ -4045,6 +3886,7 @@ worker_do_io_epoll(register struct worker *w)
 
 			// Handle ERROR/HUP events first
 			if (unlikely(unlikely(!!(revents & EPOLLERR)) || unlikely(!!(revents & EPOLLHUP)))) {
+worker_do_io_epoll_fail:
 				// Shutdown both connection sides and force an IO event
 				// which should make a system call to detect what happened
 				t->rd_shut = true;
@@ -4052,14 +3894,14 @@ worker_do_io_epoll(register struct worker *w)
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
 				epoll_ctl(w->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 				if (t->active_flags & FLG_RD) {
-					task_handle_io_event(t, FLG_RD);	// Releases the task
+					task_handle_io_event(t, FLG_RD);	// Unlocks  the task
 					continue;
 				}
 				if (t->active_flags & FLG_WR) {
-					task_handle_io_event(t, FLG_WR);	// Releases the task
+					task_handle_io_event(t, FLG_WR);	// Unlocks  the task
 					continue;
 				}
-				task_do_close_cb(t, FLG_PW);
+				task_do_close_cb(t, FLG_PW);			// Unlocks the task
 				continue;
 			}
 
@@ -4068,7 +3910,7 @@ worker_do_io_epoll(register struct worker *w)
 				t->rd_shut = true;
 				if (t->active_flags & FLG_RD) {
 					task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
-					task_handle_io_event(t, FLG_RD);	// Releases the task
+					task_handle_io_event(t, FLG_RD);	// Unlocks  the task
 					continue;
 				}
 				task_lower_event_flag(t, EPOLLRDHUP);
@@ -4088,39 +3930,46 @@ worker_do_io_epoll(register struct worker *w)
 				continue;
 			}
 
-			// If we're not overloaded then do immediate callbacks
-			if (do_direct) {
-				if (revents & EPOLLIN) {
-					if (revents & EPOLLOUT) {
-						// A write is active too.  Just queue that
-						task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-						task_notify_action(t, FLG_WR);
-					} else {
-						task_lower_event_flag(t, EPOLLIN);
-					}
-					task_handle_io_event(t, FLG_RD);	// Releases the task
-					continue;
-				}
-
-				if (revents & EPOLLOUT) {
-					task_lower_event_flag(t, EPOLLOUT);
-					task_handle_io_event(t, FLG_WR);	// Releases the task
-					continue;
-				}
-			}
-
 			// Need to queue instead. Place the events on worker notifyq
 			if (revents & EPOLLIN) {
-				task_lower_event_flag(t, EPOLLIN);
-				task_notify_action(t, FLG_RD);
-			}
-
-			if (revents & EPOLLOUT) {
+				if (revents & EPOLLOUT) {
+					task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
+					task_notify_action(t, FLG_WR);			// If a write is active too, just queue it
+					if (do_direct) {
+						task_handle_io_event(t, FLG_RD);	// Unlocks the task
+					} else {
+						task_notify_action(t, FLG_RD);
+						task_unlock(t, FLG_NONE);
+					}
+					continue;
+				} else {
+					task_lower_event_flag(t, EPOLLIN);
+					if (do_direct) {
+						task_handle_io_event(t, FLG_RD);	// Unlocks the task
+					} else {
+						task_notify_action(t, FLG_RD);
+						task_unlock(t, FLG_NONE);
+					}
+					continue;
+				}
+			} else if (revents & EPOLLOUT) {
 				task_lower_event_flag(t, EPOLLOUT);
-				task_notify_action(t, FLG_WR);
+				if (do_direct) {
+					task_handle_io_event(t, FLG_WR);		// Unlocks the task
+				} else {
+					task_notify_action(t, FLG_WR);
+					task_unlock(t, FLG_NONE);
+				}
+				continue;
 			}
 
-			// All the flag updates have already been handled
+			// If we're here, we've gotten some event that we don't handle.  Just
+			// ignore it.  If EPOLLONESHOT is enabled though, we need to re-arm
+#ifdef USE_EPOLLONESHOT
+			if (task_raise_event_flag(t, 0) < 0) {
+				goto worker_do_io_epoll_fail;
+			}
+#endif
 			task_unlock(t, FLG_NONE);
 		}
 
@@ -4131,7 +3980,6 @@ worker_do_io_epoll(register struct worker *w)
 		wait_time = 0;
 	}
 } // worker_do_epoll
-#endif
 
 
 // The main io worker loop.  One instance exists per io worker thread
@@ -4144,13 +3992,9 @@ worker_loop_io(void *arg)
 	__thr_current_instance = w->instance;
 
 	while(w->state == WORKER_STATE_RUNNING) {
-#ifdef USE_POLL
-		worker_do_io_poll(w);
-#else
 		worker_do_io_epoll(w);
-#endif
-		// Call it twice, because first pass can generate events
 		worker_process_notifyq(w);
+		// Call it twice, because first pass can generate events
 		worker_process_notifyq(w);
 	}
 
@@ -4304,22 +4148,17 @@ worker_create(struct instance *i, int worker_type)
 	TAILQ_INIT(&w->freeq);
 
 	if (w->type == WORKER_TYPE_IO) {
-#ifdef USE_POLL
-		w->epfd = -1;
-#else
 		// Create epoll fd for incoming task events
 		if ((w->epfd = epoll_create1(0)) < 0) {
 			// epoll_create1 will set errno
 			goto worker_create_failed;
 		}
-#endif
 
 		// Create event fd for task event loop notifications
 		if ((w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
 			// eventfd will set errno
 			goto worker_create_failed;
 		} else {
-#ifndef USE_POLL
 			// Register worker notification event fd against the worker epoll fd
 			// Do not use EPOLLET here since we don't do selective re-arming
 			struct epoll_event ev[1] = {0};
@@ -4330,7 +4169,6 @@ worker_create(struct instance *i, int worker_type)
 				// epoll_ctl will set errno
 				goto worker_create_failed;
 			}
-#endif
 		}
 	} else if (w->type == WORKER_TYPE_BLOCKING) {
 		// Blocking workers use a blocking eventfd and just wait on that instead of epoll_wait
@@ -4344,30 +4182,6 @@ worker_create(struct instance *i, int worker_type)
 		errno = EINVAL;
 		goto worker_create_failed;
 	}
-
-#ifdef USE_POLL
-	w->poll_event_set1 = calloc((i->tfd_pool_size / i->num_workers_io) * 2, sizeof(struct pollfd));
-	if (w->poll_event_set1 == NULL) {
-		goto worker_create_failed;
-	}
-	w->poll_event_set2 = calloc((i->tfd_pool_size / i->num_workers_io) * 2, sizeof(struct pollfd));
-	if (w->poll_event_set2 == NULL) {
-		goto worker_create_failed;
-	}
-	w->poll_tfd_set1 = calloc((i->tfd_pool_size / i->num_workers_io) * 2, sizeof(int32_t));
-	if (w->poll_tfd_set1 == NULL) {
-		goto worker_create_failed;
-	}
-	w->poll_tfd_set2 = calloc((i->tfd_pool_size / i->num_workers_io) * 2, sizeof(int32_t));
-	if (w->poll_tfd_set2 == NULL) {
-		goto worker_create_failed;
-	}
-
-	// Set up the initial set
-	w->poll_events = w->poll_event_set1;
-	w->poll_tfds = w->poll_tfd_set1;
-	w->nfds = 1;
-#endif
 
 	// Create timer queue for the worker. Use the default keys as intptr_t comparison function
 	if ((w->timer_queue = pheap_create(NULL)) == NULL) {

@@ -37,7 +37,7 @@
 //#define USE_PTHREAD_SPINLOCKS
 
 // Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
-// be logged to __thr_current_instance->stragglers, which allows us to attach a debugger and
+// be stored to __thr_current_instance->stragglers, which allows us to attach a debugger and
 // quickly find any active TFD's within the pool that probably should not still be active
 //#define TFD_POOL_DEBUG
 
@@ -46,8 +46,6 @@
 #define TASK_MAX_EVENTS		1024				// More than this impacts CPU cache lines negatively
 #define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
-#define	TASK_MAX_TFD_LOCKS	256				// Number of TFD spinlocks in an instance's lock pool
-								// Best if this is kept as an even power of 2
 
 // I highly recommend NOT fiddling with the COLT1 value unless you understand what it will impact
 #define	WORKER_TIME_COLT1	4500000				// 4s (expressed in microseconds)
@@ -79,23 +77,21 @@ typedef struct {
 	int64_t lock[8];
 } __attribute__ ((aligned(64))) spin_lock_t;
 
-static inline void spin_lock2(register int64_t volatile *p)
+static inline void __spin_lock(register int64_t volatile *p)
 {
 	while(unlikely(__sync_lock_test_and_set(p, 1))) {
 		do { _mm_pause(); } while (*p);
 	}
 }
 
-static inline void spin_unlock2(register int64_t volatile *p)
+static inline void __spin_unlock(register int64_t volatile *p)
 {
 	__sync_lock_release(p);
 }
 
-#define spin_init(lk)   (lk).lock[0] = 0;
-#define spin_lock(lk)   spin_lock2((lk).lock);
-#define spin_unlock(lk) spin_unlock2((lk).lock);
-
-// Returns 1 if the task was freed, 0 otherwise
+#define spin_init(lk)   (lk)->lock[0] = 0;
+#define spin_lock(lk)   __spin_lock((lk)->lock);
+#define spin_unlock(lk) __spin_unlock((lk)->lock);
 
 //-------------------------------------------------------------------------------------------
 
@@ -173,7 +169,6 @@ struct ntfyq {
 	TAILQ_ENTRY(ntfyq)		list;
 	uint64_t			tfd;
 	uint32_t			action;
-	uint32_t			locked;
 } __attribute__ ((aligned(32)));
 
 struct task_timer {
@@ -231,43 +226,46 @@ struct task {
 	//=================================    WRITE CONTROL FIELDS    =================================//
 	//----------------------------------------------------------------------------------------------//
 
-	// General Write Fields
-	struct task_timer		wr_tt;			// 48 bytes - WR Timeout Information
-	const char			*wr_buf;
-	void				*wr_cb_data;
-
-	//===================================  64 BYTE BOUNDARY    =====================================//
-
 	// Data write fields
+	const char			*wr_buf;
+	const struct iovec		*wrv_iov;
 	size_t				wr_total;
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
 	size_t				wrv_buflen;
 	size_t				wrv_bufpos;
-	const struct iovec		*wrv_iov;
+	void				*wr_cb_data;
+
+	//===================================  64 BYTE BOUNDARY    =====================================//
+
+	// General Write Fields
+	struct task_timer		wr_tt;			// 48 bytes - WR Timeout Information
 	void				(*wr_cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data);
 	void				(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
+
 	//----------------------------------------------------------------------------------------------//
 	//==================================    READ CONTROL FIELDS    =================================//
 	//----------------------------------------------------------------------------------------------//
 
+	// General Read Fields
 	struct task_timer		rd_tt;			// 48 bytes - RD Timeout Information
-	char				*rd_buf;
-	void				*rd_cb_data;
+	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
+	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
+	// Data read fields
+	char				*rd_buf;
+	const struct iovec		*rdv_iov;
 	size_t				rd_total;
 	size_t				rd_buflen;
 	size_t				rd_bufpos;
 	size_t				rdv_buflen;
 	size_t				rdv_bufpos;
-	const struct iovec		*rdv_iov;
-	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
-	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
+	void				*rd_cb_data;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -287,16 +285,14 @@ struct task {
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
-	struct worker			*preferred_worker;	// To initiate task io worker migration
-	struct ntfyq_list		accept_children;	// The list of child accept tasks
-	uint32_t			migrations;		// Number of times the task has migrated
-	socklen_t			addrlen;		// The valid length of the data in .addr
-
-	//==================================  64 BYTE BOUNDARY    ====================================//
-
 	// notifyqlen_locked is updated by an atomic count operation.  We want to keep it on its own CPU
 	// cache line (64 bytes width) as that will get flushed when it gets updated.
 	__attribute__ ((aligned(64))) uint64_t	notifyqlen_locked; // Number of locked notifyq entries this task has
+	struct worker			*preferred_worker;	// To initiate task io worker migration
+	TAILQ_ENTRY(task)		free_list;		// List of free tasks
+	struct ntfyq_list		accept_children;	// The list of child accept tasks
+	uint32_t			migrations;		// Number of times the task has migrated
+	socklen_t			addrlen;		// The valid length of the data in .addr
 } __attribute__ ((aligned(64)));	// Round up to the nearest 64 byte boundary
 
 typedef enum {
@@ -399,21 +395,22 @@ struct instance {
 	pthread_t			thr;
 	pthread_mutex_t			lock;
 	int				evfd;
+	int32_t				ti;
 
 	// TFD->task pool
 	struct task			*tfd_pool;		// The total pool of tasks we can work with
+	struct task_list		free_tasks;
 
 	// For TASK_TYPE_ACCEPT tasks, addr refers to the local address we're listening on
 	// For TASK_TYPE_IO/CONNECT tasks, addr refers to the remote communication address
 	struct sockaddr_storage		*tfd_addrs;		// Addresses for tasks within the task pool
 	uint64_t			tfd_pool_used;		// The total number of active tasks in the pool
 	uint32_t			tfd_pool_size;
+
 #ifdef USE_PTHREAD_SPINLOCKS
-//__attribute__ ((aligned(64))) pthread_spinlock_t tfd_locks[TASK_MAX_TFD_LOCKS];
 	pthread_spinlock_t		*tfd_locks_real;
 	pthread_spinlock_t		*tfd_locks;
 #else
-//__attribute__ ((aligned(64))) spin_lock_t tfd_locks[TASK_MAX_TFD_LOCKS];
 	spin_lock_t			*tfd_locks_real;
 	spin_lock_t			*tfd_locks;
 #endif
@@ -459,22 +456,26 @@ struct instance {
 
 static inline int task_lower_event_flag(struct task *t, uint32_t flags);
 
-static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool initialised = false;
 static __thread int64_t		__thr_preferred_age;
 static __thread struct worker	*__thr_current_worker = NULL;		// The current IO worker.  MUST BE NULL if current thread is not an IO worker
 static __thread struct worker	*__thr_preferred_worker = NULL;		// A preferred target IO worker for nested task IO
 static __thread struct instance	*__thr_current_instance = NULL;
-static struct instance		instances[TASK_MAX_INSTANCES];
+
+static struct instance		*instances[TASK_MAX_INSTANCES];
+static bool initialised = false;
+static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define	lockless_worker(w)	(w == __thr_current_worker)
 
+#define	TASK_MAX_TFD_LOCKS	(256)		// Number of TFD spinlocks in an instance's lock pool. MUST be a power of 2
+#define	TASK_TFD_LOCK_MASK	(TASK_MAX_TFD_LOCKS - 1)
+
 #ifdef USE_PTHREAD_SPINLOCKS
-#define	tfd_lock(lock_index)	pthread_spin_lock(__thr_current_instance->tfd_locks + ((lock_index) % TASK_MAX_TFD_LOCKS)
-#define	tfd_unlock(lock_index)	pthread_spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) % TASK_MAX_TFD_LOCKS)
+#define	tfd_lock(lock_index)	pthread_spin_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
+#define	tfd_unlock(lock_index)	pthread_spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
 #else
-#define	tfd_lock(lock_index)	spin_lock(__thr_current_instance->tfd_locks[(lock_index) % TASK_MAX_TFD_LOCKS])
-#define	tfd_unlock(lock_index)	spin_unlock(__thr_current_instance->tfd_locks[(lock_index) % TASK_MAX_TFD_LOCKS])
+#define	tfd_lock(lock_index)	spin_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
+#define	tfd_unlock(lock_index)	spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
 #endif
 
 // ---------------------------------------------------------------------------------------------//
@@ -598,7 +599,7 @@ worker_lock(struct worker *w)
 #ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_lock(&w->spinlock);
 #else
-	spin_lock(w->lock[0]);
+	spin_lock(w->lock);
 #endif
 } // worker_lock
 
@@ -609,7 +610,7 @@ worker_unlock(struct worker *w)
 #ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_unlock(&w->spinlock);
 #else
-	spin_unlock(w->lock[0]);
+	spin_unlock(w->lock);
 #endif
 } // worker_lock
 
@@ -808,10 +809,16 @@ task_init(struct task *t)
 static void
 task_free(struct task *t)
 {
-	ck_pr_dec_64(&__thr_current_instance->tfd_pool_used);
+	register struct instance *i = __thr_current_instance;
+
+	ck_pr_dec_64(&i->tfd_pool_used);
 	ck_pr_dec_64(&t->worker->num_tasks);
 	task_destroy_timeouts(t);
 	task_init(t);
+
+	pthread_spin_lock(&i->cpuspin);
+	TAILQ_INSERT_HEAD(&i->free_tasks, t, free_list);
+	pthread_spin_unlock(&i->cpuspin);
 } // task_free
 
 
@@ -957,56 +964,41 @@ task_nuke(uint32_t tfdi)
 static struct task *
 task_get_free_task(void)
 {
-	if (__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN) {
+	register struct instance *i = __thr_current_instance;
+	register struct task *t;
+	register uint32_t tfdi;
+
+	if (i->state == INSTANCE_STATE_SHUTTING_DOWN) {
 		errno = EOWNERDEAD;
 		return NULL;
 	}
 
 	// Also ensure we're not at our max open tfd limit
-	if (unlikely(__thr_current_instance->tfd_pool_used > (uint64_t)(__thr_current_instance->tfd_pool_size * 0.8))) {
+	if (unlikely(i->tfd_pool_used > (uint64_t)(i->tfd_pool_size * 0.8))) {
 		errno = EMFILE;
 		return NULL;
 	}
 	
-	for (register uint32_t attempts = 0; attempts < __thr_current_instance->tfd_pool_size; attempts++) {
-		register struct task *t;
-		uint32_t tfdi;
-
-		// Try randomly twice, and then scan from there
-		if (attempts < 2) {
-			tfdi = (int32_t)(random() % __thr_current_instance->tfd_pool_size);
-		} else {
-			tfdi = ((tfdi + 1) % __thr_current_instance->tfd_pool_size);
-		}
-
-		t = __thr_current_instance->tfd_pool + tfdi;
-
-		// Quick check without locking
-		if (t->tfd != (int64_t)TFD_NONE) {
-			continue;
-		}
-
-		// We have a possible candidate.  Validate and set with lock held
-		tfd_lock(tfdi);
-		if (t->tfd != (int64_t)TFD_NONE) {
-			// Someone got to it before us, try again
-			tfd_unlock(tfdi);
-			continue;
-		}
-		// We got one!
-		t->tfd = t->tfd_iteration;
-		t->tfd <<= 32;
-		t->tfd |= (uint64_t)tfdi;
-		t->tfd_index = tfdi;
-		tfd_unlock(tfdi);
-		t->io_depth = 0;
-		t->state = TASK_STATE_ACTIVE;
-		ck_pr_inc_64(&__thr_current_instance->tfd_pool_used);
-		return t;
+	pthread_spin_lock(&i->cpuspin);
+	t = TAILQ_FIRST(&i->free_tasks);
+	if (t == NULL) {
+		pthread_spin_unlock(&i->cpuspin);
+		errno = EMFILE;
+		return NULL;
 	}
+	TAILQ_REMOVE(&i->free_tasks, t, free_list);
+	pthread_spin_unlock(&i->cpuspin);
 
-	errno = EMFILE;
-	return NULL;
+	tfdi = t - i->tfd_pool;
+	t->tfd = t->tfd_iteration;
+	t->tfd <<= 32;
+	t->tfd |= (uint64_t)tfdi;
+	t->tfd_index = tfdi;
+	t->io_depth = 0;
+	t->state = TASK_STATE_ACTIVE;
+	ck_pr_inc_64(&i->tfd_pool_used);
+
+	return t;
 } // task_get_free_tfd 
 
 // ---------------------------------------------------------------------------------------------//
@@ -1464,11 +1456,9 @@ task_notify_action_queue:
 	if (likely(lockless_worker(w))) {
 		w->notifyqlen++;
 		t->notifyqlen++;
-		tq->locked = false;
 		TAILQ_INSERT_TAIL(&w->notifyq, tq, list);
 	} else {
 		ck_pr_inc_64(&t->notifyqlen_locked);
-		tq->locked = true;
 		worker_lock(w);
 		w->notifyqlen_locked++;
 		TAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
@@ -1485,7 +1475,6 @@ task_notify_action_queue_first:
 
 		w->notifyqlen++;
 		t->notifyqlen++;
-		tq->locked = false;
 		tqh = TAILQ_FIRST(&w->notifyq);
 		if (tqh == NULL) {
 			TAILQ_INSERT_TAIL(&w->notifyq, tq, list);
@@ -1496,7 +1485,6 @@ task_notify_action_queue_first:
 		register struct ntfyq *tqh = NULL;
 
 		ck_pr_inc_64(&t->notifyqlen_locked);
-		tq->locked = true;
 		worker_lock(w);
 		w->notifyqlen_locked++;
 		tqh = TAILQ_FIRST(&w->notifyq_locked);
@@ -3338,8 +3326,6 @@ worker_check_timeouts(struct worker *w)
 static void
 worker_handle_instance(struct instance *i)
 {
-	int32_t ti = i - instances;
-
 	// Process blocking worker callbacks
 	i->curtime_us = get_time_us(TASK_TIME_COARSE);
 	if (!TAILQ_EMPTY(&i->workers_notify)) {
@@ -3358,7 +3344,7 @@ worker_handle_instance(struct instance *i)
 				w->work_cb_data = NULL;
 
 				instance_unlock(i);
-				work_cb_func(ti, work_cb_data);
+				work_cb_func(i->ti, work_cb_data);
 				instance_lock(i);
 			}
 
@@ -3533,15 +3519,13 @@ worker_do_timeout_check(register struct worker *w)
 static void
 worker_process_notifyq(register struct worker *w)
 {
-	register uint32_t num_processed = 0;
-	register struct ntfyq *tq;
-	struct ntfyq_list notifyq, freeq;
+	register struct ntfyq *tq = NULL;
 
 #ifdef TFD_POOL_DEBUG
 	// Update straggler debug list
 	if (w == w->instance->instance_worker) {
-		uint32_t n, k;
-		struct instance *i = w->instance;
+		register uint32_t n, k;
+		register struct instance *i = w->instance;
 
 		for (n = 0; n < NUM_STRAGGLERS; n++) i->stragglers[n] = UINT32_MAX;
 		for (n = 0, k = 0; k < i->tfd_pool_size; k++) {
@@ -3553,7 +3537,6 @@ worker_process_notifyq(register struct worker *w)
 		}
 	}
 #endif
-
 
 	// Process nothing if we're shutting down
 	// Everything will get cleaned up when the worker shuts down
@@ -3567,169 +3550,176 @@ worker_process_notifyq(register struct worker *w)
 		}
 	}
 
-	// Check the locking notifyq lists
-	worker_lock(w);
-	if (unlikely(TAILQ_EMPTY(&w->freeq_locked))) {
-		// If the locking freeq is empty, just give it our present free list
-		// We'll be adding entries to our own free list at the end of this loop
-		TAILQ_CONCAT(&w->freeq_locked, &w->freeq, list);
-	}
-	if (unlikely(!TAILQ_EMPTY(&w->notifyq_locked))) {
-		// Append the locking notifyq list to our unlocked list
-		TAILQ_CONCAT(&w->notifyq, &w->notifyq_locked, list);
-		w->notifyqlen += w->notifyqlen_locked;
-	}
-	w->notifyqlen_locked = 0;
-	worker_unlock(w);
+	for (register uint32_t locked = 0; locked < 2; locked++) {
+		register uint32_t num_processed = 0;
+		struct ntfyq_list notifyq, freeq;
 
-	// Everything past this point is lockless
-	// We use local lists because it's faster
-	TAILQ_INIT(&notifyq);
-	TAILQ_INIT(&freeq);
-	TAILQ_CONCAT(&notifyq, &w->notifyq, list);
-
-	w->curtime_us = get_time_us(TASK_TIME_PRECISE);
-	while (likely((tq = TAILQ_FIRST(&notifyq)) != NULL)) {
-		register struct task *t = NULL;
-		register int64_t tfd;
-		register bool locked;
-		register task_action_flag_t action;
-
-		num_processed++;
-
-		if (unlikely(++w->processed_total >= w->processed_tc)) {
-			worker_do_timeout_check(w);
-		}
-
-		TAILQ_REMOVE(&notifyq, tq, list);
-		tfd = tq->tfd;
-		action = tq->action;
-		locked = tq->locked;
-		tq->tfd = TFD_NONE;
-		tq->action = FLG_NONE;
-		tq->locked = false;
-		TAILQ_INSERT_TAIL(&freeq, tq, list);
-
-		t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
-
-		if (unlikely(locked)) {
-			ck_pr_dec_64(&t->notifyqlen_locked);
+		// Check the notifyq lists
+		if (locked) {
+			if (TAILQ_EMPTY(&w->notifyq_locked)) {
+				continue;
+			}
+			TAILQ_INIT(&notifyq);
+			worker_lock(w);
+			TAILQ_CONCAT(&notifyq, &w->notifyq_locked, list);
+			worker_unlock(w);
 		} else {
-			t->notifyqlen--;
-		}
-
-		if (unlikely(tfd != t->tfd)) {
-			continue;
-		}
-
-		// If Task is not in the Active State, unlock and go
-		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
-			if (action != FLG_CL) {
-				task_unlock(t, action);
+			if (TAILQ_EMPTY(&w->notifyq)) {
 				continue;
 			}
+			TAILQ_INIT(&notifyq);
+			TAILQ_CONCAT(&notifyq, &w->notifyq, list);
 		}
 
-		// Check if the action got cancelled
-		if (unlikely((t->active_flags & action) == 0)) {
-			if (action != FLG_CL) {
-				task_unlock(t, action);
-				continue;
+		TAILQ_INIT(&freeq);
+
+		w->curtime_us = get_time_us(TASK_TIME_PRECISE);
+		while (likely((tq = TAILQ_FIRST(&notifyq)) != NULL)) {
+			register struct task *t = NULL;
+			register int64_t tfd;
+			register task_action_flag_t action;
+
+			num_processed++;
+
+			if (unlikely(++w->processed_total >= w->processed_tc)) {
+				worker_do_timeout_check(w);
 			}
-		}
 
-		// If this worker does not match the task's worker, then that's probably because
-		// the task recently migrated.  Send the notification to the correct worker
-		if(unlikely(t->worker != w)) {
-			// Forward the action directly to the correct worker.  Temporarily
-			// raise t->forward_close to allow FLG_CL actions through even when
-			// the task is in DESTROY state
-			t->forward_close = true;
-			if (task_notify_action(t, action)) {
-				t->forward_close = false;
-				task_unlock(t, FLG_NONE);
+			TAILQ_REMOVE(&notifyq, tq, list);
+			tfd = tq->tfd;
+			action = tq->action;
+			tq->tfd = TFD_NONE;
+			tq->action = FLG_NONE;
+			TAILQ_INSERT_HEAD(&freeq, tq, list);
+
+			t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
+
+			if (unlikely(locked)) {
+				ck_pr_dec_64(&t->notifyqlen_locked);
 			} else {
-				// It didn't get forwarded, drop the action reference
-				t->forward_close = false;
-				task_unlock(t, action);
+				t->notifyqlen--;
 			}
-			continue;
-		}
 
-		if (unlikely(action == FLG_CL)) {
-			// If we're an accept parent with children then shut them down now
-			if (t->type == TASK_TYPE_ACCEPT_PARENT) {
-				task_shutdown_accept_children(w, t);
-				task_do_close_cb(t, FLG_LI);
+			if (unlikely(tfd != t->tfd)) {
 				continue;
 			}
-			task_do_close_cb(t, FLG_NONE);	// FLG_CL is always reset by task_do_close_cb
-			continue;
-		}
 
-		// It's a change action from here on.  Process the action we got
-
-		// IO actions are usually the most common. Test for them first
-		if (action == FLG_WR) {
-			task_handle_io_event(t, FLG_WR);	// Releases the task lock
-			continue;
-		}
-
-		if (action == FLG_RD) {
-			task_handle_io_event(t, FLG_RD);	// Releases the task lock
-			continue;
-		}
-
-		if (action == FLG_RT) {
-			task_activate_rd_timeout(t);
-			task_unlock(t, FLG_NONE);
-			continue;
-		}
-
-		if (action == FLG_WT) {
-			task_activate_wr_timeout(t);
-			task_unlock(t, FLG_NONE);
-			continue;
-		}
-
-		if (likely(action == FLG_TM)) {
-			task_update_timer(t);			// Releases the task lock
-			continue;
-		}
-
-		// Handle a migration notification
-		if (action == FLG_MG) {
-			if (t->preferred_worker != NULL) {
-				if (t->preferred_worker != w) {
-					// We're the sender
-					worker_handle_task_migration(w, t);
-				} else {
-					// We're the receiver
-					t->preferred_worker = NULL;
-
-					// Re-attach any timer nodes as needed
-					worker_timer_update(w, &t->tm_tt, t->tfd);
-					worker_timer_update(w, &t->rd_tt, t->tfd);
-					worker_timer_update(w, &t->wr_tt, t->tfd);
+			// If Task is not in the Active State, unlock and go
+			if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+				if (action != FLG_CL) {
+					task_unlock(t, action);
+					continue;
 				}
 			}
-			task_unlock(t, action);
-			continue;
+
+			// Check if the action got cancelled
+			if (unlikely((t->active_flags & action) == 0)) {
+				if (action != FLG_CL) {
+					task_unlock(t, action);
+					continue;
+				}
+			}
+
+			// If this worker does not match the task's worker, then that's probably because
+			// the task recently migrated.  Send the notification to the correct worker
+			if(unlikely(t->worker != w)) {
+				// Forward the action directly to the correct worker.  Temporarily
+				// raise t->forward_close to allow FLG_CL actions through even when
+				// the task is in DESTROY state
+				t->forward_close = true;
+				if (task_notify_action(t, action)) {
+					t->forward_close = false;
+					task_unlock(t, FLG_NONE);
+				} else {
+					// It didn't get forwarded, drop the action reference
+					t->forward_close = false;
+					task_unlock(t, action);
+				}
+				continue;
+			}
+
+			if (unlikely(action == FLG_CL)) {
+				// If we're an accept parent with children then shut them down now
+				if (t->type == TASK_TYPE_ACCEPT_PARENT) {
+					task_shutdown_accept_children(w, t);
+					task_do_close_cb(t, FLG_LI);
+					continue;
+				}
+				task_do_close_cb(t, FLG_NONE);	// FLG_CL is always reset by task_do_close_cb
+				continue;
+			}
+
+			// It's a change action from here on.  Process the action we got
+
+			// IO actions are usually the most common. Test for them first
+			if (action == FLG_WR) {
+				task_handle_io_event(t, FLG_WR);	// Releases the task lock
+				continue;
+			}
+
+			if (action == FLG_RD) {
+				task_handle_io_event(t, FLG_RD);	// Releases the task lock
+				continue;
+			}
+
+			if (action == FLG_RT) {
+				task_activate_rd_timeout(t);
+				task_unlock(t, FLG_NONE);
+				continue;
+			}
+
+			if (action == FLG_WT) {
+				task_activate_wr_timeout(t);
+				task_unlock(t, FLG_NONE);
+				continue;
+			}
+
+			if (likely(action == FLG_TM)) {
+				task_update_timer(t);			// Releases the task lock
+				continue;
+			}
+
+			// Handle a migration notification
+			if (action == FLG_MG) {
+				if (t->preferred_worker != NULL) {
+					if (t->preferred_worker != w) {
+						// We're the sender
+						worker_handle_task_migration(w, t);
+					} else {
+						// We're the receiver
+						t->preferred_worker = NULL;
+
+						// Re-attach any timer nodes as needed
+						worker_timer_update(w, &t->tm_tt, t->tfd);
+						worker_timer_update(w, &t->rd_tt, t->tfd);
+						worker_timer_update(w, &t->wr_tt, t->tfd);
+					}
+				}
+				task_unlock(t, action);
+				continue;
+			}
+
+			// Bad action type
+			assert(0);
 		}
 
-		// Bad action type
-		assert(0);
-	}
-
-	w->notifyqlen -= num_processed;
-
-	// Concat any remainder back to the actual lists
-	if (likely(tq != NULL)) {
-		TAILQ_CONCAT(&w->notifyq, &notifyq, list);
-	}
-
-	if (likely(!TAILQ_EMPTY(&freeq))) {
-		TAILQ_CONCAT(&w->freeq, &freeq, list);
+		if (num_processed > 0) {
+			if (locked) {
+				// Concat any remainder back to the actual lists
+				worker_lock(w);
+				w->notifyqlen_locked -= num_processed;
+				TAILQ_CONCAT(&w->notifyq_locked, &notifyq, list);
+				TAILQ_CONCAT(&freeq, &w->freeq_locked, list);
+				TAILQ_CONCAT(&w->freeq_locked, &freeq, list);
+				worker_unlock(w);
+			} else {
+				// Concat any remainder back to the actual lists
+				w->notifyqlen -= num_processed;
+				TAILQ_CONCAT(&w->notifyq, &notifyq, list);
+				TAILQ_CONCAT(&freeq, &w->freeq, list);
+				TAILQ_CONCAT(&w->freeq, &freeq, list);
+			}
+		}
 	}
 
 // Uncomment the following definition to turn on notifyqlen validation
@@ -3806,7 +3796,7 @@ worker_do_io_epoll(register struct worker *w)
 		// Disable direct callbacks if notifyq's are too long
 		// It's not essential here to get an exact notifyqlen_locked
 		// value, which is why we don't atomically examine it
-		if ((w->notifyqlen + w->notifyqlen_locked) > TASK_MAX_EVENTS) {
+		if ((w->notifyqlen + w->notifyqlen_locked) > (TASK_MAX_EVENTS * 2)) {
 			do_direct = false;
 		}
 
@@ -4107,8 +4097,10 @@ worker_create(struct instance *i, int worker_type)
 		return NULL;
 	}
 
+	size_t sz;
+	for (sz = 1; sz < sizeof(struct worker); sz += sz);
 	// Create the worker state itself
-	if (posix_memalign((void **)&w, (size_t)64, sizeof(struct worker)) != 0) {
+	if (posix_memalign((void **)&w, sz, sz) != 0) {
 		return NULL;
 	}
 	memset(w, 0, sizeof(struct worker));
@@ -4123,7 +4115,7 @@ worker_create(struct instance *i, int worker_type)
 #ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spin_init(&w->spinlock, PTHREAD_PROCESS_PRIVATE);
 #else
-	spin_init(w->lock[0]);
+	spin_init(w->lock);
 #endif
 	TAILQ_INIT(&w->notifyq_locked);
 	TAILQ_INIT(&w->notifyq_batches);
@@ -4436,6 +4428,15 @@ instance_destroy(struct instance *i)
 	memset(i, 0, sizeof(struct instance));
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
+	pthread_mutex_lock(&creation_lock);
+	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
+		if (instances[ti] == i) {
+			instances[ti] = NULL;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&creation_lock);
+	free(i);
 } // instance_destroy
 
 
@@ -4469,7 +4470,10 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		return -1;
 	}
 	for (n = 0; n < pool_size; n++) {
-		task_init(i->tfd_pool + n);
+		struct task *t = i->tfd_pool + n;
+
+		task_init(t);
+		TAILQ_INSERT_TAIL(&i->free_tasks, t, free_list);
 	}
 
 	// Allocate the task sockaddr_storage space now
@@ -4508,7 +4512,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		return -1;
 	}
 	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
-		spin_init(i->tfd_locks_real[n]);
+		spin_init(i->tfd_locks_real + n);
 	}
 	i->tfd_locks = i->tfd_locks_real + 1;
 #endif
@@ -4526,29 +4530,27 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 
 	// Find an unused instance
 	for (ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-		if (instances[ti].state != INSTANCE_STATE_FREE) {
+		if (instances[ti]) {
 			continue;
 		}
-		i = instances + ti;
 		break;
 	}
 
-	if (i == NULL) {
-		goto instance_creation_fail;
-	} else {
-		memset(i, 0, sizeof(struct instance));
-	}
-
-	if ((i->io_workers = (struct worker **)calloc(num_workers_io, sizeof(struct worker *))) == NULL) {
+	if (ti >= TASK_MAX_INSTANCES) {
 		goto instance_creation_fail;
 	}
 
-	if (instance_tfd_pool_init(i, max_tasks) < 0) {
+	size_t sz;
+	for (sz = 1; sz < sizeof(struct instance); sz += sz);
+	if (posix_memalign((void **)&i, sz, sz) != 0) {
 		goto instance_creation_fail;
 	}
+
+	memset(i, 0, sizeof(struct instance));
 
 	i->magic = INSTANCE_MAGIC;
 	i->curtime_us = get_time_us(TASK_TIME_PRECISE);
+	i->ti = ti;
 
 	i->state = INSTANCE_STATE_CREATED;
 	i->thr = pthread_self();
@@ -4561,10 +4563,19 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	TAILQ_INIT(&i->workers_notify);
 	TAILQ_INIT(&i->workers_shutdown);
 	TAILQ_INIT(&i->workers_dead);
+	TAILQ_INIT(&i->free_tasks);
+
+	if ((i->io_workers = (struct worker **)calloc(num_workers_io, sizeof(struct worker *))) == NULL) {
+		goto instance_creation_fail;
+	}
 
 	i->num_workers_io = num_workers_io;	// May get modified downwards later
 	i->num_blocking_workers = 0;
 	i->num_blocking_idle = 0;
+
+	if (instance_tfd_pool_init(i, max_tasks) < 0) {
+		goto instance_creation_fail;
+	}
 
 	pthread_spin_init(&i->cpuspin, PTHREAD_PROCESS_PRIVATE);
 
@@ -4588,7 +4599,9 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
+	instances[ti] = i;
 	pthread_mutex_unlock(&creation_lock);
+
 	return i;
 
 instance_creation_fail:
@@ -4689,11 +4702,11 @@ TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
 	struct task *t;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
 
 	if ((i == NULL) || i->magic != INSTANCE_MAGIC) {
 		errno = EINVAL;
@@ -5322,11 +5335,11 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 	int err;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
 
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EINVAL;
@@ -5368,11 +5381,11 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 	int sock, tfd, err;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
 
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EINVAL;
@@ -5432,13 +5445,19 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	int do_start = 0;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
-	if (i->magic != INSTANCE_MAGIC) {
+	i = instances[ti];
+
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
+		return -1;
+	}
+
+	if (i->state == INSTANCE_STATE_SHUTTING_DOWN) {
+		errno = EOWNERDEAD;
 		return -1;
 	}
 
@@ -5555,11 +5574,12 @@ TASK_instance_destroy(int32_t ti)
 	struct instance *i;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
+
 	if (i->magic != INSTANCE_MAGIC) {
 		errno = EBADF;
 		return -1;
@@ -5585,11 +5605,12 @@ TASK_instance_wait(int32_t ti)
 	struct instance *i;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
+
 	if (i->magic != INSTANCE_MAGIC) {
 		errno = EBADF;
 		return -1;
@@ -5651,11 +5672,12 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 	struct instance *i;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
+
 	if (i->magic != INSTANCE_MAGIC) {
 		errno = EBADF;
 		return -1;
@@ -5686,11 +5708,12 @@ TASK_instance_start(int32_t ti)
 	struct instance *i;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
-		errno = EINVAL;
+		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances + ti;
+	i = instances[ti];
+
 	if (i->magic != INSTANCE_MAGIC) {
 		errno = EBADF;
 		return -1;
@@ -5721,24 +5744,21 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	int num_io_to_spawn = 0;
 
 	pthread_mutex_lock(&creation_lock);
-	do {
+	if (!initialised) {
 		struct sigaction sa[1];
 		int32_t ti;
 
-		if (initialised) break;
-
+// fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
+fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
 		sigaction(SIGPIPE, sa, NULL);
 
 		for(ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-			memset(instances + ti, 0, sizeof(struct instance));
-			i = instances + ti;
-			i->magic = INSTANCE_MAGIC;
-			i->state = INSTANCE_STATE_FREE;
+			instances[ti] = NULL;
 		}
 		initialised = true;
-	} while (false);
+	}
 	pthread_mutex_unlock(&creation_lock);
 
 	// If we're not asked to spawn any io workers then
@@ -5781,7 +5801,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		goto TASK_instance_create_error;
 	}
 
-	return (instances - i);
+	return i->ti;
 
 TASK_instance_create_error:
 	if (i) {

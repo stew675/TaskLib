@@ -129,6 +129,9 @@ loadgen_write_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 		} else {
 			if (errno != EOWNERDEAD) {
 				perror("loadgen_write");
+				if (errno == EINPROGRESS) {
+					assert(0);
+				}
 			}
 		}
 		TASK_close(tfd);

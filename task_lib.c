@@ -43,7 +43,6 @@
 
 #define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768				// The maximum amount that may be read/written in one go
-#define TASK_MAX_EVENTS		1024				// More than this impacts CPU cache lines negatively
 #define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
 
@@ -204,11 +203,11 @@ struct task {
 
 	struct worker			*worker;		// The current io worker task is bound to
 	int32_t				fd;			// The actual system socket FD we're working on
+	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 	uint32_t			io_depth;		// How many direct calls to allow before queueing
 	uint32_t			notifyqlen;		// Number of notifyq entries this task has
 	int32_t				cb_errno;		// Errno we want to propagate on callbacks
 	uint32_t			tfd_index;		// The node index in the table
-	int32_t				tfd_iteration;		// The iteration on the node
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -290,9 +289,10 @@ struct task {
 	// cache line (64 bytes width) as that will get flushed when it gets updated.
 	__attribute__ ((aligned(64))) uint64_t	notifyqlen_locked; // Number of locked notifyq entries this task has
 	struct worker			*preferred_worker;	// To initiate task io worker migration
-	STAILQ_ENTRY(task)		free_list;		// List of free tasks
 	struct ntfyq_list		accept_children;	// The list of child accept tasks
+	STAILQ_ENTRY(task)		free_list;		// List of free tasks
 	uint32_t			migrations;		// Number of times the task has migrated
+	int32_t				tfd_iteration;		// The iteration on the node
 	socklen_t			addrlen;		// The valid length of the data in .addr
 } __attribute__ ((aligned(64)));	// Round up to the nearest 64 byte boundary
 
@@ -333,8 +333,12 @@ struct worker {
 
 	pthread_t			thr;
 	uint64_t			num_tasks;
+	struct epoll_event 		*events;
+	int32_t				max_events;
+	int				max_epfds;
+	int				*epfd;
+	int				*epfd_used;
 	int				evfd;
-	int				epfd;
 	int				notified;
 	int				affined_cpu;
 	uint64_t			processed_total;
@@ -802,6 +806,7 @@ task_init(struct task *t)
 	STAILQ_INIT(&t->accept_children);
 	t->age = get_time_us(TASK_TIME_COARSE);		// Set the age
 	t->tfd = TFD_NONE;
+	t->epfd = -1;
 
 	t->tfd_iteration = iteration;
 } // task_init
@@ -1536,7 +1541,7 @@ task_cancel_write(struct task *t)
 
 #ifdef USE_EPOLLONESHOT
 	// Ensure to call EPOLL_CTL_MOD
-	if (epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) == 0) {
+	if (epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) == 0) {
 		t->committed_events = (t->ev.events & 0xff);
 	}
 #endif
@@ -1559,13 +1564,60 @@ task_cancel_read(struct task *t)
 
 #ifdef USE_EPOLLONESHOT
 	// Ensure to call EPOLL_CTL_MOD
-	if (epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) == 0) {
+	if (epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) == 0) {
 		t->committed_events = (t->ev.events & 0xff);
 	}
 #endif
 
 	t->active_flags &= ~(FLG_RD);
 } // task_cancel_read
+
+
+static inline void
+task_acquire_epfd(struct task *t)
+{
+	register struct worker *w = t->worker;
+	register int n;
+
+	// Assign an epfd to the task
+	worker_lock(w);
+
+	if (t->epfd >= 0) {
+		worker_unlock(w);
+		return;
+	}
+
+	for (n = 0; n < w->max_epfds; n++) {
+		if (w->epfd_used[n] < w->max_events) {
+			w->epfd_used[n]++;
+			break;
+		}
+	}
+
+	worker_unlock(w);
+
+	assert (n < w->max_epfds);
+	t->epfd = w->epfd[n];
+} // task_acquire_epfd
+
+
+static inline void
+task_release_epfd(struct task *t)
+{
+	register struct worker *w = t->worker;
+
+	// De-reference the task from the worker's epfd count
+	worker_lock(w);
+	for (register int n = 0; n < w->max_epfds; n++) {
+		if (t->epfd == w->epfd[n]) {
+			w->epfd_used[n]--;
+			break;
+		}
+	}
+	worker_unlock(w);
+
+	t->epfd = -1;
+} // task_release_epfd
 
 
 static inline void
@@ -1590,15 +1642,17 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 	__thr_preferred_worker = NULL;
 
 	if (t->fd >= 0) {
+
 		// If it's a user registered socket, do not close it, just de-register it from epoll
 		if (unlikely(t->registered_fd)) {
-			epoll_ctl(t->worker->epfd, EPOLL_CTL_DEL, t->fd, NULL);
+			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 		} else {
 			shutdown(t->fd, SHUT_RDWR);
 			close(t->fd);
 		}
 		t->active_flags &= ~(FLG_PW | FLG_PI | FLG_PO);	// Disable All Poll Wait Flags Now
 		t->fd = -1;
+		task_release_epfd(t);
 		task_cancel_read(t);
 		task_cancel_write(t);
 	}
@@ -2117,10 +2171,6 @@ worker_destroy(struct worker *w)
 
 	// While technically 0 is a valid fd number, that's also stdin, and we're assuming that is still there
 	// and will never have been chosen for any of the worker's fd's
-	if (w->epfd >= 0) {
-		close(w->epfd);
-		w->epfd = 0;
-	}
 	if (w->evfd >= 0) {
 		close(w->evfd);
 		w->evfd = 0;
@@ -2128,6 +2178,22 @@ worker_destroy(struct worker *w)
 	if (w->timer_queue) {
 		pheap_destroy(w->timer_queue, NULL);
 		w->timer_queue = NULL;
+	}
+	if (w->epfd) {
+		for (int32_t n = 0; n < w->max_epfds; n++) {
+			close(w->epfd[n]);
+		}
+		free(w->epfd);
+		w->epfd = NULL;
+	}
+	if (w->epfd_used) {
+		free(w->epfd_used);
+		w->epfd_used = NULL;
+	}
+	if (w->events) {
+		free(w->events);
+		w->events = NULL;
+		w->max_events = 0;
 	}
 
 #ifdef USE_PTHREAD_SPINLOCKS
@@ -2421,6 +2487,9 @@ task_activate_wr_timeout(register struct task *t)
 static inline int
 task_create_event_flag(register struct task *t)
 {
+
+	task_acquire_epfd(t);
+
 	t->ev.data.u64 = (uint64_t)t->tfd;
 	if (likely(t->rd_shut == false)) {
 		t->ev.events |= EPOLLRDHUP;
@@ -2431,7 +2500,7 @@ task_create_event_flag(register struct task *t)
 	t->ev.events |= EPOLLONESHOT;
 #endif
 
-	register int res = epoll_ctl(t->worker->epfd, EPOLL_CTL_ADD, t->fd, &t->ev);
+	register int res = epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &t->ev);
 
 #ifdef USE_EPOLLET
 	// Only turn on EPOLLET AFTER the add, or we race
@@ -2440,6 +2509,10 @@ task_create_event_flag(register struct task *t)
 		t->ev.events |= EPOLLET;
 	}
 #endif
+
+	if (res < 0) {
+		task_release_epfd(t);
+	}
 
 	return res;
 } // task_create_event_flag
@@ -2465,14 +2538,14 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 
 	t->ev.events |= flags;
 
-	if (likely(t->ev.data.u64 != TFDU_NONE)) {
-		if (unlikely(epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
+	if (unlikely(t->epfd < 0)) {
+		// We need to to EPOLL_CTL_ADD instead
+		if (task_create_event_flag(t) < 0) {
 			t->ev.events &= ~flags;
 			return -1;
 		}
 	} else {
-		// We need to to EPOLL_CTL_ADD instead
-		if (task_create_event_flag(t) < 0) {
+		if (unlikely(epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
 			t->ev.events &= ~flags;
 			return -1;
 		}
@@ -2530,7 +2603,7 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 	}
 #endif
 
-	res = epoll_ctl(t->worker->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
+	res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
 	if (likely(res == 0)) {
 		t->committed_events = (t->ev.events & 0xff);
 	}
@@ -3445,14 +3518,21 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	worker_timer_update(w, &t->wr_tt, TFD_NONE);
 
 	// Cancel any epoll_wait on this worker, and move to new
-	if ((t->fd >= 0) && (t->ev.events)) {
-		if (epoll_ctl(w->epfd, EPOLL_CTL_DEL, t->fd, &t->ev) == 0) {
+	if ((t->fd >= 0) && (t->epfd >= 0)) {
+		if (epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, &t->ev) == 0) {
 			t->committed_events = 0;
 		}
+		t->worker = w;
+		task_release_epfd(t);
+
 #ifdef USE_EPOLLET
 		t->ev.events &= ~(EPOLLET);		// Don't do an ADD with EPOLLET set
 #endif
-		if (epoll_ctl(tw->epfd, EPOLL_CTL_ADD, t->fd, &t->ev) == 0) {
+
+		t->worker = tw;
+		task_acquire_epfd(t);
+		if (epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &t->ev) == 0) {
+			task_release_epfd(t);
 			t->committed_events = (t->ev.events & 0xff);
 		}
 #ifdef USE_EPOLLET
@@ -3767,29 +3847,29 @@ get_next_epoll_timeout_ms(struct worker *w)
 static void
 worker_do_io_epoll(register struct worker *w)
 {
-	struct epoll_event events[TASK_MAX_EVENTS];
-	register int wait_time = 0, nfds = TASK_MAX_EVENTS;
-	register bool do_direct = true;
+	register int wait_time = 0, en;
 
 	// Determine the initial time we want to be waiting in epoll for
 	wait_time = get_next_epoll_timeout_ms(w);
-	while (true) {
-		// Disable direct callbacks if notifyq's are too long
-		// It's not essential here to get an exact notifyqlen_locked
-		// value, which is why we don't atomically examine it
-		if ((w->notifyqlen + w->notifyqlen_locked) > (TASK_MAX_EVENTS * 2)) {
-			do_direct = false;
+	for (en = 0; en < w->max_epfds; en++, wait_time = 0) {
+		register int nfds;
+
+		// Skip if nothing is registered
+		if (w->epfd_used[en] == 0) {
+			continue;
 		}
 
 		// Wait for something to happen!
-		nfds = epoll_wait(w->epfd, events, TASK_MAX_EVENTS, wait_time);
-
-		if (nfds < 0) {
-			if (errno == EINTR) {
-				continue;
+		while (true) {
+			nfds = epoll_wait(w->epfd[en], w->events, w->max_events, wait_time);
+			if (nfds < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				perror("epoll_wait");
+				worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
+				return;
 			}
-			perror("epoll_wait");
-			worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
 			break;
 		}
 
@@ -3797,20 +3877,14 @@ worker_do_io_epoll(register struct worker *w)
 		worker_check_timeouts(w);
 
 		if (nfds == 0) {
-			break;
-		}
-
-		// Quick load check.  If there's too much going on just put the events
-		// directly onto the notify queue, otherwise, make direct callbacks
-		if (nfds == TASK_MAX_EVENTS) {
-			do_direct = false;
+			continue;
 		}
 
 		// Scan through the list of all the events we've received
 		for (int n = 0; likely(n < nfds); n++) {
-			register int64_t tfd = (int64_t)events[n].data.u64;
+			register int64_t tfd = (int64_t)w->events[n].data.u64;
 			register uint32_t tfdi = (uint32_t)(tfd & 0xffffffff);
-			register uint32_t revents = events[n].events;
+			register uint32_t revents = w->events[n].events;
 			register struct task *t;
 
 			if (unlikely(++w->processed_total >= w->processed_tc)) {
@@ -3846,7 +3920,7 @@ worker_do_io_epoll_fail:
 				t->rd_shut = true;
 				t->wr_shut = true;
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				epoll_ctl(w->epfd, EPOLL_CTL_DEL, t->fd, NULL);
+				epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 				if (t->active_flags & FLG_RD) {
 					task_handle_io_event(t, FLG_RD);	// Unlocks  the task
 					continue;
@@ -3889,31 +3963,16 @@ worker_do_io_epoll_fail:
 				if (revents & EPOLLOUT) {
 					task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
 					task_notify_action(t, FLG_WR);			// If a write is active too, just queue it
-					if (do_direct) {
-						task_handle_io_event(t, FLG_RD);	// Unlocks the task
-					} else {
-						task_notify_action(t, FLG_RD);
-						task_unlock(t, FLG_NONE);
-					}
+					task_handle_io_event(t, FLG_RD);	// Unlocks the task
 					continue;
 				} else {
 					task_lower_event_flag(t, EPOLLIN);
-					if (do_direct) {
-						task_handle_io_event(t, FLG_RD);	// Unlocks the task
-					} else {
-						task_notify_action(t, FLG_RD);
-						task_unlock(t, FLG_NONE);
-					}
+					task_handle_io_event(t, FLG_RD);	// Unlocks the task
 					continue;
 				}
 			} else if (revents & EPOLLOUT) {
 				task_lower_event_flag(t, EPOLLOUT);
-				if (do_direct) {
-					task_handle_io_event(t, FLG_WR);		// Unlocks the task
-				} else {
-					task_notify_action(t, FLG_WR);
-					task_unlock(t, FLG_NONE);
-				}
+				task_handle_io_event(t, FLG_WR);		// Unlocks the task
 				continue;
 			}
 
@@ -3926,12 +3985,6 @@ worker_do_io_epoll_fail:
 #endif
 			task_unlock(t, FLG_NONE);
 		}
-
-		if (nfds < TASK_MAX_EVENTS) {
-			break;
-		}
-
-		wait_time = 0;
 	}
 } // worker_do_epoll
 
@@ -4072,19 +4125,35 @@ static struct worker *
 worker_create(struct instance *i, int worker_type)
 {
 	struct worker *w = NULL;
+	register size_t page_size = sysconf(_SC_PAGESIZE), sz;
 
 	if ((worker_type != WORKER_TYPE_IO) && (worker_type != WORKER_TYPE_BLOCKING)) {
 		errno = EINVAL;
 		return NULL;
 	}
 
-	size_t sz;
 	for (sz = 1; sz < sizeof(struct worker); sz += sz);
 	// Create the worker state itself
 	if (posix_memalign((void **)&w, sz, sz) != 0) {
 		return NULL;
 	}
 	memset(w, 0, sizeof(struct worker));
+
+	w->max_events = page_size / sizeof(struct epoll_event);
+	w->max_epfds = i->tfd_pool_size + (w->max_events * i->num_workers_io) - 1;
+	w->max_epfds /= (i->num_workers_io * w->max_events);
+
+	if ((w->epfd = (int *)calloc(w->max_epfds, sizeof(int))) == NULL) {
+		goto worker_create_failed;
+	}
+
+	if ((w->epfd_used = (int *)calloc(w->max_epfds, sizeof(int))) == NULL) {
+		goto worker_create_failed;
+	}
+
+	if (posix_memalign((void **)&w->events, page_size, page_size) != 0) {
+		goto worker_create_failed;
+	}
 
 	// Now initialise the worker state
 	w->magic = WORKER_MAGIC;
@@ -4105,10 +4174,12 @@ worker_create(struct instance *i, int worker_type)
 	STAILQ_INIT(&w->freeq);
 
 	if (w->type == WORKER_TYPE_IO) {
-		// Create epoll fd for incoming task events
-		if ((w->epfd = epoll_create1(0)) < 0) {
-			// epoll_create1 will set errno
-			goto worker_create_failed;
+		for (int n = 0; n < w->max_epfds; n++) {
+			// Create epoll fd for incoming task events
+			if ((w->epfd[n] = epoll_create1(0)) < 0) {
+				// epoll_create1 will set errno
+				goto worker_create_failed;
+			}
 		}
 
 		// Create event fd for task event loop notifications
@@ -4122,15 +4193,14 @@ worker_create(struct instance *i, int worker_type)
 
 			ev->events = EPOLLIN;
 			ev->data.u64 = TFD_NONE;
-			if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->evfd, ev) < 0) {
+			if (epoll_ctl(w->epfd[0], EPOLL_CTL_ADD, w->evfd, ev) < 0) {
 				// epoll_ctl will set errno
 				goto worker_create_failed;
 			}
+			w->epfd_used[0] = 1;
 		}
 	} else if (w->type == WORKER_TYPE_BLOCKING) {
 		// Blocking workers use a blocking eventfd and just wait on that instead of epoll_wait
-		w->epfd = -1;
-
 		if ((w->evfd = eventfd(0, 0)) < 0) {
 			// eventfd will set errno
 			goto worker_create_failed;
@@ -5729,9 +5799,9 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		struct sigaction sa[1];
 		int32_t ti;
 
-//fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
-//fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
-//fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));
+fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
+fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
+fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
 		sigaction(SIGPIPE, sa, NULL);
@@ -5768,7 +5838,8 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	i->per_task_sndbuf = tcp_sndbuf_size;
 
 	// Create our workers now
-	int nio = 0;
+	i->num_workers_io = num_io_to_spawn;
+	uint32_t nio = 0;
 	for (int n = 0; n < num_io_to_spawn; n++) {
 		struct worker *w;
 
@@ -5776,7 +5847,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 			i->io_workers[nio++] = w;
 		}
 	}
-	i->num_workers_io = nio;
+	assert(i->num_workers_io == nio);
 
 	if (i->num_workers_io == 0) {
 		errno = ENOMEM;

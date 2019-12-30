@@ -46,7 +46,8 @@
 #define TASK_MAX_EVENTS		1024				// More than this impacts CPU cache lines negatively
 #define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
-#define	TASK_MAX_TFD_LOCKS	253				// Number of TFD spinlocks in an instance's lock pool
+#define	TASK_MAX_TFD_LOCKS	256				// Number of TFD spinlocks in an instance's lock pool
+								// Best if this is kept as an even power of 2
 
 // I highly recommend NOT fiddling with the COLT1 value unless you understand what it will impact
 #define	WORKER_TIME_COLT1	4500000				// 4s (expressed in microseconds)
@@ -110,9 +111,8 @@ typedef enum {
 // The ordering of these tasks states is important
 typedef enum {
 	TASK_STATE_UNUSED = 0,		// Idle
-	TASK_STATE_ACTIVE,		// In the FD table
-	TASK_STATE_DESTROY,		// Waiting for worker to kill it
-	TASK_STATE_MAX = INT32_MAX	// Force 32-bit size
+	TASK_STATE_ACTIVE = 1,		// In the FD table
+	TASK_STATE_DESTROY = 2		// Waiting for worker to kill it
 } task_state_t;
 
 typedef enum {
@@ -121,22 +121,19 @@ typedef enum {
 	TASK_TYPE_TIMER = 2,
 	TASK_TYPE_CONNECT = 3,
 	TASK_TYPE_ACCEPT_PARENT = 4,
-	TASK_TYPE_ACCEPT_CHILD = 5,
-	TASK_TYPE_MAX = INT32_MAX
+	TASK_TYPE_ACCEPT_CHILD = 5
 } task_type_t;
 
 typedef enum {
 	TASK_READ_STATE_IDLE = 0,
 	TASK_READ_STATE_VECTOR = 1,
-	TASK_READ_STATE_BUFFER = 2,
-	TASK_READ_STATE_MAX = INT32_MAX
+	TASK_READ_STATE_BUFFER = 2
 } task_rd_state_t;
 
 typedef enum {
 	TASK_WRITE_STATE_IDLE = 0,
 	TASK_WRITE_STATE_VECTOR = 1,
-	TASK_WRITE_STATE_BUFFER = 2,
-	TASK_WRITE_STATE_MAX = INT32_MAX
+	TASK_WRITE_STATE_BUFFER = 2
 } task_wr_state_t;
 
 enum {
@@ -175,124 +172,131 @@ typedef enum {
 struct ntfyq {
 	TAILQ_ENTRY(ntfyq)		list;
 	uint64_t			tfd;
-	task_action_flag_t		action;
-	bool				locked;
-};
+	uint32_t			action;
+	uint32_t			locked;
+} __attribute__ ((aligned(32)));
 
 struct task_timer {
 	int64_t			tfd;		// TFD this timer is associated with
 	int64_t			expiry_us;	// The expiry time
+	int64_t			expires_in_us;	// When it will expire
 	void			*node;		// The paired heap node
 	struct task_timer	*next;		// Next cool-off list entry
 	struct task_timer	*prev;		// Previous cool-off list entry
 };
 
+// The strategy for the data layout is this.
 struct task {
-	// General task information
-	// 64 bytes of "hot" items before notifyqlen_locked
-__attribute__ ((aligned(64))) task_action_flag_t active_flags;	// Which flags are active
-	task_type_t			type;			// Type of task
-	task_state_t			state;			// Operational state of the task
+	//===================================  64 BYTE BOUNDARY    =====================================//
+
+	// General task information.  Every task structure is aligned to a 64-byte boundary. We pack 
+	// as much hot information as we can into the first single CPU cache line size of 64 bytes
+
+	uint32_t			active_flags;		// Which flags are active
+	uint32_t			type:3,			// Type of task
+					rd_state:2,		// Which read operation is in progress
+					wr_state:2,		// Which write operation is in progress
+					registered_fd:1,	// If the FD was registered by the user
+					state:2,		// Operational state of the task
+					rd_shut:1,		// If the read side is shutdown
+					wr_shut:1,		// If the write side is shutdown
+					forward_close:1,	// Temporarily allow close action forwarding
+					unused:19;
 	int64_t				tfd;			// Task File Descriptor that identifies this task
-	uint32_t			tfd_index;		// The node index in the table
-	int32_t				fd;			// The actual system socket FD we're working on
-	int32_t				cb_errno;		// Errno we want to propagate on callbacks
-	uint32_t			io_depth;		// How many direct calls to allow before queueing
 	struct epoll_event		ev;			// The current epoll events we're waiting on
-	struct worker			*worker;		// The current io worker task is bound to
-	uint32_t			notifyqlen;		// Number of notifyq entries this task has
 	uint32_t			committed_events;	// Events verifiably committed via epoll_ctl
-	int64_t				age;			// Time this task was created
-	uint32_t			migrations;		// Number of times the task has migrated
+
+	struct worker			*worker;		// The current io worker task is bound to
+	int32_t				fd;			// The actual system socket FD we're working on
+	uint32_t			io_depth;		// How many direct calls to allow before queueing
+	uint32_t			notifyqlen;		// Number of notifyq entries this task has
+	int32_t				cb_errno;		// Errno we want to propagate on callbacks
+	uint32_t			tfd_index;		// The node index in the table
 	int32_t				tfd_iteration;		// The iteration on the node
-	struct worker			*preferred_worker;	// To initiate task io worker migration
 
-	//----------------------------------------------------------------------------------------------//
-	//=================================    TASK CLOSURE FIELDS    ==================================//
-	//----------------------------------------------------------------------------------------------//
-
-	// The close cb to inform use to close the task.  It is automatically inherited by newly
-	// accepted tasks until the user sets it to something else.
-	void				*close_cb_data;		//  User data to pass to the close callback
-	void				(*close_cb)(int64_t tfd, void *close_cb_data);
-	bool				forward_close;		// Temporarily allow close action forwarding
-	bool				registered_fd;		// If the FD was registered by the user
+	//===================================  64 BYTE BOUNDARY    =====================================//
 
 	//----------------------------------------------------------------------------------------------//
 	//=================================    TIMER CONTROL FIELDS    =================================//
 	//----------------------------------------------------------------------------------------------//
 
 	// Timer Task Information
-	struct task_timer		tm_tt;
+	struct task_timer		tm_tt;			// 48 bytes - Timer Information
 	void				*tm_cb_data;
 	void				(*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
 
-	//----------------------------------------------------------------------------------------------//
-	//================================    WRITE DIRECTION FIELDS   =================================//
-	//----------------------------------------------------------------------------------------------//
+	//===================================  64 BYTE BOUNDARY    =====================================//
 
-	// Connect is treated as a special form of write
-	void				*connect_cb_data;
-	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
+	//----------------------------------------------------------------------------------------------//
+	//=================================    WRITE CONTROL FIELDS    =================================//
+	//----------------------------------------------------------------------------------------------//
 
 	// General Write Fields
-	struct task_timer		wr_tt;
-	bool				wr_shut;		// If Write side is shutdown
-	task_wr_state_t			wr_state;
-	size_t				wr_total;
+	struct task_timer		wr_tt;			// 48 bytes - WR Timeout Information
+	const char			*wr_buf;
 	void				*wr_cb_data;
 
+	//===================================  64 BYTE BOUNDARY    =====================================//
+
 	// Data write fields
+	size_t				wr_total;
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
-	const char			*wr_buf;
-	void				(*wr_cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data);
-
-	// Data writev fields
 	size_t				wrv_buflen;
 	size_t				wrv_bufpos;
 	const struct iovec		*wrv_iov;
-	int				wrv_iovcnt;
+	void				(*wr_cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data);
 	void				(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data);
 
+	//===================================  64 BYTE BOUNDARY    =====================================//
+
 	//----------------------------------------------------------------------------------------------//
-	//================================    READ DIRECTION FIELDS    =================================//
+	//==================================    READ CONTROL FIELDS    =================================//
 	//----------------------------------------------------------------------------------------------//
 
-	// Accept is a treated as a special form of reading
-	void				*accept_cb_data;
-	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
-	struct ntfyq_list		accept_children;
-
-	// General Read Fields
-	struct task_timer		rd_tt;
-	bool				rd_shut;		// If Read side is shutdown
-	task_rd_state_t			rd_state;
-	size_t				rd_total;
+	struct task_timer		rd_tt;			// 48 bytes - RD Timeout Information
+	char				*rd_buf;
 	void				*rd_cb_data;
 
-	// Data read fields
+	//===================================  64 BYTE BOUNDARY    =====================================//
+
+	size_t				rd_total;
 	size_t				rd_buflen;
 	size_t				rd_bufpos;
-	char				*rd_buf;
-	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
-
-	// Data readv fields
 	size_t				rdv_buflen;
 	size_t				rdv_bufpos;
 	const struct iovec		*rdv_iov;
-	int				rdv_iovcnt;
+	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
 	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
 
-	// notifyqlen_locked is updated by an atomic count operation.  We want to keep it on its own
-	// CPU cache line (64 bytes width). We stick the end of the structure for this reason
-	__attribute__ ((aligned(64))) uint64_t	notifyqlen_locked;	// Number of locked notifyq entries this task has
+	//===================================  64 BYTE BOUNDARY    =====================================//
 
-	// For TASK_TYPE_ACCEPT tasks, addr refers to the local address we're listening on
-	// For TASK_TYPE_IO/CONNECT tasks, addr refers to the remote communication address
-	struct sockaddr_storage		addr;			// An IPv4/6 address
+	//----------------------------------------------------------------------------------------------//
+	//===================================    CALLBACK FIELDS    ====================================//
+	//----------------------------------------------------------------------------------------------//
+
+	int32_t				wrv_iovcnt;
+	int32_t				rdv_iovcnt;
+	int64_t				age;			// Time this task was created
+	void				*accept_cb_data;
+	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
+	void				*connect_cb_data;
+	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
+	void				*close_cb_data;		//  User data to pass to the close callback
+	void				(*close_cb)(int64_t tfd, void *close_cb_data);
+
+	//===================================  64 BYTE BOUNDARY    =====================================//
+
+	struct worker			*preferred_worker;	// To initiate task io worker migration
+	struct ntfyq_list		accept_children;	// The list of child accept tasks
+	uint32_t			migrations;		// Number of times the task has migrated
 	socklen_t			addrlen;		// The valid length of the data in .addr
 
+	//==================================  64 BYTE BOUNDARY    ====================================//
+
+	// notifyqlen_locked is updated by an atomic count operation.  We want to keep it on its own CPU
+	// cache line (64 bytes width) as that will get flushed when it gets updated.
+	__attribute__ ((aligned(64))) uint64_t	notifyqlen_locked; // Number of locked notifyq entries this task has
 } __attribute__ ((aligned(64)));	// Round up to the nearest 64 byte boundary
 
 typedef enum {
@@ -317,13 +321,19 @@ struct instance;
 struct worker {
 	uint32_t			magic;
 #define WORKER_MAGIC	0xa3b6c9e1
-
+	uint32_t			notifyqlen;
+	uint32_t			notifyqlen_locked;
+	uint32_t			type;
 	void				*timer_queue;
 	int64_t				curtime_us;
+	struct ntfyq_list		notifyq_batches;
 
-	worker_type_t			type;
-	worker_state_t			state;
-	worker_state_t			old_state;
+	struct ntfyq_list		notifyq;
+	struct ntfyq_list		freeq;
+	struct ntfyq_list		notifyq_locked;
+	struct ntfyq_list		freeq_locked;
+
+
 	pthread_t			thr;
 	uint64_t			num_tasks;
 	int				evfd;
@@ -332,14 +342,6 @@ struct worker {
 	int				affined_cpu;
 	uint64_t			processed_total;
 	uint64_t			processed_tc;
-
-	struct ntfyq_list		notifyq;
-	struct ntfyq_list		freeq;
-	uint32_t			notifyqlen;
-
-	struct ntfyq_list		notifyq_locked;
-	struct ntfyq_list		freeq_locked;
-	uint32_t			notifyqlen_locked;
 
 	// Timer cool of list stuff
 	int64_t				colt_next;
@@ -354,6 +356,8 @@ struct worker {
 
 	struct instance			*instance;
 	TAILQ_ENTRY(worker)		list;
+	worker_state_t			state;
+	worker_state_t			old_state;
 
 	// Put this all by itself at the end
 #ifdef USE_PTHREAD_SPINLOCKS
@@ -376,7 +380,7 @@ struct cpuinfo {
 	struct worker			**workers;
 	int				worker_pos;
 	int				num_workers;
-};
+} __attribute__ ((aligned(32)));;
 
 struct instance {
 	uint32_t			magic;
@@ -398,12 +402,20 @@ struct instance {
 
 	// TFD->task pool
 	struct task			*tfd_pool;		// The total pool of tasks we can work with
+
+	// For TASK_TYPE_ACCEPT tasks, addr refers to the local address we're listening on
+	// For TASK_TYPE_IO/CONNECT tasks, addr refers to the remote communication address
+	struct sockaddr_storage		*tfd_addrs;		// Addresses for tasks within the task pool
 	uint64_t			tfd_pool_used;		// The total number of active tasks in the pool
 	uint32_t			tfd_pool_size;
 #ifdef USE_PTHREAD_SPINLOCKS
-__attribute__ ((aligned(64))) pthread_spinlock_t tfd_locks[TASK_MAX_TFD_LOCKS];
+//__attribute__ ((aligned(64))) pthread_spinlock_t tfd_locks[TASK_MAX_TFD_LOCKS];
+	pthread_spinlock_t		*tfd_locks_real;
+	pthread_spinlock_t		*tfd_locks;
 #else
-__attribute__ ((aligned(64))) spin_lock_t tfd_locks[TASK_MAX_TFD_LOCKS];
+//__attribute__ ((aligned(64))) spin_lock_t tfd_locks[TASK_MAX_TFD_LOCKS];
+	spin_lock_t			*tfd_locks_real;
+	spin_lock_t			*tfd_locks;
 #endif
 
 	struct worker			*instance_worker;
@@ -458,11 +470,11 @@ static struct instance		instances[TASK_MAX_INSTANCES];
 #define	lockless_worker(w)	(w == __thr_current_worker)
 
 #ifdef USE_PTHREAD_SPINLOCKS
-#define	tfd_lock(lock_index)	pthread_spin_lock(__thr_current_instance->tfd_locks + ((lock_index) % TASK_MAX_TFD_LOCKS))
-#define	tfd_unlock(lock_index)	pthread_spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) % TASK_MAX_TFD_LOCKS))
+#define	tfd_lock(lock_index)	pthread_spin_lock(__thr_current_instance->tfd_locks + ((lock_index) % TASK_MAX_TFD_LOCKS)
+#define	tfd_unlock(lock_index)	pthread_spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) % TASK_MAX_TFD_LOCKS)
 #else
-#define	tfd_lock(lock_index)	spin_lock(__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)])
-#define	tfd_unlock(lock_index)	spin_unlock(__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)])
+#define	tfd_lock(lock_index)	spin_lock(__thr_current_instance->tfd_locks[(lock_index) % TASK_MAX_TFD_LOCKS])
+#define	tfd_unlock(lock_index)	spin_unlock(__thr_current_instance->tfd_locks[(lock_index) % TASK_MAX_TFD_LOCKS])
 #endif
 
 // ---------------------------------------------------------------------------------------------//
@@ -808,7 +820,7 @@ task_free(struct task *t)
 static void
 task_unlock(struct task *t, task_action_flag_t action)
 {
-	register uint64_t tfdi = (t->tfd & 0xffffffff);
+	register uint64_t tfdi = t->tfd_index;
 
 	t->active_flags &= ~(action);
 	if (unlikely(t->state == TASK_STATE_DESTROY)) {
@@ -1304,42 +1316,6 @@ instance_unlock(struct instance *i)
 } // instance_unlock
 
 
-// ---------------------------------------------------------------------------------------------//
-// 				Task FD Pool Managment API					//
-// ---------------------------------------------------------------------------------------------//
-
-static int
-instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
-{
-	uint32_t n;
-	// Don't allow less than 250 tfd entries for pool size
-	pool_size = (pool_size < 250) ? 250 : pool_size;
-
-	// Make actual pool size be 130% of what was asked for hashing efficiency
-	pool_size += 200;	// To allow for any listener and timer tasks
-	pool_size *= 1.3;
-
-	i->tfd_pool_used = 0;
-	i->tfd_pool_size = pool_size;
-	i->tfd_pool = (struct task *)calloc(pool_size, sizeof(struct task));
-	if (i->tfd_pool == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	for (n = 0; n < pool_size; n++) {
-		task_init(i->tfd_pool + n);
-	}
-	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
-#ifdef USE_PTHREAD_SPINLOCKS
-		pthread_spin_init(i->tfd_locks + n, PTHREAD_PROCESS_PRIVATE);
-#else
-		spin_init(i->tfd_locks[n]);
-#endif
-	}
-	return 0;
-} // instance_tfd_pool_init
-
-
 static int
 notifier_write(int fd)
 {
@@ -1399,6 +1375,7 @@ worker_notify_get_free_ntfyq(struct worker *w)
 	if (likely(lockless_worker(w))) {
 		if (likely((tq = TAILQ_FIRST(&w->freeq)) != NULL)) {
 			TAILQ_REMOVE(&w->freeq, tq, list);
+			memset(tq, 0, sizeof(struct ntfyq));
 			return tq;
 		}
 	} else {
@@ -1411,13 +1388,34 @@ worker_notify_get_free_ntfyq(struct worker *w)
 		worker_unlock(w);
 	}
 
-	tq = (struct ntfyq *)calloc(1, sizeof(struct ntfyq));
-	if (likely(tq != NULL)) {
-		return tq;
+	register size_t page_size = sysconf(_SC_PAGESIZE), batch_size, n;
+	struct ntfyq *ntq = NULL;
+
+	// Grab an aligned system page of memory, and we'll dice it up ourselves
+	if (posix_memalign((void **)&ntq, page_size, page_size) != 0) {
+		return NULL;
+	}
+	tq = ntq;
+	memset(tq, 0, page_size);
+	batch_size = page_size / sizeof(struct ntfyq);
+
+	// We don't use the first entry, but instead stick it on a worker list
+	// so we have a list of what memory to pass to free() later
+	worker_lock(w);
+	TAILQ_INSERT_TAIL(&w->notifyq_batches, tq, list);
+	if (likely(lockless_worker(w))) {
+		worker_unlock(w);
+		for (n = 2; n < batch_size; n++) {
+			TAILQ_INSERT_TAIL(&w->freeq, (tq + n), list);
+		}
+	} else {
+		for (n = 2; n < batch_size; n++) {
+			TAILQ_INSERT_TAIL(&w->freeq_locked, (tq + n), list);
+		}
+		worker_unlock(w);
 	}
 
-	errno = ENOMEM;
-	return NULL;
+	return tq + 1;
 } // worker_notify_get_free_ntfyq
 
 
@@ -2112,6 +2110,11 @@ worker_cleanup(struct worker *w)
 	// Now remove all our free notification entries
 	while((tq = TAILQ_FIRST(&freeq))) {
 		TAILQ_REMOVE(&freeq, tq, list);
+	}
+
+	// Free up our batch allocated memory
+	while((tq = TAILQ_FIRST(&w->notifyq_batches))) {
+		TAILQ_REMOVE(&w->notifyq_batches, tq, list);
 		free(tq);
 	}
 } // worker_cleanup
@@ -2368,6 +2371,30 @@ task_update_timer(struct task *t)
 } // task_update_timer
 
 
+// Update the task expiry timeout for a socket operation
+static inline void
+task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
+{
+	register int64_t new_tm_us;
+
+	if (unlikely(us_from_now < 0)) {
+		new_tm_us = TIMER_TIME_CANCEL;
+	} else if (us_from_now < 5000000) {
+		new_tm_us = get_time_us(TASK_TIME_PRECISE) + us_from_now;
+	} else if (us_from_now < TASK_TIMEOUT_ONE_YEAR) {
+		// Set to the current worker time plus the us_from_now plus half
+		// the worker's maximum epoll timeout.  It'll be close enough
+		new_tm_us = get_time_us(TASK_TIME_COARSE) + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
+	} else {
+		us_from_now = TASK_TIMEOUT_ONE_YEAR;
+	}
+
+	if (new_tm_us != *p_tm) {
+		*p_tm = new_tm_us;
+	}
+} // task_update_io_timeout
+
+
 static inline void
 task_activate_rd_timeout(register struct task *t)
 {
@@ -2384,6 +2411,7 @@ task_activate_rd_timeout(register struct task *t)
 		return;
 	}
 
+	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
 	worker_timer_update(w, &t->rd_tt, t->tfd);
 	if (likely(t->rd_tt.expiry_us >= 0)) {
 		t->active_flags |= FLG_RT;
@@ -2404,6 +2432,7 @@ task_activate_wr_timeout(register struct task *t)
 		return;
 	}
 
+	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
 	worker_timer_update(w, &t->wr_tt, t->tfd);
 	if (likely(t->wr_tt.expiry_us >= 0)) {
 		t->active_flags |= FLG_WT;
@@ -2485,7 +2514,7 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 			t->active_flags |= FLG_PI;
 			task_activate_rd_timeout(t);
 		}
-	} else if (flags & EPOLLOUT) {
+	} else if (likely(flags & EPOLLOUT)) {
 		t->active_flags |= FLG_PO;
 		task_activate_wr_timeout(t);
 	}
@@ -2496,12 +2525,9 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 
 // Lowers the given event flag(s)
 static inline int
-task_lower_event_flag(struct task *t, uint32_t flags)
+task_lower_event_flag(register struct task *t, register uint32_t flags)
 {
 	int res;
-
-	// Lower the flags on the task
-	t->ev.events &= ~flags;
 
 	// If we have no TFD, we nothing else to do
 	if (unlikely(t->ev.data.u64 == TFDU_NONE)) {
@@ -2509,17 +2535,22 @@ task_lower_event_flag(struct task *t, uint32_t flags)
 	}
 
 	if (flags & EPOLLIN) {
-		t->active_flags &= ~(FLG_PI);
-	}
-
-	if (flags & EPOLLOUT) {
+		if (flags & EPOLLOUT) {
+			t->active_flags &= ~(FLG_PI | FLG_PO);
+		} else {
+			t->active_flags &= ~(FLG_PI);
+		}
+	} else if (likely(flags & EPOLLOUT)) {
 		t->active_flags &= ~(FLG_PO);
 	}
+
+	// Lower the flags on the task
+	t->ev.events &= ~flags;
 
 #ifdef USE_EPOLLONESHOT
 	// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
 	// if there's no other IN/OUT flag still set
-	if ((flags & (EPOLLIN | EPOLLOUT)) == 0) {
+	if ((t->ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
 		return 0;
 	}
 #endif
@@ -2587,18 +2618,6 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 static ssize_t
 task_write_vector(register struct task *t, register bool queued)
 {
-	// Check for EOF condition before doing anything else
-	if (unlikely(t->wr_shut)) {
-		if (queued) {
-			t->cb_errno = EPIPE;
-			task_do_writev_cb(t, -1);	// Unlocks task
-			return 0;
-		}
-		t->rd_state = TASK_WRITE_STATE_IDLE;
-		errno = EPIPE;
-		return -1;
-	}
-
 	// Keep trying to write until we're done, or we're blocked
 	while (t->wrv_bufpos < t->wrv_buflen) {
 		ssize_t written;
@@ -2698,18 +2717,6 @@ static ssize_t
 task_write_buffer(register struct task *t, register bool queued)
 {
 	register size_t max_can_do = TASK_MAX_IO_UNIT;
-
-	// Check for EOF condition before doing anything else
-	if (unlikely(t->wr_shut)) {
-		if (queued) {
-			t->cb_errno = EPIPE;
-			task_do_write_cb(t, -1);	// Unlocks task
-			return 0;
-		}
-		t->rd_state = TASK_WRITE_STATE_IDLE;
-		errno = EPIPE;
-		return -1;
-	}
 
 	// Keep trying to write until we're done, or we're blocked
 	t->cb_errno = 0;
@@ -2824,18 +2831,6 @@ task_handle_connect_event(struct task *t)
 static ssize_t
 task_read_vector(register struct task *t, register bool queued)
 {
-	// Check for EOF condition before doing anything else
-	if (unlikely(t->rd_shut)) {
-		if (queued) {
-			t->cb_errno = EPIPE;
-			task_do_read_cb(t, -1);	// Unlocks task
-			return 0;
-		}
-		t->rd_state = TASK_READ_STATE_IDLE;
-		errno = EPIPE;
-		return -1;
-	}
-
 	// Read what we can
 	while (t->rdv_bufpos < t->rdv_buflen) {
 		ssize_t reddin;
@@ -2958,18 +2953,6 @@ static ssize_t
 task_read_buffer(register struct task *t, register int queued)
 {
 	register size_t max_can_do = TASK_MAX_IO_UNIT;
-
-	// Check for EOF condition before doing anything else
-	if (unlikely(t->rd_shut)) {
-		if (queued) {
-			t->cb_errno = EPIPE;
-			task_do_read_cb(t, -1);	// Unlocks task
-			return 0;
-		}
-		t->rd_state = TASK_READ_STATE_IDLE;
-		errno = EPIPE;
-		return -1;
-	}
 
 	// Read what we can
 	t->cb_errno = 0;
@@ -4125,10 +4108,10 @@ worker_create(struct instance *i, int worker_type)
 	}
 
 	// Create the worker state itself
-	if ((w = (struct worker *)calloc(1, sizeof(struct worker))) == NULL) {
-		errno = ENOMEM;
+	if (posix_memalign((void **)&w, (size_t)64, sizeof(struct worker)) != 0) {
 		return NULL;
 	}
+	memset(w, 0, sizeof(struct worker));
 
 	// Now initialise the worker state
 	w->magic = WORKER_MAGIC;
@@ -4143,6 +4126,7 @@ worker_create(struct instance *i, int worker_type)
 	spin_init(w->lock[0]);
 #endif
 	TAILQ_INIT(&w->notifyq_locked);
+	TAILQ_INIT(&w->notifyq_batches);
 	TAILQ_INIT(&w->freeq_locked);
 	TAILQ_INIT(&w->notifyq);
 	TAILQ_INIT(&w->freeq);
@@ -4279,7 +4263,7 @@ instance_listen_balance(struct task *t)
 		}
 		
 		// Now bind to the same address
-		if (bind(nfd, (const struct sockaddr *)&t->addr, t->addrlen) < 0) {
+		if (bind(nfd, (const struct sockaddr *)i->tfd_addrs + t->tfd_index, t->addrlen) < 0) {
 			perror("instance_listen_balance->bind");
 			close(nfd);
 			continue;
@@ -4297,7 +4281,7 @@ instance_listen_balance(struct task *t)
 		}
 
 		// Convert new task to an acceptor type and inform task to expect incoming events
-		memcpy(&nt->addr, &t->addr, t->addrlen);
+		memcpy(i->tfd_addrs + nt->tfd_index, i->tfd_addrs + t->tfd_index, t->addrlen);
 		nt->addrlen = t->addrlen;
 		nt->accept_cb = t->accept_cb;
 		nt->accept_cb_data = t->accept_cb_data;
@@ -4427,6 +4411,15 @@ instance_destroy(struct instance *i)
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
 	}
+	if (i->tfd_locks_real) {
+		free((void *)i->tfd_locks_real);
+		i->tfd_locks_real = NULL;
+		i->tfd_locks = NULL;
+	}
+	if (i->tfd_addrs) {
+		free((void *)i->tfd_addrs);
+		i->tfd_addrs = NULL;
+	}
 	if (i->cpus) {
 		for(int n = 0; n < i->num_cpus; n++) {
 			if (i->cpus[n].workers) {
@@ -4444,6 +4437,83 @@ instance_destroy(struct instance *i)
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
 } // instance_destroy
+
+
+// ---------------------------------------------------------------------------------------------//
+// 				Task FD Pool Managment API					//
+// ---------------------------------------------------------------------------------------------//
+
+static int
+instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
+{
+	register size_t page_size = sysconf(_SC_PAGESIZE), num_pages;
+	uint32_t n;
+
+	// Don't allow less than 100 tfd entries for pool size
+	pool_size = (pool_size < 100) ? 100 : pool_size;
+
+	// Make actual pool size be 130% of what was asked for hashing efficiency
+	pool_size += 100;	// To allow for any listener and timer tasks
+	pool_size *= 1.3;
+
+	i->tfd_pool_used = 0;
+	i->tfd_pool_size = pool_size;
+
+	// Allocate the task tfd_pool space now
+	num_pages = pool_size * sizeof(struct task);
+	num_pages += (page_size - 1);
+	num_pages /= page_size;
+
+	if (posix_memalign((void **)&i->tfd_pool, page_size, num_pages * page_size) != 0) {
+		i->tfd_pool = NULL;
+		return -1;
+	}
+	for (n = 0; n < pool_size; n++) {
+		task_init(i->tfd_pool + n);
+	}
+
+	// Allocate the task sockaddr_storage space now
+	num_pages = pool_size * sizeof(struct sockaddr_storage);
+	num_pages += (page_size - 1);
+	num_pages /= page_size;
+
+	if (posix_memalign((void **)&i->tfd_addrs, page_size, num_pages * page_size) != 0) {
+		i->tfd_addrs = NULL;
+		return -1;
+	}
+	memset(i->tfd_addrs, 0, pool_size * sizeof(struct sockaddr_storage));
+
+
+	// Allocate the spinlock storage now
+#ifdef USE_PTHREAD_SPINLOCKS
+	num_pages = TASK_MAX_TFD_LOCKS * sizeof(pthread_spinlock_t);
+	num_pages += (page_size - 1);
+	num_pages /= page_size;
+
+	if (posix_memalign((void **)&i->tfd_locks_real, page_size, num_pages * page_size) != 0) {
+		i->tfd_locks = NULL;
+		return -1;
+	}
+	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
+		pthread_spin_init(i->tfd_locks_real + n, PTHREAD_PROCESS_PRIVATE);
+	}
+	i->tfd_locks = i->tfd_locks_real + 1;
+#else
+	num_pages = TASK_MAX_TFD_LOCKS * sizeof(spin_lock_t);
+	num_pages += (page_size - 1);
+	num_pages /= page_size;
+
+	if (posix_memalign((void **)&i->tfd_locks_real, page_size, num_pages * page_size) != 0) {
+		i->tfd_locks = NULL;
+		return -1;
+	}
+	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
+		spin_init(i->tfd_locks_real[n]);
+	}
+	i->tfd_locks = i->tfd_locks_real + 1;
+#endif
+	return 0;
+} // instance_tfd_pool_init
 
 
 static struct instance *
@@ -4661,30 +4731,6 @@ TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
 // 				Task Library Socket IO API					//
 //----------------------------------------------------------------------------------------------//
 
-// Update the task expiry timeout for a socket operation
-static inline void
-task_socket_update_timeout(register int64_t us_from_now, int64_t *p_tm)
-{
-	register int64_t new_tm_us;
-
-	if (unlikely(us_from_now < 0)) {
-		new_tm_us = TIMER_TIME_CANCEL;
-	} else if (us_from_now < 5000000) {
-		new_tm_us = get_time_us(TASK_TIME_PRECISE) + us_from_now;
-	} else if (us_from_now < TASK_TIMEOUT_ONE_YEAR) {
-		// Set to the current worker time plus the us_from_now plus half
-		// the worker's maximum epoll timeout.  It'll be close enough
-		new_tm_us = get_time_us(TASK_TIME_COARSE) + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
-	} else {
-		us_from_now = TASK_TIMEOUT_ONE_YEAR;
-	}
-
-	if (new_tm_us != *p_tm) {
-		*p_tm = new_tm_us;
-	}
-} // task_socket_update_timeout
-
-
 // Will write the entire contents of the supplied buffers to the given tfd, or die trying
 ssize_t
 TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *wr_cb_data,
@@ -4747,7 +4793,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	t->wr_state = TASK_WRITE_STATE_VECTOR;
 	t->wrv_cb = wrv_cb;
 	t->wr_cb_data = wr_cb_data;
-	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
+	t->wr_tt.expires_in_us = expires_in_us;
 
 	// Check if we can call the writev handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -4825,7 +4871,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	t->wr_buflen = buflen;
 	t->wr_cb = wr_cb;
 	t->wr_cb_data = wr_cb_data;
-	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
+	t->wr_tt.expires_in_us = expires_in_us;
 
 	// Check if we can call the write handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -4918,7 +4964,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	t->rd_state = TASK_READ_STATE_VECTOR;
 	t->rdv_cb = rdv_cb;
 	t->rd_cb_data = rd_cb_data;
-	task_socket_update_timeout(expires_in_us, &t->rd_tt.expiry_us);
+	t->rd_tt.expires_in_us = expires_in_us;
 
 	// Check if we can call the readv handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -4995,7 +5041,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	t->rd_buflen = buflen;
 	t->rd_cb = rd_cb;
 	t->rd_cb_data = rd_cb_data;
-	task_socket_update_timeout(expires_in_us, &t->rd_tt.expiry_us);
+	t->rd_tt.expires_in_us = expires_in_us;
 
 	// Check if we can call the read handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -5049,10 +5095,9 @@ TASK_socket_get_fd(int64_t tfd)
 } // TASK_socket_get_fd
 
 
-// Closes the tfd control over the given WebOps FD.  If an on_close_cb() has been
-// registered against the tfd, then that will be call just prior to closing
-// If there is a timeout registered against the tfd, it will be automatically cancelled
-// If called against a timeout-only task, it just calls TASK_timeout_destroy(tfd);
+// Closes the TFD and makes the callback to the task's close cb if the user registered one
+// This close action is always queued, and not immediate as it allows everything that is
+// already in the notification queue to drain first
 int
 TASK_close(int64_t tfd)
 {
@@ -5109,6 +5154,7 @@ int
 TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t tfd, void *accept_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_LI);
+	register struct instance *i;
 
 	if (t == NULL) return -1;	// errno already set
 
@@ -5116,11 +5162,12 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	t->type = TASK_TYPE_ACCEPT_PARENT;
 	t->accept_cb = accept_cb;
 	t->accept_cb_data = accept_cb_data;
-	__thr_current_instance->is_server = true;
+	i = t->worker->instance;
+	i->is_server = true;
 
 	// Retrieve the local address the accept task is bound to
-	t->addrlen = sizeof(t->addr);
-	if (getsockname(t->fd, (struct sockaddr *)&t->addr, &t->addrlen) < 0) {
+	t->addrlen = sizeof(i->tfd_addrs[0]);
+	if (getsockname(t->fd, (struct sockaddr *)i->tfd_addrs + t->tfd_index, &t->addrlen) < 0) {
 		int err = errno;
 		task_unlock(t, (FLG_LI));
 		errno = err;
@@ -5172,6 +5219,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 		   void *connect_cb_data, void (*connect_cb)(int64_t tfd, int result, void *connect_cb_data))
 {
 	register struct task *t;
+	register struct instance *i;
 
 	if ((t = task_lookup(tfd, FLG_CO)) == NULL) return -1;		// errno already set
 
@@ -5185,12 +5233,13 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	t->type = TASK_TYPE_CONNECT;
 	t->connect_cb = connect_cb;
 	t->connect_cb_data = connect_cb_data;
-	__thr_current_instance->is_client = true;
-	task_socket_update_timeout(expires_in_us, &t->wr_tt.expiry_us);
+	t->wr_tt.expires_in_us = expires_in_us;
+	i = t->worker->instance;
+	i->is_client = true;
 
 	// Start the connect
 	while (1) {
-		memcpy(&t->addr, addr, addrlen);
+		memcpy(i->tfd_addrs + t->tfd_index, addr, addrlen);
 		t->addrlen = addrlen;
 		t->cb_errno = 0;
 		if (connect(t->fd, addr, addrlen) == 0) {

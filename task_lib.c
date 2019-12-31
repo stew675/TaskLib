@@ -3848,6 +3848,7 @@ static void
 worker_do_io_epoll(register struct worker *w)
 {
 	register int wait_time = 0, en;
+	register bool do_direct = true;
 
 	// Determine the initial time we want to be waiting in epoll for
 	wait_time = get_next_epoll_timeout_ms(w);
@@ -3961,18 +3962,29 @@ worker_do_io_epoll_fail:
 			// Need to queue instead. Place the events on worker notifyq
 			if (revents & EPOLLIN) {
 				if (revents & EPOLLOUT) {
+					// If get both, just queue both
 					task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-					task_notify_action(t, FLG_WR);			// If a write is active too, just queue it
-					task_handle_io_event(t, FLG_RD);	// Unlocks the task
+					task_notify_action(t, FLG_WR);			// Queue the write
+					task_handle_io_event(t, FLG_RD);		// Unlocks the task
 					continue;
 				} else {
 					task_lower_event_flag(t, EPOLLIN);
-					task_handle_io_event(t, FLG_RD);	// Unlocks the task
+					if (do_direct) {
+						task_handle_io_event(t, FLG_RD);	// Unlocks the task
+					} else {
+						task_notify_action(t, FLG_RD);
+						task_unlock(t, FLG_NONE);
+					}
 					continue;
 				}
 			} else if (revents & EPOLLOUT) {
 				task_lower_event_flag(t, EPOLLOUT);
-				task_handle_io_event(t, FLG_WR);		// Unlocks the task
+				if (do_direct) {
+					task_handle_io_event(t, FLG_WR);		// Unlocks the task
+				} else {
+					task_notify_action(t, FLG_WR);
+					task_unlock(t, FLG_NONE);
+				}
 				continue;
 			}
 
@@ -4000,8 +4012,6 @@ worker_loop_io(void *arg)
 
 	while(w->state == WORKER_STATE_RUNNING) {
 		worker_do_io_epoll(w);
-		worker_process_notifyq(w);
-		// Call it twice, because first pass can generate events
 		worker_process_notifyq(w);
 	}
 
@@ -5799,9 +5809,9 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		struct sigaction sa[1];
 		int32_t ti;
 
-fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
-fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
-fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));
+//fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
+//fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
+//fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
 		sigaction(SIGPIPE, sa, NULL);

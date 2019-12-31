@@ -35,6 +35,7 @@ uint64_t	total_deliver = 0;
 uint64_t	total_received = 0;
 uint64_t	run_time = 0;
 uint64_t	max_outstanding = (MAX_TCP_MEM / 100);
+uint64_t	run_in = 0, run_out = 0;
 
 static void loadgen_start_rd(struct loadgen *lg);
 static void loadgen_start_wr(struct loadgen *lg);
@@ -265,12 +266,24 @@ static void
 ticker_cb(int64_t tfd, int64_t lateness_us, void *user_data)
 {
 	static int64_t count = 0;
-	int64_t div;
 	int interval = 1;
+	int smooth = 10;
 
 	TASK_timeout_set(tfd, ((TICKER_PERIOD_US * interval) - lateness_us), user_data, ticker_cb);
-	div = (count > 0) ? count : 1;
-	fprintf(stderr, "T+%-6ld: IN MB/sec=%lu OUT MB/sec=%lu\n", count, (total_received / div) / (1024 * 1024), (total_deliver / div) / (1024 * 1024));
+	if (run_in) {
+		run_in = ((run_in * (smooth - 1)) + total_received) / smooth;
+	} else {
+		run_in = total_received;
+	}
+	total_received = 0;
+	if (run_out) {
+		run_out = ((run_out * (smooth - 1)) + total_deliver) / smooth;
+	} else {
+		run_out = total_deliver;
+	}
+	total_deliver = 0;
+
+	fprintf(stderr, "T+%-6ld: IN MB/sec=%lu OUT MB/sec=%lu\n", count, run_in / (1024 * 1024), run_out / (1024 * 1024));
 	count += interval;
 } // ticker_cb
 

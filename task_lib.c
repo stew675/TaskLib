@@ -94,7 +94,6 @@ static inline void __spin_unlock(register int64_t volatile *p)
 //-------------------------------------------------------------------------------------------
 
 TAILQ_HEAD(worker_list, worker);
-STAILQ_HEAD(task_list, task);
 STAILQ_HEAD(ntfyq_list, ntfyq);
 
 typedef enum {
@@ -160,7 +159,8 @@ typedef enum {
 	FLG_TD	=	0x00020000,		// A Timer Destroy API is in progress
 	FLG_TS	=	0x00040000,		// A Timer Set API is in progress
 	FLG_GFD	=	0x00080000,		// A Get FD operation is already in progress
-	FLG_SD =	0x00100000,		// A Shutdown operation is in progress
+	FLG_SD	=	0x00100000,		// A Shutdown operation is in progress
+	FLG_AC	=	0x00200000,		// A newly accepted task
 } task_action_flag_t;
 
 struct ntfyq {
@@ -286,7 +286,7 @@ struct task {
 	// cache line (64 bytes width) as that will get flushed when it gets updated.
 	__attribute__ ((aligned(64))) uint64_t	notifyqlen_locked; // Number of locked notifyq entries this task has
 	struct worker			*preferred_worker;	// To initiate task io worker migration
-	STAILQ_ENTRY(task)		free_list;		// List of free tasks
+	struct task			*free_next;		// List of free tasks
 	int64_t				age;			// Time this task was created
 	socklen_t			addrlen;		// The valid length of the data in .addr
 } __attribute__ ((aligned(64)));
@@ -399,7 +399,7 @@ struct instance {
 
 	// TFD->task pool
 	struct task			*tfd_pool;		// The total pool of tasks we can work with
-	struct task_list		free_tasks;
+	struct task			*free_tasks;
 
 	// For TASK_TYPE_ACCEPT tasks, addr refers to the local address we're listening on
 	// For TASK_TYPE_IO/CONNECT tasks, addr refers to the remote communication address
@@ -424,7 +424,7 @@ struct instance {
 	uint64_t			per_task_sndbuf;
 
 	// CPU/Worker Affinity Fields
-	pthread_spinlock_t		cpuspin;
+	spin_lock_t			cpuspin;
 	int				worker_offset;
 	bool				all_cpus_seen;
 	bool				all_io_workers_affined;
@@ -461,6 +461,7 @@ static __thread struct instance	*__thr_current_instance = NULL;
 
 static struct instance		*instances[TASK_MAX_INSTANCES];
 static bool initialised = false;
+static size_t __page_size;
 static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define	lockless_worker(w)	(w == __thr_current_worker)
@@ -750,7 +751,7 @@ worker_timer_update(struct worker *w, struct task_timer *tt, int64_t tfd)
 } // worker_timer_update
 
 
-static inline void
+static void
 task_destroy_timeouts(struct task *t)
 {
 	struct worker *w = t->worker;
@@ -784,12 +785,13 @@ task_destroy_timeouts(struct task *t)
 
 
 static void
-task_init(struct task *t)
+task_init(struct task *t, uint32_t tfdi)
 {
 	int32_t iteration = (t->tfd_iteration + 1) % 8388608;
 
 	memset(t, 0, sizeof(struct task));
 	t->state = TASK_STATE_UNUSED;
+	t->tfd_index = tfdi;
 	t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
@@ -813,11 +815,12 @@ task_free(struct task *t)
 	ck_pr_dec_64(&i->tfd_pool_used);
 	ck_pr_dec_64(&t->worker->num_tasks);
 	task_destroy_timeouts(t);
-	task_init(t);
+	task_init(t, t->tfd_index);
 
-	pthread_spin_lock(&i->cpuspin);
-	STAILQ_INSERT_HEAD(&i->free_tasks, t, free_list);
-	pthread_spin_unlock(&i->cpuspin);
+	spin_lock(&i->cpuspin);
+	t->free_next = i->free_tasks;
+	i->free_tasks = t;
+	spin_unlock(&i->cpuspin);
 } // task_free
 
 
@@ -954,7 +957,7 @@ task_nuke(uint32_t tfdi)
 	register struct task *t = __thr_current_instance->tfd_pool + tfdi;
 
 	task_destroy_timeouts(t);
-	task_init(t);
+	task_init(t, t->tfd_index);
 	ck_pr_dec_64(&__thr_current_instance->tfd_pool_used);
 } // task_nuke
 
@@ -978,23 +981,22 @@ task_get_free_task(void)
 		return NULL;
 	}
 	
-	pthread_spin_lock(&i->cpuspin);
-	t = STAILQ_FIRST(&i->free_tasks);
-	if (t == NULL) {
-		pthread_spin_unlock(&i->cpuspin);
+	spin_lock(&i->cpuspin);
+	if ((t = i->free_tasks) == NULL) {
+		spin_unlock(&i->cpuspin);
 		errno = EMFILE;
 		return NULL;
 	}
-	STAILQ_REMOVE_HEAD(&i->free_tasks, free_list);
-	pthread_spin_unlock(&i->cpuspin);
+	i->free_tasks = t->free_next;
+	assert(t->state == TASK_STATE_UNUSED);
+	t->state = TASK_STATE_ACTIVE;
+	spin_unlock(&i->cpuspin);
 
-	tfdi = t - i->tfd_pool;
+	tfdi = t->tfd_index;
 	t->tfd = t->tfd_iteration;
 	t->tfd <<= 32;
 	t->tfd |= (uint64_t)tfdi;
-	t->tfd_index = tfdi;
 	t->io_depth = 0;
-	t->state = TASK_STATE_ACTIVE;
 	ck_pr_inc_64(&i->tfd_pool_used);
 
 	return t;
@@ -1024,14 +1026,14 @@ get_cpu_of_sock(int sock)
 		return -1;
 	}
 
-	pthread_spin_lock(&i->cpuspin);
+	spin_lock(&i->cpuspin);
 	if (i->cpus[cpu].seen == true) {
-		pthread_spin_unlock(&i->cpuspin);
+		spin_unlock(&i->cpuspin);
 		return cpu;
 	}
 	i->cpus[cpu].seen = true;
 	i->num_cpus_seen++;
-	pthread_spin_unlock(&i->cpuspin);
+	spin_unlock(&i->cpuspin);
 
 	if (i->num_cpus_seen == i->num_cpus) {
 		i->all_cpus_seen = true;
@@ -1148,7 +1150,7 @@ set_one_workers_affinity(int cpu)
 	// Not ideal that we're holding spinlocks for this amount of time
 	// but we only do it once for each IO worker, ever, so it's okay
 
-	pthread_spin_lock(&i->cpuspin);
+	spin_lock(&i->cpuspin);
 
 	// Pick a direction based on observed operation.  If we're both
 	// client and server, just alternate directions each time
@@ -1179,7 +1181,7 @@ set_one_workers_affinity(int cpu)
 	}
 	if (w == NULL) {
 		i->all_io_workers_affined = true;
-		pthread_spin_unlock(&i->cpuspin);
+		spin_unlock(&i->cpuspin);
 		return;
 	}
 
@@ -1218,7 +1220,7 @@ set_one_workers_affinity(int cpu)
 	w->affined_cpu = tcpu;
 
 	// We can finally release the lock!
-	pthread_spin_unlock(&i->cpuspin);
+	spin_unlock(&i->cpuspin);
 
 	// Actually set the affinity now of w to tcpu
 	set_worker_cpu_affinity(w, tcpu);
@@ -1307,7 +1309,7 @@ instance_unlock(struct instance *i)
 } // instance_unlock
 
 
-static int
+static inline int
 notifier_write(int fd)
 {
 	uint64_t m = 1;
@@ -1331,7 +1333,7 @@ notifier_write(int fd)
 
 // Notify worker to wake up.  This quickly breaks it out of the epoll_wait() call
 // when we want it to notice something has changed (like us adding new tasks to it)
-static int
+static inline int
 worker_notify(struct worker *w)
 {
 	if (unlikely(w == NULL)) {
@@ -1346,7 +1348,7 @@ worker_notify(struct worker *w)
 } // worker_notify
 
 
-static int
+static inline int
 instance_notify(struct instance *i)
 {
 	if (i == NULL) {
@@ -1362,6 +1364,7 @@ static struct ntfyq *
 worker_notify_get_free_ntfyq(struct worker *w)
 {
 	register struct ntfyq *tq = NULL;
+	register size_t batch_size, n;
 
 	if (likely(lockless_worker(w))) {
 		if (likely((tq = STAILQ_FIRST(&w->freeq)) != NULL)) {
@@ -1379,16 +1382,12 @@ worker_notify_get_free_ntfyq(struct worker *w)
 		worker_unlock(w);
 	}
 
-	register size_t page_size = sysconf(_SC_PAGESIZE), batch_size, n;
-	struct ntfyq *ntq = NULL;
-
 	// Grab an aligned system page of memory, and we'll dice it up ourselves
-	if (posix_memalign((void **)&ntq, page_size, page_size) != 0) {
+	if ((tq = aligned_alloc(__page_size, __page_size)) == NULL) {
 		return NULL;
 	}
-	tq = ntq;
-	memset(tq, 0, page_size);
-	batch_size = page_size / sizeof(struct ntfyq);
+	memset(tq, 0, __page_size);
+	batch_size = __page_size / sizeof(struct ntfyq);
 
 	// We don't use the first entry, but instead stick it on a worker list
 	// so we have a list of what memory to pass to free() later
@@ -1531,7 +1530,7 @@ task_activate_rd_timeout(register struct task *t)
 	if (likely(t->rd_tt.expiry_us >= 0)) {
 		t->active_flags |= FLG_RT;
 	} else {
-		t->active_flags &= ~(FLG_RT);
+		task_unlock(t, FLG_RT);
 	}
 } // task_activate_rd_timeout
 
@@ -1552,7 +1551,7 @@ task_activate_wr_timeout(register struct task *t)
 	if (likely(t->wr_tt.expiry_us >= 0)) {
 		t->active_flags |= FLG_WT;
 	} else {
-		t->active_flags &= ~(FLG_WT);
+		task_unlock(t, FLG_WT);
 	}
 } // task_activate_wr_timeout
 
@@ -1590,6 +1589,10 @@ task_release_epfd(struct task *t)
 {
 	register struct worker *w = t->worker;
 
+	if (t->epfd < 0) {
+		return;
+	}
+
 	// De-reference the task from the worker's epfd count
 	worker_lock(w);
 	for (register int n = 0; n < w->max_epfds; n++) {
@@ -1605,7 +1608,7 @@ task_release_epfd(struct task *t)
 
 
 // Creates the given event flag(s)
-static inline int
+static int
 task_create_event_flag(register struct task *t)
 {
 
@@ -1640,7 +1643,7 @@ task_create_event_flag(register struct task *t)
 
 
 // Raises the given event flag(s)
-static inline int
+static int
 task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
 	if (flags & EPOLLIN) {
@@ -1663,11 +1666,23 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 		// We need to to EPOLL_CTL_ADD instead
 		if (task_create_event_flag(t) < 0) {
 			t->ev.events &= ~flags;
+			if (flags & EPOLLIN) {
+				task_unlock(t, FLG_RD);
+			}
+			if (flags & EPOLLOUT) {
+				task_unlock(t, FLG_WR);
+			}
 			return -1;
 		}
 	} else {
 		if (unlikely(epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
 			t->ev.events &= ~flags;
+			if (flags & EPOLLIN) {
+				task_unlock(t, FLG_RD);
+			}
+			if (flags & EPOLLOUT) {
+				task_unlock(t, FLG_WR);
+			}
 			return -1;
 		}
 	}
@@ -1693,7 +1708,7 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 
 
 // Lowers the given event flag(s)
-static inline int
+static int
 task_lower_event_flag(register struct task *t, register uint32_t flags)
 {
 	int res;
@@ -1705,12 +1720,12 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 
 	if (flags & EPOLLIN) {
 		if (flags & EPOLLOUT) {
-			t->active_flags &= ~(FLG_PI | FLG_PO);
+			task_unlock(t, FLG_PI | FLG_PO);
 		} else {
-			t->active_flags &= ~(FLG_PI);
+			task_unlock(t, FLG_PI);
 		}
 	} else if (likely(flags & EPOLLOUT)) {
-		t->active_flags &= ~(FLG_PO);
+		task_unlock(t, FLG_PO);
 	}
 
 	// Lower the flags on the task
@@ -1739,28 +1754,20 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 static inline void
 task_cancel_timer(struct task *t, task_action_flag_t action)
 {
-	struct worker *w = t->worker;
-
 	if (action & FLG_RT) {
 		t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
-		worker_timer_update(w, &t->rd_tt, TFD_NONE);
-		t->active_flags &= ~(action);
-		return;
-	}
-	if (action & FLG_WT) {
+		worker_timer_update(t->worker, &t->rd_tt, TFD_NONE);
+	} else if (action & FLG_WT) {
 		t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
-		worker_timer_update(w, &t->wr_tt, TFD_NONE);
-		t->active_flags &= ~(action);
-		return;
-	}
-	if (action & FLG_TM) {
+		worker_timer_update(t->worker, &t->wr_tt, TFD_NONE);
+	} else if (action & FLG_TM) {
 		t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
-		worker_timer_update(w, &t->tm_tt, TFD_NONE);
-		t->active_flags &= ~(action);
-		return;
+		worker_timer_update(t->worker, &t->tm_tt, TFD_NONE);
+	} else {
+		// Bad timer type
+		assert(0);
 	}
-	// Bad timer type
-	assert(0);
+	task_unlock(t, action);
 } // task_cancel_timer
 
 
@@ -1783,7 +1790,7 @@ task_cancel_write(struct task *t)
 	}
 #endif
 
-	t->active_flags &= ~(FLG_WR);
+	task_unlock(t, FLG_WR);
 } // task_cancel_write
 
 
@@ -1806,17 +1813,19 @@ task_cancel_read(struct task *t)
 	}
 #endif
 
-	t->active_flags &= ~(FLG_RD);
+	task_unlock(t, FLG_RD);
 } // task_cancel_read
 
 
-static inline void
+static void
 task_do_close_cb(struct task *t, task_action_flag_t action)
 {
 	void (*cb)(int64_t tfd, void *close_cb_data) = t->close_cb;
 	void *cb_data = t->close_cb_data;
 	int err = t->cb_errno;
 	int64_t tfd = t->tfd;
+
+	assert(t->active_flags & FLG_CL);
 
 	// This is it boys, this is war! C'mon what are you waiting for?
 	t->state = TASK_STATE_DESTROY;
@@ -1827,12 +1836,9 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 		action |= FLG_CO;
 	}
 
-	t->active_flags &= ~(FLG_CL);		// Ensure any close reference flag is gone now
-
 	__thr_preferred_worker = NULL;
 
 	if (t->fd >= 0) {
-
 		// If it's a user registered socket, do not close it, just de-register it from epoll
 		if (unlikely(t->registered_fd)) {
 			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
@@ -1840,9 +1846,9 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 			shutdown(t->fd, SHUT_RDWR);
 			close(t->fd);
 		}
-		t->active_flags &= ~(FLG_PW | FLG_PI | FLG_PO);	// Disable All Poll Wait Flags Now
-		t->fd = -1;
 		task_release_epfd(t);
+		task_unlock(t, FLG_PW | FLG_PI | FLG_PO);	// Disable All Poll Wait Flags Now
+		t->fd = -1;
 		task_cancel_read(t);
 		task_cancel_write(t);
 	}
@@ -1864,23 +1870,23 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 	// only knows about the parent acceptor and won't know what to do with a
 	// a child acceptor since it isn't even aware of its existence
 	if ((cb == NULL) || (t->type == TASK_TYPE_ACCEPT_CHILD)) {
-		task_unlock(t, action);
+		task_unlock(t, action | FLG_CL);
 		return;
 	}
 
 	// If the instance is shutting down, don't make any callbacks
  	if (__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN) {
-		task_unlock(t, action);
+		task_unlock(t, action | FLG_CL);
 		return;
 	}
 
-	task_unlock(t, action);
+	task_unlock(t, action | FLG_CL);
 	errno = err;
 	cb(tfd, cb_data);
 } // task_do_close_cb
 
 
-static inline void
+static void
 task_do_readv_cb(struct task *t, ssize_t result)
 {
 	void (*cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data) = t->rdv_cb;
@@ -1924,7 +1930,7 @@ task_do_readv_cb(struct task *t, ssize_t result)
 } // task_do_readv_cb
 
 
-static inline void
+static void
 task_do_read_cb(struct task *t, ssize_t result)
 {
 	void (*cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data) = t->rd_cb;
@@ -1965,32 +1971,37 @@ task_do_read_cb(struct task *t, ssize_t result)
 } // task_do_read_cb
 
 
-static inline void
-task_do_accept_cb(struct task *t, struct task *nt)
+static void
+task_do_accept_cb(struct task *t)
 {
 	void (*cb)(int64_t tfd, void *accept_cb_data) = t->accept_cb;
 	void *cb_data = t->accept_cb_data;
 	int err = t->cb_errno;
-	int64_t tfd = nt->tfd;
+	int64_t tfd = t->tfd;
 
-	if (unlikely(t->accept_cb == NULL)) {
-		task_do_close_cb(nt, FLG_NONE);
+	t->accept_cb = NULL;
+	t->accept_cb_data = NULL;
+
+	if (unlikely(cb == NULL)) {
+		t->active_flags |= FLG_CL;
+		task_do_close_cb(t, FLG_AC);
 		return;
 	}
 
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
-		task_do_close_cb(nt, FLG_NONE);
+		t->active_flags |= FLG_CL;
+		task_do_close_cb(t, FLG_AC);
 		return;
 	}
 
 	__thr_preferred_worker = NULL;
-	task_unlock(nt, FLG_NONE);
 	errno = err;
 	cb(tfd, cb_data);		// t is still locked at this point
+	task_unlock(t, FLG_AC);
 } // task_do_accept_cb
 
 
-static inline void
+static void
 task_do_writev_cb(struct task *t, ssize_t result)
 {
 	void (*cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data) = t->wrv_cb;
@@ -2032,7 +2043,7 @@ task_do_writev_cb(struct task *t, ssize_t result)
 } // task_do_writev_cb
 
 
-static inline void
+static void
 task_do_write_cb(struct task *t, ssize_t result)
 {
 	void (*cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data) = t->wr_cb;
@@ -2073,7 +2084,7 @@ task_do_write_cb(struct task *t, ssize_t result)
 } // task_do_write_cb
 
 
-static inline void
+static void
 task_do_connect_cb(struct task *t, int result)
 {
 	void (*cb)(int64_t tfd, int result, void *connect_cb_data) = t->connect_cb;
@@ -2081,15 +2092,16 @@ task_do_connect_cb(struct task *t, int result)
 	int err = t->cb_errno;
 	int64_t tfd = t->tfd;
 
-	// Connect sets FLG_WR as well, cancel that here
-	task_cancel_timer(t, FLG_WT);
-	t->active_flags &= ~(FLG_WR);
+	// Connect sets FLG_WR as well.  Make sure that is released
 
-	// If there's nothing the connection, all we can do it close it
+	// If there's no callback for the connection, all we can do it close it
 	if (unlikely(cb == NULL)) {
-		task_do_close_cb(t, FLG_CO);
+		t->active_flags |= FLG_CL;
+		task_do_close_cb(t, FLG_CO | FLG_WR);
 		return;
 	}
+
+	task_cancel_timer(t, FLG_WT);
 
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
 		close(t->fd);
@@ -2099,7 +2111,7 @@ task_do_connect_cb(struct task *t, int result)
 	}
 
 	__thr_preferred_worker = NULL;
-	task_unlock(t, FLG_CO);
+	task_unlock(t, FLG_CO | FLG_WR);
 
 	if (result < 0) {
 		errno = err;
@@ -2110,7 +2122,7 @@ task_do_connect_cb(struct task *t, int result)
 } // task_do_connect_cb
 
 
-static inline void
+static void
 task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us)
 {
 	void (*cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data) = NULL;
@@ -2141,8 +2153,7 @@ task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us
 handle_timer_timeout:
 	// Check if we're just cancelling the existing timeout
 	if (t->tm_tt.expiry_us < 0) {
-		task_cancel_timer(t, FLG_TM);
-		return task_unlock(t, FLG_NONE);
+		return task_cancel_timer(t, FLG_TM);
 	}
 
 	// Check if the timeout actually fired
@@ -2169,17 +2180,16 @@ handle_timer_timeout:
 		t->tm_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->tm_tt, t->tfd);
 		t->active_flags |= action;
-		return task_unlock(t, FLG_NONE);
+		return;
 	}
 
 	// Nothing changed at all.  Just unlock and go
-	return task_unlock(t, FLG_NONE);
+	return;
 
 handle_read_timeout:
 	// Check if we're just cancelling the existing timeout
 	if (t->rd_tt.expiry_us < 0) {
-		task_cancel_timer(t, FLG_RT);
-		return task_unlock(t, FLG_NONE);
+		return task_cancel_timer(t, FLG_RT);
 	}
 
 	// Check if the timeout actually fired
@@ -2195,7 +2205,7 @@ handle_read_timeout:
 		// No reads were active, just cancel the timer and go
 		task_cancel_timer(t, FLG_RT);
 		errno = 0;
-		return task_unlock(t, FLG_NONE);
+		return;
 	}
 
 	// Check if need to update the existing timer node
@@ -2203,17 +2213,16 @@ handle_read_timeout:
 		t->rd_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->rd_tt, t->tfd);
 		t->active_flags |= action;
-		return task_unlock(t, FLG_NONE);
+		return;
 	}
 
 	// Nothing changed at all.  Just unlock and go
-	return task_unlock(t, FLG_NONE);
+	return;
 
 handle_write_timeout:
 	// Check if we're just cancelling the existing timeout
 	if (t->wr_tt.expiry_us < 0) {
-		task_cancel_timer(t, FLG_WT);
-		return task_unlock(t, FLG_NONE);
+		return task_cancel_timer(t, FLG_WT);
 	}
 
 	// Check if the timeout actually fired.  Connect timeouts are also handled here
@@ -2232,7 +2241,7 @@ handle_write_timeout:
 		// No writes were active, just cancel the timer and go
 		task_cancel_timer(t, FLG_WT);
 		errno = 0;
-		return task_unlock(t, FLG_NONE);
+		return;
 	}
 
 	// Check if need to update the existing timer node
@@ -2240,11 +2249,11 @@ handle_write_timeout:
 		t->wr_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->wr_tt, t->tfd);
 		t->active_flags |= action;
-		return task_unlock(t, FLG_NONE);
+		return;
 	}
 
 	// Nothing changed at all.  Just unlock and go
-	return task_unlock(t, FLG_NONE);
+	return;
 } // task_do_timeout_cb
 
 
@@ -2272,6 +2281,7 @@ task_shutdown_accept_children(struct worker *w, struct task *t)
 			continue;
 		}
 
+		tac->active_flags |= FLG_CL;
 		task_do_close_cb(tac, FLG_LI);
 	}
 } // task_shutdown_accept_children
@@ -2317,6 +2327,7 @@ worker_cleanup(struct worker *w)
 
 		// Just drop all the actions we see by forwarding them to task_do_close_cb()
 		t->close_cb = NULL;
+		t->active_flags |= FLG_CL;
 		task_do_close_cb(t, action);
 	}
 
@@ -2571,7 +2582,6 @@ task_update_timer(struct task *t)
 	// If we're not on the correct worker thread, queue a notify instead
 	if (!lockless_worker(w)) {
 		task_notify_action(t, FLG_TM);
-		task_unlock(t, FLG_NONE);
 		return;
 	}
 
@@ -2591,8 +2601,6 @@ task_update_timer(struct task *t)
 	// Just update the timeout in the timeout system
 	worker_timer_update(w, &t->tm_tt, t->tfd);
 	t->active_flags |= FLG_TM;
-
-	task_unlock(t, FLG_NONE);
 } // task_update_timer
 
 
@@ -2692,10 +2700,6 @@ task_write_vector(register struct task *t, register bool queued)
 			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
 				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
-					if (queued) {
-						// Write is still active, don't disable its reference
-						task_unlock(t, FLG_NONE);
-					}
 					errno = 0;
 					return 0;
 				}
@@ -2759,9 +2763,6 @@ task_write_buffer(register struct task *t, register bool queued)
 		// Restrict the amount that can be written in one go for fairness
 		if (max_can_do == 0) {
 			if (task_notify_action(t, FLG_WR)) {
-				if (queued) {
-					task_unlock(t, FLG_NONE);
-				}
 				return 0;
 			}
 			max_can_do = SIZE_MAX;
@@ -2776,10 +2777,6 @@ task_write_buffer(register struct task *t, register bool queued)
 			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
 				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
-					if (queued) {
-						// Write is still active, don't disable its reference
-						task_unlock(t, FLG_NONE);
-					}
 					errno = 0;
 					return 0;
 				}
@@ -2916,9 +2913,6 @@ task_read_vector(register struct task *t, register bool queued)
 				// We got nothing at all.  Raise EPOLLIN and wait for something
 				if (task_raise_event_flag(t, EPOLLIN) == 0) {
 					// Read is still active, don't disable its reference yet
-					if (queued) {
-						task_unlock(t, FLG_NONE);
-					}
 					return 0;
 				}
 			}
@@ -3026,9 +3020,6 @@ task_read_buffer(register struct task *t, register int queued)
 
 				// We got nothing at all.  Raise EPOLLIN and wait for something
 				if (task_raise_event_flag(t, EPOLLIN) == 0) {
-					if (queued) {
-						task_unlock(t, FLG_NONE);
-					}
 					return 0;
 				}
 			}
@@ -3240,17 +3231,19 @@ task_handle_accept_event(struct task *t)
 			worker_learn_cpu_affinity(t);
 		}
 
-		t->cb_errno = 0;
-		task_do_accept_cb(t, t_new);	// Unlocks t_new
+		t_new->cb_errno = 0;
+		t_new->active_flags |= FLG_AC;
+		t_new->accept_cb = t->accept_cb;
+		t_new->accept_cb_data = t->accept_cb_data;
+		task_do_accept_cb(t_new);	// Unlocks t_new
 	}
-	task_unlock(t, FLG_NONE);
 	return;
 
 task_handle_accept_event_fail:
 	// Major accept failure.  Cancel the accept task
 	// Inform user that accept is now failing/gone
-	t->active_flags &= ~(FLG_LI);
-	task_do_close_cb(t, FLG_RD);	// Unlocks task
+	t->active_flags |= FLG_CL;
+	task_do_close_cb(t, FLG_RD | FLG_LI);	// Unlocks task
 } // task_handle_accept_event
 
 
@@ -3673,7 +3666,6 @@ worker_process_notifyq(register struct worker *w)
 				t->forward_close = true;
 				if (task_notify_action(t, action)) {
 					t->forward_close = false;
-					task_unlock(t, FLG_NONE);
 				} else {
 					// It didn't get forwarded, drop the action reference
 					t->forward_close = false;
@@ -3689,7 +3681,7 @@ worker_process_notifyq(register struct worker *w)
 					task_do_close_cb(t, FLG_LI);
 					continue;
 				}
-				task_do_close_cb(t, FLG_NONE);	// FLG_CL is always reset by task_do_close_cb
+				task_do_close_cb(t, FLG_CL);	// FLG_CL is always reset by task_do_close_cb
 				continue;
 			}
 
@@ -3708,13 +3700,11 @@ worker_process_notifyq(register struct worker *w)
 
 			if (action == FLG_RT) {
 				task_activate_rd_timeout(t);
-				task_unlock(t, FLG_NONE);
 				continue;
 			}
 
 			if (action == FLG_WT) {
 				task_activate_wr_timeout(t);
-				task_unlock(t, FLG_NONE);
 				continue;
 			}
 
@@ -3890,6 +3880,8 @@ worker_do_io_epoll(register struct worker *w)
 				continue;
 			}
 
+			assert(tfd == t->tfd);
+
 			// Check if the action got cancelled
 			if ((t->active_flags & FLG_PW) == 0) {
 				task_unlock(t, FLG_PW);
@@ -3913,7 +3905,8 @@ worker_do_io_epoll_fail:
 					task_handle_io_event(t, FLG_WR);	// Unlocks  the task
 					continue;
 				}
-				task_do_close_cb(t, FLG_PW);			// Unlocks the task
+				task_unlock(t, FLG_PW);
+				task_notify_action(t, FLG_CL);
 				continue;
 			}
 
@@ -3928,7 +3921,6 @@ worker_do_io_epoll_fail:
 				task_lower_event_flag(t, EPOLLRDHUP);
 				revents &= ~(EPOLLRDHUP);
 				if (revents == 0) {
-					task_unlock(t, FLG_NONE);
 					continue;
 				}
 			}
@@ -3956,7 +3948,6 @@ worker_do_io_epoll_fail:
 						task_handle_io_event(t, FLG_RD);	// Unlocks the task
 					} else {
 						task_notify_action(t, FLG_RD);
-						task_unlock(t, FLG_NONE);
 					}
 					continue;
 				}
@@ -3966,7 +3957,6 @@ worker_do_io_epoll_fail:
 					task_handle_io_event(t, FLG_WR);		// Unlocks the task
 				} else {
 					task_notify_action(t, FLG_WR);
-					task_unlock(t, FLG_NONE);
 				}
 				continue;
 			}
@@ -3978,7 +3968,6 @@ worker_do_io_epoll_fail:
 				goto worker_do_io_epoll_fail;
 			}
 #endif
-			task_unlock(t, FLG_NONE);
 		}
 	}
 } // worker_do_epoll
@@ -4117,8 +4106,8 @@ worker_start_failed:
 static struct worker *
 worker_create(struct instance *i, int worker_type)
 {
-	struct worker *w = NULL;
-	register size_t page_size = sysconf(_SC_PAGESIZE), sz;
+	register struct worker *w = NULL;
+	register size_t sz;
 
 	if ((worker_type != WORKER_TYPE_IO) && (worker_type != WORKER_TYPE_BLOCKING)) {
 		errno = EINVAL;
@@ -4127,12 +4116,12 @@ worker_create(struct instance *i, int worker_type)
 
 	for (sz = 1; sz < sizeof(struct worker); sz += sz);
 	// Create the worker state itself
-	if (posix_memalign((void **)&w, sz, sz) != 0) {
+	if ((w = aligned_alloc(sz, sz)) == NULL) {
 		return NULL;
 	}
-	memset(w, 0, sizeof(struct worker));
+	memset(w, 0, sz);
 
-	w->max_events = page_size / sizeof(struct epoll_event);
+	w->max_events = __page_size / sizeof(struct epoll_event);
 	w->max_epfds = i->tfd_pool_size + (w->max_events * i->num_workers_io) - 1;
 	w->max_epfds /= (i->num_workers_io * w->max_events);
 
@@ -4144,7 +4133,7 @@ worker_create(struct instance *i, int worker_type)
 		goto worker_create_failed;
 	}
 
-	if (posix_memalign((void **)&w->events, page_size, page_size) != 0) {
+	if ((w->events = aligned_alloc(__page_size, __page_size)) == NULL) {
 		goto worker_create_failed;
 	}
 
@@ -4333,7 +4322,6 @@ instance_listen_balance(struct task *t)
 		ntq->tfd = nt->tfd;
 		ntq->action = FLG_LI;
 		STAILQ_INSERT_TAIL(&t->accept_children, ntq, list);
-		task_unlock(nt, FLG_NONE);
 	}
 } // instance_listen_balance
 
@@ -4468,7 +4456,6 @@ instance_destroy(struct instance *i)
 	if (__thr_current_instance == i) {
 		__thr_current_instance = NULL;
 	}
-	pthread_spin_destroy(&i->cpuspin);
 	memset(i, 0, sizeof(struct instance));
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
@@ -4491,7 +4478,7 @@ instance_destroy(struct instance *i)
 static int
 instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 {
-	register size_t page_size = sysconf(_SC_PAGESIZE), num_pages;
+	register size_t num_pages;
 	uint32_t n;
 
 	// Don't allow less than 100 tfd entries for pool size
@@ -4506,55 +4493,60 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 
 	// Allocate the task tfd_pool space now
 	num_pages = pool_size * sizeof(struct task);
-	num_pages += (page_size - 1);
-	num_pages /= page_size;
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
 
-	if (posix_memalign((void **)&i->tfd_pool, page_size, num_pages * page_size) != 0) {
+	if ((i->tfd_pool = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_pool = NULL;
 		return -1;
 	}
+	memset(i->tfd_pool, 0, num_pages * __page_size);
 	for (n = 0; n < pool_size; n++) {
-		struct task *t = i->tfd_pool + n;
+		uint32_t tfdi = pool_size - (n + 1);
+		struct task *t = i->tfd_pool + tfdi;
 
-		task_init(t);
-		STAILQ_INSERT_TAIL(&i->free_tasks, t, free_list);
+		task_init(t, tfdi);
+		t->free_next = i->free_tasks;
+		i->free_tasks = t;
 	}
 
 	// Allocate the task sockaddr_storage space now
 	num_pages = pool_size * sizeof(struct sockaddr_storage);
-	num_pages += (page_size - 1);
-	num_pages /= page_size;
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
 
-	if (posix_memalign((void **)&i->tfd_addrs, page_size, num_pages * page_size) != 0) {
+	if ((i->tfd_addrs = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_addrs = NULL;
 		return -1;
 	}
-	memset(i->tfd_addrs, 0, pool_size * sizeof(struct sockaddr_storage));
+	memset(i->tfd_addrs, 0, num_pages * __page_size);
 
 
 	// Allocate the spinlock storage now
 #ifdef USE_PTHREAD_SPINLOCKS
 	num_pages = TASK_MAX_TFD_LOCKS * sizeof(pthread_spinlock_t);
-	num_pages += (page_size - 1);
-	num_pages /= page_size;
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
 
-	if (posix_memalign((void **)&i->tfd_locks_real, page_size, num_pages * page_size) != 0) {
+	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_locks = NULL;
 		return -1;
 	}
+	memset(i->tfd_locks_real, 0, num_pages * __page_size);
 	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
 		pthread_spin_init(i->tfd_locks_real + n, PTHREAD_PROCESS_PRIVATE);
 	}
 	i->tfd_locks = i->tfd_locks_real + 1;
 #else
 	num_pages = TASK_MAX_TFD_LOCKS * sizeof(spin_lock_t);
-	num_pages += (page_size - 1);
-	num_pages /= page_size;
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
 
-	if (posix_memalign((void **)&i->tfd_locks_real, page_size, num_pages * page_size) != 0) {
+	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_locks = NULL;
 		return -1;
 	}
+	memset(i->tfd_locks_real, 0, num_pages * __page_size);
 	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
 		spin_init(i->tfd_locks_real + n);
 	}
@@ -4586,11 +4578,10 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 
 	size_t sz;
 	for (sz = 1; sz < sizeof(struct instance); sz += sz);
-	if (posix_memalign((void **)&i, sz, sz) != 0) {
+	if ((i = aligned_alloc(sz, sz)) == NULL) {
 		goto instance_creation_fail;
 	}
-
-	memset(i, 0, sizeof(struct instance));
+	memset(i, 0, sz);
 
 	i->magic = INSTANCE_MAGIC;
 	i->curtime_us = get_time_us(TASK_TIME_PRECISE);
@@ -4607,7 +4598,6 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	TAILQ_INIT(&i->workers_notify);
 	TAILQ_INIT(&i->workers_shutdown);
 	TAILQ_INIT(&i->workers_dead);
-	STAILQ_INIT(&i->free_tasks);
 
 	if ((i->io_workers = (struct worker **)calloc(num_workers_io, sizeof(struct worker *))) == NULL) {
 		goto instance_creation_fail;
@@ -4621,7 +4611,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
-	pthread_spin_init(&i->cpuspin, PTHREAD_PROCESS_PRIVATE);
+	spin_init(&i->cpuspin);
 
 	// CPU/Worker affinity setup
 	i->num_cpus_seen = 0;
@@ -4779,7 +4769,6 @@ TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
 	t->tm_cb = timeout_cb;
 	t->tm_cb_data = timeout_cb_data;
 	task_notify_action(t, FLG_TM);
-	task_unlock(t, FLG_NONE);	// The notifyq has the reference now
 	return t->tfd;
 } // TASK_timeout_create
 
@@ -4859,7 +4848,6 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 
 			t->io_depth++;
 			if ((result = task_write_vector(t, false)) == 0) {
-				task_unlock(t, FLG_NONE);
 				return 0;
 			}
 			task_unlock(t, FLG_WR);
@@ -4877,8 +4865,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		return -1;
 	}
 
-	// The operation is queued.  Update the timeout, unlock the task and go
-	task_unlock(t, FLG_NONE);
+	// The operation is queued.
 	return 0;
 } // TASK_socket_writev
 
@@ -4934,7 +4921,6 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 
 			t->io_depth++;
 			if ((result = task_write_buffer(t, false)) == 0) {
-				task_unlock(t, FLG_NONE);
 				return 0;
 			}
 			task_unlock(t, FLG_WR);
@@ -4952,8 +4938,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		return -1;
 	}
 
-	// The operation is queued.  Update the timeout, unlock the task and go
-	task_unlock(t, FLG_NONE);
+	// The operation is queued
 	return 0;
 } // TASK_socket_write
 
@@ -5024,7 +5009,6 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 
 			t->io_depth++;
 			if ((result = task_read_vector(t, false)) == 0) {
-				task_unlock(t, FLG_NONE);
 				return 0;
 			}
 			task_unlock(t, FLG_RD);
@@ -5042,8 +5026,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		return -1;
 	}
 
-	// The operation is queued.  Update the timeout, unlock the task and go
-	task_unlock(t, FLG_NONE);
+	// The operation is queued
 	return 0;
 } // TASK_socket_readv
 
@@ -5098,7 +5081,6 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 
 			t->io_depth++;
 			if ((result = task_read_buffer(t, false)) == 0) {
-				task_unlock(t, FLG_NONE);
 				return 0;
 			}
 			task_unlock(t, FLG_RD);
@@ -5116,8 +5098,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		return -1;
 	}
 
-	// The operation is queued.  Update the timeout, unlock the task and go
-	task_unlock(t, FLG_NONE);
+	// The operation is queued
 	return 0;
 } // TASK_socket_read
 
@@ -5155,7 +5136,6 @@ TASK_close(int64_t tfd)
 	t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
 	task_notify_action(t, FLG_CL);
-	task_unlock(t, FLG_NONE);
 	return 0;
 } // TASK_close
 
@@ -5252,8 +5232,6 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 	// Now apply the listener to all IO workers
 	instance_listen_balance(t);
-
-	task_unlock(t, FLG_NONE);
 	return 0;
 } // TASK_socket_listen
 
@@ -5289,6 +5267,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 		t->cb_errno = 0;
 		if (connect(t->fd, addr, addrlen) == 0) {
 			// We connected immediately! Return 1
+			t->io_depth = TASK_MAX_IO_DEPTH;
 			task_unlock(t, FLG_CO);
 			return 1;
 		}
@@ -5303,8 +5282,6 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 			if (task_raise_event_flag(t, EPOLLOUT) < 0) {
 				break;
 			}
-			task_unlock(t, FLG_NONE);
-
 			// We queued it, return 0
 			return 0;
 		}
@@ -5364,7 +5341,6 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 	struct instance *i;
 	struct task *t;
 	int64_t tfd;
-	int err;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
@@ -5395,10 +5371,8 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 		return -1;
 	}
 	tfd = t->tfd;
-	err = errno;
 	t->registered_fd = true;	// Mark it as registered so it isn't closed by task_do_close_cb()
-	task_unlock(t, FLG_NONE);
-	errno = err;
+	errno = 0;
 	return tfd;
 } // TASK_register_fd
 
@@ -5410,7 +5384,7 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 {
 	struct instance *i;
 	struct task *t;
-	int sock, tfd, err;
+	int sock, tfd;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
@@ -5456,9 +5430,6 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 		return -1;
 	}
 	tfd = t->tfd;
-	err = errno;
-	task_unlock(t, FLG_NONE);
-	errno = err;
 	return tfd;
 } // TASK_socket_create
 
@@ -5780,6 +5751,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		struct sigaction sa[1];
 		int32_t ti;
 
+		__page_size = sysconf(_SC_PAGESIZE);
 //fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
 //fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
 //fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));

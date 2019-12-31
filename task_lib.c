@@ -59,7 +59,6 @@
 #define TASK_US_TO_S(a)		(((int64_t)a) / 1000000)
 
 #define TFD_NONE 		(int64_t)(0xffffffffffffffff)
-#define TFDU_NONE 		(uint64_t)(0xffffffffffffffff)
 
 // Branch prediction optimisation macros
 #if __GNUC__ >= 3
@@ -180,7 +179,6 @@ struct task_timer {
 	struct task_timer	*prev;		// Previous cool-off list entry
 };
 
-// The strategy for the data layout is this.
 struct task {
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -200,14 +198,13 @@ struct task {
 	int64_t				tfd;			// Task File Descriptor that identifies this task
 	struct epoll_event		ev;			// The current epoll events we're waiting on
 	uint32_t			committed_events;	// Events verifiably committed via epoll_ctl
-
 	struct worker			*worker;		// The current io worker task is bound to
-	int32_t				fd;			// The actual system socket FD we're working on
-	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 	uint32_t			io_depth;		// How many direct calls to allow before queueing
 	uint32_t			notifyqlen;		// Number of notifyq entries this task has
-	int32_t				cb_errno;		// Errno we want to propagate on callbacks
 	uint32_t			tfd_index;		// The node index in the table
+	int32_t				tfd_iteration;		// The iteration on the node
+	int32_t				fd;			// The actual system socket FD we're working on
+	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -228,10 +225,11 @@ struct task {
 
 	// Data write fields
 	const char			*wr_buf;
-	const struct iovec		*wrv_iov;
-	size_t				wr_total;
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
+	const struct iovec		*wrv_iov;
+	int32_t				cb_errno;		// Errno we want to propagate on callbacks
+	int32_t				wrv_iovcnt;
 	size_t				wrv_buflen;
 	size_t				wrv_bufpos;
 	void				*wr_cb_data;
@@ -259,10 +257,11 @@ struct task {
 
 	// Data read fields
 	char				*rd_buf;
-	const struct iovec		*rdv_iov;
-	size_t				rd_total;
 	size_t				rd_buflen;
 	size_t				rd_bufpos;
+	const struct iovec		*rdv_iov;
+	uint32_t			migrations;		// Number of times the task has migrated
+	int32_t				rdv_iovcnt;
 	size_t				rdv_buflen;
 	size_t				rdv_bufpos;
 	void				*rd_cb_data;
@@ -273,9 +272,7 @@ struct task {
 	//===================================    CALLBACK FIELDS    ====================================//
 	//----------------------------------------------------------------------------------------------//
 
-	int32_t				wrv_iovcnt;
-	int32_t				rdv_iovcnt;
-	int64_t				age;			// Time this task was created
+	struct ntfyq_list		accept_children;	// The list of child accept tasks
 	void				*accept_cb_data;
 	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
 	void				*connect_cb_data;
@@ -289,12 +286,10 @@ struct task {
 	// cache line (64 bytes width) as that will get flushed when it gets updated.
 	__attribute__ ((aligned(64))) uint64_t	notifyqlen_locked; // Number of locked notifyq entries this task has
 	struct worker			*preferred_worker;	// To initiate task io worker migration
-	struct ntfyq_list		accept_children;	// The list of child accept tasks
 	STAILQ_ENTRY(task)		free_list;		// List of free tasks
-	uint32_t			migrations;		// Number of times the task has migrated
-	int32_t				tfd_iteration;		// The iteration on the node
+	int64_t				age;			// Time this task was created
 	socklen_t			addrlen;		// The valid length of the data in .addr
-} __attribute__ ((aligned(64)));	// Round up to the nearest 64 byte boundary
+} __attribute__ ((aligned(64)));
 
 typedef enum {
 	WORKER_STATE_LIMBO = 0,
@@ -458,8 +453,6 @@ struct instance {
 	void				(*shutdown_cb)(intptr_t ti, void *shutdown_data);
 	void				*shutdown_data;
 };
-
-static inline int task_lower_event_flag(struct task *t, uint32_t flags);
 
 static __thread int64_t		__thr_preferred_age;
 static __thread struct worker	*__thr_current_worker = NULL;		// The current IO worker.  MUST BE NULL if current thread is not an IO worker
@@ -1493,11 +1486,255 @@ task_notify_action_queue_first:
 } // task_notify_action
 
 
+// Update the task expiry timeout for a socket operation
+static inline void
+task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
+{
+	register int64_t new_tm_us;
+
+	if (unlikely(us_from_now < 0)) {
+		new_tm_us = TIMER_TIME_CANCEL;
+	} else if (us_from_now < 5000000) {
+		new_tm_us = get_time_us(TASK_TIME_PRECISE) + us_from_now;
+	} else if (us_from_now < TASK_TIMEOUT_ONE_YEAR) {
+		// Set to the current worker time plus the us_from_now plus half
+		// the worker's maximum epoll timeout.  It'll be close enough
+		new_tm_us = get_time_us(TASK_TIME_COARSE) + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
+	} else {
+		us_from_now = TASK_TIMEOUT_ONE_YEAR;
+	}
+
+	if (new_tm_us != *p_tm) {
+		*p_tm = new_tm_us;
+	}
+} // task_update_io_timeout
+
+
+static inline void
+task_activate_rd_timeout(register struct task *t)
+{
+	register struct worker *w = t->worker;
+
+	// If we're not on the correct worker thread, queue a notify instead
+	if (!lockless_worker(w)) {
+		task_notify_action(t, FLG_RT);
+		return;
+	}
+
+	// Acceptors have no timeouts
+	if (unlikely(!!(t->active_flags & FLG_LI))) {
+		return;
+	}
+
+	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
+	worker_timer_update(w, &t->rd_tt, t->tfd);
+	if (likely(t->rd_tt.expiry_us >= 0)) {
+		t->active_flags |= FLG_RT;
+	} else {
+		t->active_flags &= ~(FLG_RT);
+	}
+} // task_activate_rd_timeout
+
+
+static inline void
+task_activate_wr_timeout(register struct task *t)
+{
+	register struct worker *w = t->worker;
+
+	// If we're not on the correct worker thread, queue a notify instead
+	if (!lockless_worker(w)) {
+		task_notify_action(t, FLG_WT);
+		return;
+	}
+
+	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
+	worker_timer_update(w, &t->wr_tt, t->tfd);
+	if (likely(t->wr_tt.expiry_us >= 0)) {
+		t->active_flags |= FLG_WT;
+	} else {
+		t->active_flags &= ~(FLG_WT);
+	}
+} // task_activate_wr_timeout
+
+
+static inline void
+task_acquire_epfd(struct task *t)
+{
+	register struct worker *w = t->worker;
+	register int n;
+
+	// Assign an epfd to the task
+	worker_lock(w);
+
+	if (t->epfd >= 0) {
+		worker_unlock(w);
+		return;
+	}
+
+	for (n = 0; n < w->max_epfds; n++) {
+		if (w->epfd_used[n] < w->max_events) {
+			w->epfd_used[n]++;
+			break;
+		}
+	}
+
+	worker_unlock(w);
+
+	assert (n < w->max_epfds);
+	t->epfd = w->epfd[n];
+} // task_acquire_epfd
+
+
+static inline void
+task_release_epfd(struct task *t)
+{
+	register struct worker *w = t->worker;
+
+	// De-reference the task from the worker's epfd count
+	worker_lock(w);
+	for (register int n = 0; n < w->max_epfds; n++) {
+		if (t->epfd == w->epfd[n]) {
+			w->epfd_used[n]--;
+			break;
+		}
+	}
+	worker_unlock(w);
+
+	t->epfd = -1;
+} // task_release_epfd
+
+
+// Creates the given event flag(s)
+static inline int
+task_create_event_flag(register struct task *t)
+{
+
+	task_acquire_epfd(t);
+
+	t->ev.data.u64 = (uint64_t)t->tfd;
+	if (likely(t->rd_shut == false)) {
+		t->ev.events |= EPOLLRDHUP;
+	}
+	t->active_flags |= FLG_PW;
+
+#ifdef USE_EPOLLONESHOT
+	t->ev.events |= EPOLLONESHOT;
+#endif
+
+	register int res = epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &t->ev);
+
+#ifdef USE_EPOLLET
+	// Only turn on EPOLLET AFTER the add, or we race
+	// with the kernel on the initial event notification
+	if (res == 0) {
+		t->ev.events |= EPOLLET;
+	}
+#endif
+
+	if (res < 0) {
+		task_release_epfd(t);
+	}
+
+	return res;
+} // task_create_event_flag
+
+
+// Raises the given event flag(s)
+static inline int
+task_raise_event_flag(register struct task *t, register uint32_t flags)
+{
+	if (flags & EPOLLIN) {
+		if (unlikely(t->rd_shut)) {
+			errno = EPIPE;
+			return -1;
+		}
+	}
+
+	if (flags & EPOLLOUT) {
+		if (unlikely(t->wr_shut)) {
+			errno = EPIPE;
+			return -1;
+		}
+	}
+
+	t->ev.events |= flags;
+
+	if (unlikely(t->epfd < 0)) {
+		// We need to to EPOLL_CTL_ADD instead
+		if (task_create_event_flag(t) < 0) {
+			t->ev.events &= ~flags;
+			return -1;
+		}
+	} else {
+		if (unlikely(epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
+			t->ev.events &= ~flags;
+			return -1;
+		}
+	}
+
+	t->committed_events = (t->ev.events & 0xff);
+
+	if (flags & EPOLLIN) {
+		if (flags & EPOLLOUT) {
+			t->active_flags |= (FLG_PI | FLG_PO);
+			task_activate_rd_timeout(t);
+			task_activate_wr_timeout(t);
+		} else {
+			t->active_flags |= FLG_PI;
+			task_activate_rd_timeout(t);
+		}
+	} else if (likely(flags & EPOLLOUT)) {
+		t->active_flags |= FLG_PO;
+		task_activate_wr_timeout(t);
+	}
+
+	return 0;
+} // task_raise_event_flag
+
+
+// Lowers the given event flag(s)
+static inline int
+task_lower_event_flag(register struct task *t, register uint32_t flags)
+{
+	int res;
+
+	// If we have no TFD, we nothing else to do
+	if (unlikely(t->epfd < 0)) {
+		return 0;
+	}
+
+	if (flags & EPOLLIN) {
+		if (flags & EPOLLOUT) {
+			t->active_flags &= ~(FLG_PI | FLG_PO);
+		} else {
+			t->active_flags &= ~(FLG_PI);
+		}
+	} else if (likely(flags & EPOLLOUT)) {
+		t->active_flags &= ~(FLG_PO);
+	}
+
+	// Lower the flags on the task
+	t->ev.events &= ~flags;
+
+#ifdef USE_EPOLLONESHOT
+	// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
+	// if there's no other IN/OUT flag still set
+	if ((t->ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
+		return 0;
+	}
+#endif
+
+	res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
+	if (likely(res == 0)) {
+		t->committed_events = (t->ev.events & 0xff);
+	}
+	return res;
+} // task_lower_event_flag
+
 
 // ---------------------------------------------------------------------------------------------//
 // 				    Callback Managment API					//
 // ---------------------------------------------------------------------------------------------//
-
 
 static inline void
 task_cancel_timer(struct task *t, task_action_flag_t action)
@@ -1571,53 +1808,6 @@ task_cancel_read(struct task *t)
 
 	t->active_flags &= ~(FLG_RD);
 } // task_cancel_read
-
-
-static inline void
-task_acquire_epfd(struct task *t)
-{
-	register struct worker *w = t->worker;
-	register int n;
-
-	// Assign an epfd to the task
-	worker_lock(w);
-
-	if (t->epfd >= 0) {
-		worker_unlock(w);
-		return;
-	}
-
-	for (n = 0; n < w->max_epfds; n++) {
-		if (w->epfd_used[n] < w->max_events) {
-			w->epfd_used[n]++;
-			break;
-		}
-	}
-
-	worker_unlock(w);
-
-	assert (n < w->max_epfds);
-	t->epfd = w->epfd[n];
-} // task_acquire_epfd
-
-
-static inline void
-task_release_epfd(struct task *t)
-{
-	register struct worker *w = t->worker;
-
-	// De-reference the task from the worker's epfd count
-	worker_lock(w);
-	for (register int n = 0; n < w->max_epfds; n++) {
-		if (t->epfd == w->epfd[n]) {
-			w->epfd_used[n]--;
-			break;
-		}
-	}
-	worker_unlock(w);
-
-	t->epfd = -1;
-} // task_release_epfd
 
 
 static inline void
@@ -1703,9 +1893,6 @@ task_do_readv_cb(struct task *t, ssize_t result)
 
 	t->rd_state = TASK_READ_STATE_IDLE;
 	task_cancel_timer(t, FLG_RT);
-	if (likely(result > 0)) {
-		t->rd_total += result;
-	}
 
 	// If we don't have a callback, just terminate the write peacefully
 	if (unlikely(t->rdv_cb == NULL)) {
@@ -1748,9 +1935,6 @@ task_do_read_cb(struct task *t, ssize_t result)
 
 	t->rd_state = TASK_READ_STATE_IDLE;
 	task_cancel_timer(t, FLG_RT);
-	if (likely(result > 0)) {
-		t->rd_total += result;
-	}
 
 	// If we don't have a callback, just terminate the read peacefully
 	if (unlikely(t->rd_cb == NULL)) {
@@ -2412,205 +2596,6 @@ task_update_timer(struct task *t)
 } // task_update_timer
 
 
-// Update the task expiry timeout for a socket operation
-static inline void
-task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
-{
-	register int64_t new_tm_us;
-
-	if (unlikely(us_from_now < 0)) {
-		new_tm_us = TIMER_TIME_CANCEL;
-	} else if (us_from_now < 5000000) {
-		new_tm_us = get_time_us(TASK_TIME_PRECISE) + us_from_now;
-	} else if (us_from_now < TASK_TIMEOUT_ONE_YEAR) {
-		// Set to the current worker time plus the us_from_now plus half
-		// the worker's maximum epoll timeout.  It'll be close enough
-		new_tm_us = get_time_us(TASK_TIME_COARSE) + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
-	} else {
-		us_from_now = TASK_TIMEOUT_ONE_YEAR;
-	}
-
-	if (new_tm_us != *p_tm) {
-		*p_tm = new_tm_us;
-	}
-} // task_update_io_timeout
-
-
-static inline void
-task_activate_rd_timeout(register struct task *t)
-{
-	register struct worker *w = t->worker;
-
-	// If we're not on the correct worker thread, queue a notify instead
-	if (!lockless_worker(w)) {
-		task_notify_action(t, FLG_RT);
-		return;
-	}
-
-	// Acceptors have no timeouts
-	if (unlikely(!!(t->active_flags & FLG_LI))) {
-		return;
-	}
-
-	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
-	worker_timer_update(w, &t->rd_tt, t->tfd);
-	if (likely(t->rd_tt.expiry_us >= 0)) {
-		t->active_flags |= FLG_RT;
-	} else {
-		t->active_flags &= ~(FLG_RT);
-	}
-} // task_activate_rd_timeout
-
-
-static inline void
-task_activate_wr_timeout(register struct task *t)
-{
-	register struct worker *w = t->worker;
-
-	// If we're not on the correct worker thread, queue a notify instead
-	if (!lockless_worker(w)) {
-		task_notify_action(t, FLG_WT);
-		return;
-	}
-
-	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
-	worker_timer_update(w, &t->wr_tt, t->tfd);
-	if (likely(t->wr_tt.expiry_us >= 0)) {
-		t->active_flags |= FLG_WT;
-	} else {
-		t->active_flags &= ~(FLG_WT);
-	}
-} // task_activate_wr_timeout
-
-
-// Creates the given event flag(s)
-static inline int
-task_create_event_flag(register struct task *t)
-{
-
-	task_acquire_epfd(t);
-
-	t->ev.data.u64 = (uint64_t)t->tfd;
-	if (likely(t->rd_shut == false)) {
-		t->ev.events |= EPOLLRDHUP;
-	}
-	t->active_flags |= FLG_PW;
-
-#ifdef USE_EPOLLONESHOT
-	t->ev.events |= EPOLLONESHOT;
-#endif
-
-	register int res = epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &t->ev);
-
-#ifdef USE_EPOLLET
-	// Only turn on EPOLLET AFTER the add, or we race
-	// with the kernel on the initial event notification
-	if (res == 0) {
-		t->ev.events |= EPOLLET;
-	}
-#endif
-
-	if (res < 0) {
-		task_release_epfd(t);
-	}
-
-	return res;
-} // task_create_event_flag
-
-
-// Raises the given event flag(s)
-static inline int
-task_raise_event_flag(register struct task *t, register uint32_t flags)
-{
-	if (flags & EPOLLIN) {
-		if (unlikely(t->rd_shut)) {
-			errno = EPIPE;
-			return -1;
-		}
-	}
-
-	if (flags & EPOLLOUT) {
-		if (unlikely(t->wr_shut)) {
-			errno = EPIPE;
-			return -1;
-		}
-	}
-
-	t->ev.events |= flags;
-
-	if (unlikely(t->epfd < 0)) {
-		// We need to to EPOLL_CTL_ADD instead
-		if (task_create_event_flag(t) < 0) {
-			t->ev.events &= ~flags;
-			return -1;
-		}
-	} else {
-		if (unlikely(epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
-			t->ev.events &= ~flags;
-			return -1;
-		}
-	}
-
-	t->committed_events = (t->ev.events & 0xff);
-
-	if (flags & EPOLLIN) {
-		if (flags & EPOLLOUT) {
-			t->active_flags |= (FLG_PI | FLG_PO);
-			task_activate_rd_timeout(t);
-			task_activate_wr_timeout(t);
-		} else {
-			t->active_flags |= FLG_PI;
-			task_activate_rd_timeout(t);
-		}
-	} else if (likely(flags & EPOLLOUT)) {
-		t->active_flags |= FLG_PO;
-		task_activate_wr_timeout(t);
-	}
-
-	return 0;
-} // task_raise_event_flag
-
-
-// Lowers the given event flag(s)
-static inline int
-task_lower_event_flag(register struct task *t, register uint32_t flags)
-{
-	int res;
-
-	// If we have no TFD, we nothing else to do
-	if (unlikely(t->ev.data.u64 == TFDU_NONE)) {
-		return 0;
-	}
-
-	if (flags & EPOLLIN) {
-		if (flags & EPOLLOUT) {
-			t->active_flags &= ~(FLG_PI | FLG_PO);
-		} else {
-			t->active_flags &= ~(FLG_PI);
-		}
-	} else if (likely(flags & EPOLLOUT)) {
-		t->active_flags &= ~(FLG_PO);
-	}
-
-	// Lower the flags on the task
-	t->ev.events &= ~flags;
-
-#ifdef USE_EPOLLONESHOT
-	// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
-	// if there's no other IN/OUT flag still set
-	if ((t->ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
-		return 0;
-	}
-#endif
-
-	res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
-	if (likely(res == 0)) {
-		t->committed_events = (t->ev.events & 0xff);
-	}
-	return res;
-} // task_lower_event_flag
-
-
 static struct task *
 task_create(struct instance *i, int type, int fd, struct worker *w, void *close_cb_data,
 	    void (*close_cb)(int64_t tfd, void *close_cb_data), bool outgoing)
@@ -2745,7 +2730,6 @@ task_write_vector(register struct task *t, register bool queued)
 
 		// We wrote something!
 		t->wrv_bufpos += written;
-		t->wr_total += written;
 	}
 
 	// We wrote it all.  Make the callback
@@ -2830,7 +2814,6 @@ task_write_buffer(register struct task *t, register bool queued)
 
 		// We wrote something!
 		t->wr_bufpos += written;
-		t->wr_total += written;
 		max_can_do -= written;
 	}
 
@@ -4879,9 +4862,6 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 				task_unlock(t, FLG_NONE);
 				return 0;
 			}
-			if (result > 0) {
-				t->wr_total += result;
-			}
 			task_unlock(t, FLG_WR);
 			return result;
 		}
@@ -4956,9 +4936,6 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 			if ((result = task_write_buffer(t, false)) == 0) {
 				task_unlock(t, FLG_NONE);
 				return 0;
-			}
-			if (result > 0) {
-				t->wr_total += result;
 			}
 			task_unlock(t, FLG_WR);
 			return result;
@@ -5050,9 +5027,6 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 				task_unlock(t, FLG_NONE);
 				return 0;
 			}
-			if (result > 0) {
-				t->rd_total += result;
-			}
 			task_unlock(t, FLG_RD);
 			return result;
 		}
@@ -5126,9 +5100,6 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 			if ((result = task_read_buffer(t, false)) == 0) {
 				task_unlock(t, FLG_NONE);
 				return 0;
-			}
-			if (result > 0) {
-				t->rd_total += result;
 			}
 			task_unlock(t, FLG_RD);
 			return result;
@@ -5812,6 +5783,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 //fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
 //fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
 //fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));
+//fprintf(stderr, "sizeof(struct ntfyq_list) = %lu\n", sizeof(struct ntfyq_list));
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
 		sigaction(SIGPIPE, sa, NULL);

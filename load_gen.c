@@ -103,7 +103,7 @@ loadgen_start_rd(struct loadgen *lg)
 	ssize_t result;
 
 	lg->num_rd_calls++;
-	result = TASK_socket_read(lg->tfd, lg->rd_buf, BUFLEN, TASK_TIMEOUT_ONE_SEC * 10, lg, loadgen_read_cb);
+	result = TASK_socket_read(lg->tfd, lg->rd_buf, BUFLEN, TASK_TIMEOUT_ONE_SEC * 15, lg, loadgen_read_cb);
 	loadgen_read_cb(lg->tfd, lg->rd_buf, result, lg);
 } // loadgen_start_rd
 
@@ -160,7 +160,7 @@ loadgen_start_wr(struct loadgen *lg)
 	}
 
 	lg->num_wr_calls++;
-	result = TASK_socket_write(lg->tfd, lg->wr_buf, wr_size, TASK_TIMEOUT_ONE_SEC * 10, lg, loadgen_write_cb);
+	result = TASK_socket_write(lg->tfd, lg->wr_buf, wr_size, TASK_TIMEOUT_ONE_SEC * 15, lg, loadgen_write_cb);
 	loadgen_write_cb(lg->tfd, lg->wr_buf, result, lg);
 } // loadgen_start_wr
 
@@ -213,7 +213,7 @@ loadgen_connect(struct loadgen *lg)
 		return;
 	}
 
-	res = TASK_socket_connect(lg->tfd, (struct sockaddr *)lg->addr, sizeof(struct sockaddr_in), TASK_TIMEOUT_ONE_SEC * 5, (void *)lg, connect_complete_cb);
+	res = TASK_socket_connect(lg->tfd, (struct sockaddr *)lg->addr, sizeof(struct sockaddr_in), TASK_TIMEOUT_ONE_SEC * 15, (void *)lg, connect_complete_cb);
 	connect_complete_cb(lg->tfd, res, lg);
 }
 

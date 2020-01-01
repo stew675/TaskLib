@@ -34,7 +34,16 @@
 #define USE_EPOLLONESHOT
 
 // Uncomment the following to turn on using pthread spinlocks for TFD table and worker locking
+// Best for near-zero contention scenarios
 //#define USE_PTHREAD_SPINLOCKS
+
+// Uncomment the following to turn on using greedy spinlocks for TFD table and worker locking
+// Ideal for up to 10 threads contention scenarios
+//#define USE_SPINLOCKS
+
+// Uncomment the following to turn on using ticketed spinlocks for TFD table and worker locking
+// Ideal for all contention levels, but slower under minimum contention scenarios
+#define USE_TICKETLOCKS
 
 // Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
 // be stored to __thr_current_instance->stragglers, which allows us to attach a debugger and
@@ -69,7 +78,8 @@
 #define unlikely(x) (x)
 #endif
 
-// Intel MP Hyper-threading friendly implementation of Spinlocks
+// Intel MP Hyper-threading friendly implementation of Unfair Spinlocks
+// Excellent performance for 1-6 contending threads
 #include <immintrin.h>
 typedef struct {
 	int64_t lock[8];
@@ -90,6 +100,44 @@ static inline void __spin_unlock(register int64_t volatile *p)
 #define spin_init(lk)   (lk)->lock[0] = 0;
 #define spin_lock(lk)   __spin_lock((lk)->lock);
 #define spin_unlock(lk) __spin_unlock((lk)->lock);
+
+// AMD/Intel MP Hyper-threading friendly implementation of Fair Ticketed Spinlocks with progressive backoff
+#include <immintrin.h>
+#define __TICKET_LOCK_INITIALIZER { {0}, {0}}
+
+struct ticketlock {
+	struct __tickets {
+		int32_t head;
+		int32_t tail;
+	} tickets;
+	int64_t pad[7];
+};
+
+static __inline__ void ticket_lock_init(struct ticketlock *lock)
+{
+    *lock = (struct ticketlock)__TICKET_LOCK_INITIALIZER;
+}
+
+static __inline__ void ticket_lock(struct ticketlock *lock)
+{
+	register struct __tickets tkt = { .tail = 1 };
+	register int32_t diff;
+
+	{ asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tkt), "+m"(*(&lock->tickets)) : :"memory", "cc"); }
+	while((diff = tkt.tail - tkt.head)) {
+		if (diff > 2) {
+			do { _mm_pause(); } while (--diff);
+		} else {
+			_mm_pause();
+		}
+		tkt.head = *((volatile int32_t *)&(lock->tickets.head));
+	}
+}
+
+static __inline__ void ticket_unlock(struct ticketlock *lock)
+{
+	{ asm __volatile__("lock addl %1, %0\n" :"+m"(*(&lock->tickets.head)) :"ri"(1) : "memory","cc"); }
+}
 
 //-------------------------------------------------------------------------------------------
 
@@ -358,9 +406,13 @@ struct worker {
 
 	// Put this all by itself at the end
 #ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spinlock_t		spinlock;
-#else
-__attribute__ ((aligned(64))) spin_lock_t lock[1];
+	pthread_spinlock_t		lock;
+#endif
+#ifdef USE_SPINLOCKS
+__attribute__ ((aligned(64))) spin_lock_t lock;
+#endif
+#ifdef USE_TICKETLOCKS
+__attribute__ ((aligned(64))) struct ticketlock	lock;
 #endif
 }  __attribute__ ((aligned(64)));
 
@@ -411,9 +463,14 @@ struct instance {
 #ifdef USE_PTHREAD_SPINLOCKS
 	pthread_spinlock_t		*tfd_locks_real;
 	pthread_spinlock_t		*tfd_locks;
-#else
+#endif
+#ifdef USE_SPINLOCKS
 	spin_lock_t			*tfd_locks_real;
 	spin_lock_t			*tfd_locks;
+#endif
+#ifdef USE_TICKETLOCKS
+	struct ticketlock		*tfd_locks_real;
+	struct ticketlock		*tfd_locks;
 #endif
 
 	struct worker			*instance_worker;
@@ -471,11 +528,24 @@ static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 #define	TASK_TFD_LOCK_MASK	(TASK_MAX_TFD_LOCKS - 1)
 
 #ifdef USE_PTHREAD_SPINLOCKS
+#undef USE_SPINLOCKS
+#undef USE_TICKETLOCKS
 #define	tfd_lock(lock_index)	pthread_spin_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
 #define	tfd_unlock(lock_index)	pthread_spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#else
+#endif
+
+#ifdef USE_SPINLOCKS
+#undef USE_PTHREAD_SPINLOCKS
+#undef USE_TICKETLOCKS
 #define	tfd_lock(lock_index)	spin_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
 #define	tfd_unlock(lock_index)	spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
+#endif
+
+#ifdef USE_TICKETLOCKS
+#undef USE_PTHREAD_SPINLOCKS
+#undef USE_SPINLOCKS
+#define	tfd_lock(lock_index)	ticket_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
+#define	tfd_unlock(lock_index)	ticket_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
 #endif
 
 // ---------------------------------------------------------------------------------------------//
@@ -597,9 +667,13 @@ static inline void
 worker_lock(struct worker *w)
 {
 #ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_lock(&w->spinlock);
-#else
-	spin_lock(w->lock);
+	pthread_spin_lock(&w->lock);
+#endif
+#ifdef USE_SPINLOCKS
+	spin_lock(&w->lock);
+#endif
+#ifdef USE_TICKETLOCKS
+	ticket_lock(&w->lock);
 #endif
 } // worker_lock
 
@@ -608,9 +682,13 @@ static inline void
 worker_unlock(struct worker *w)
 {
 #ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_unlock(&w->spinlock);
-#else
-	spin_unlock(w->lock);
+	pthread_spin_unlock(&w->lock);
+#endif
+#ifdef USE_SPINLOCKS
+	spin_unlock(&w->lock);
+#endif
+#ifdef USE_TICKETLOCKS
+	ticket_unlock(&w->lock);
 #endif
 } // worker_lock
 
@@ -2341,7 +2419,7 @@ worker_destroy(struct worker *w)
 	}
 
 #ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_destroy(&w->spinlock);
+	pthread_spin_destroy(&w->lock);
 #endif
 	free(w);
 	w = NULL;
@@ -4096,9 +4174,13 @@ worker_create(struct instance *i, int worker_type)
 	w->curtime_us = get_time_us(TASK_TIME_PRECISE);
 	w->gepfd = -1;
 #ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_init(&w->spinlock, PTHREAD_PROCESS_PRIVATE);
-#else
-	spin_init(w->lock);
+	pthread_spin_init(&w->lock, PTHREAD_PROCESS_PRIVATE);
+#endif
+#ifdef USE_SPINLOCKS
+	spin_init(&w->lock);
+#endif
+#ifdef USE_TICKETLOCKS
+	ticket_lock_init(&w->lock);
 #endif
 	STAILQ_INIT(&w->notifyq_locked);
 	STAILQ_INIT(&w->notifyq_batches);
@@ -4390,7 +4472,9 @@ instance_destroy(struct instance *i)
 		i->tfd_pool = NULL;
 	}
 	if (i->tfd_locks_real) {
-		free((void *)i->tfd_locks_real);
+		union { volatile void *a; void *b;} whatevs;
+		whatevs.a = i->tfd_locks_real;
+		free(whatevs.b);
 		i->tfd_locks_real = NULL;
 		i->tfd_locks = NULL;
 	}
@@ -4478,34 +4562,36 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 
 	// Allocate the spinlock storage now
 #ifdef USE_PTHREAD_SPINLOCKS
-	num_pages = TASK_MAX_TFD_LOCKS * sizeof(pthread_spinlock_t);
-	num_pages += (__page_size - 1);
-	num_pages /= __page_size;
-
-	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
-		i->tfd_locks = NULL;
-		return -1;
-	}
-	memset(i->tfd_locks_real, 0, num_pages * __page_size);
-	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
-		pthread_spin_init(i->tfd_locks_real + n, PTHREAD_PROCESS_PRIVATE);
-	}
-	i->tfd_locks = i->tfd_locks_real + 1;
-#else
-	num_pages = TASK_MAX_TFD_LOCKS * sizeof(spin_lock_t);
-	num_pages += (__page_size - 1);
-	num_pages /= __page_size;
-
-	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
-		i->tfd_locks = NULL;
-		return -1;
-	}
-	memset(i->tfd_locks_real, 0, num_pages * __page_size);
-	for (n = 0; n < TASK_MAX_TFD_LOCKS; n++) {
-		spin_init(i->tfd_locks_real + n);
-	}
-	i->tfd_locks = i->tfd_locks_real + 1;
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(pthread_spinlock_t);
 #endif
+#ifdef USE_SPINLOCKS
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(spin_lock_t);
+#endif
+#ifdef USE_TICKETLOCKS
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(struct ticketlock);
+#endif
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
+
+	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
+		i->tfd_locks = NULL;
+		return -1;
+	}
+	union { volatile void *a; void *b;} whatevs;
+	whatevs.a = i->tfd_locks_real;
+	memset(whatevs.b, 0, num_pages * __page_size);
+	for (n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
+#ifdef USE_PTHREAD_SPINLOCKS
+		pthread_spin_init(i->tfd_locks_real + n, PTHREAD_PROCESS_PRIVATE);
+#endif
+#ifdef USE_SPINLOCKS
+		spin_init(i->tfd_locks_real + n);
+#endif
+#ifdef USE_TICKETLOCKS
+		ticket_lock_init(i->tfd_locks_real + n);
+#endif
+	}
+	i->tfd_locks = i->tfd_locks_real + 1;
 	return 0;
 } // instance_tfd_pool_init
 
@@ -5713,10 +5799,6 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		int32_t ti;
 
 		__page_size = sysconf(_SC_PAGESIZE);
-//fprintf(stderr, "sizeof(struct task) = %lu\n", sizeof(struct task));
-//fprintf(stderr, "sizeof(struct worker) = %lu\n", sizeof(struct worker));
-//fprintf(stderr, "sizeof(struct ntfyq) = %lu\n", sizeof(struct ntfyq));
-//fprintf(stderr, "sizeof(struct ntfyq_list) = %lu\n", sizeof(struct ntfyq_list));
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
 		sigaction(SIGPIPE, sa, NULL);

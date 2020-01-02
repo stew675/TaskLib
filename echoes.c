@@ -315,7 +315,7 @@ main(int argc, const char *argv[])
 		return 1;
 	}
 
-	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, max_conns, 131072, TAKS_FLAGS_AFFINITY_FORCE)) < 0) {
+	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 4, 0, max_conns, 131072, TAKS_FLAGS_AFFINITY_FORCE)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

@@ -97,12 +97,19 @@
 #define unlikely(x) (x)
 #endif
 
+// Uncomment the following line to turn on spinlock statistics.  Turning this on slows
+// the respective spinlocks by 20% or so.  The statistics are not exacting in correctess
+// for reasons of speed, and recorded values are intended to be guidelines only
+// #define __LOCK_STATISTICS
+
 // AMD/Intel MP Hyper-threading friendly implementation of Greedy Spinlocks
 // Excellent performance for 0-4 contending threads
 typedef struct {
-	uint64_t	lock;
-	uint64_t	spins;
-	uint64_t	pad[6];
+	volatile uint64_t	lock;
+	volatile uint64_t	calls;
+	volatile uint64_t	contentions;
+	volatile uint64_t	spins;
+	uint64_t		pad[4];
 } __attribute__ ((aligned(64))) spinlock_t;
 
 #define	SPIN_LOCK_INITIALIZER	(spinlock_t){0}
@@ -111,11 +118,16 @@ typedef struct {
 
 static inline void spin_lock(register spinlock_t volatile *lock)
 {
-	while(unlikely(__sync_lock_test_and_set((volatile uint64_t *)lock, 1))) {
-		// Switch the commented lines below to turn off/on (inexact) contention
-		// counting. Slows down the algorithm by about 10% to have it enabled
-		// do { _mm_pause(); lock->spins++;} while (*((volatile uint64_t *)lock));
+#ifdef __LOCK_STATISTICS
+	lock->calls++;
+#endif
+	while(unlikely(__sync_lock_test_and_set(((volatile uint64_t *)lock), 1))) {
+#ifdef __LOCK_STATISTICS
+		lock->contentions++;
+		do { _mm_pause(); lock->spins++;} while (*((volatile uint64_t *)lock));
+#else
 		do { _mm_pause();} while (*((volatile uint64_t *)lock));
+#endif
 	}
 }
 
@@ -123,11 +135,13 @@ static inline void spin_lock(register spinlock_t volatile *lock)
 // progressive backoff.  Typically best for moderate contention scenarios and above
 typedef struct {
 	struct __ticket {
-		uint32_t	  tail;
 		volatile uint32_t head;
+		uint32_t	  tail;
 	} tickets;
-	uint64_t	spins;
-	uint64_t	pad[6];
+	volatile uint64_t	calls;
+	volatile uint64_t	contentions;
+	volatile uint64_t	spins;
+	uint64_t		pad[4];
 } __attribute__ ((aligned(64))) ticketlock_t;
 
 #define TICKET_LOCK_INITIALIZER	(ticketlock_t){0}
@@ -139,6 +153,10 @@ static inline void ticket_lock(register ticketlock_t *lock)
 	register struct __ticket tkt = ({ register struct __ticket tmp = {.tail = 1};
 					asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tmp),
 					"+m"(*(&lock->tickets)) : :"memory", "cc"); tmp;});
+#ifdef __LOCK_STATISTICS
+	lock->calls++;
+	if (tkt.tail - tkt.head) lock->contentions++;
+#endif
 	while (tkt.tail - tkt.head) {
 		// It's faster for the uncontested path to calculate tkt.head below
 		// It's also slightly faster when contesting to use > 2 than > 1
@@ -147,10 +165,10 @@ static inline void ticket_lock(register ticketlock_t *lock)
 		} else {
 			_mm_pause();
 		}
+#ifdef __LOCK_STATISTICS
+		lock->spins++;
+#endif
 		tkt.head = lock->tickets.head;
-		// Uncomment the line below to turn on (inexact) contention counting
-		// It slows down the algorithm by about 10% to have it enabled
-		// lock->spins++;
 	}
 }
 

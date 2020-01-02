@@ -412,7 +412,7 @@ main(int argc, const char *argv[])
 
 	fprintf(stderr, "Generating Load for %u clients\n", maxgens);
 
-	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 3, 0, maxgens, 98304, TAKS_FLAGS_AFFINITY_DISABLE)) < 0) {
+	if ((task_instance = TASK_instance_create((get_nprocs_conf() + 2) / 4, 0, maxgens, 98304, TAKS_FLAGS_AFFINITY_DISABLE)) < 0) {
 		perror("TASK_instance_create");
 		return 1;
 	}

@@ -150,9 +150,9 @@ typedef struct {
 
 static inline void ticket_lock(register ticketlock_t *lock)
 {
-	register struct __ticket tkt = ({ register struct __ticket tmp = {.tail = 1};
-					asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tmp),
-					"+m"(*(&lock->tickets)) : :"memory", "cc"); tmp;});
+	register struct __ticket tkt = {.tail = 1};
+	
+	asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tkt), "+m"(*(&lock->tickets)) : :"memory", "cc");
 #ifdef __LOCK_STATISTICS
 	lock->calls++;
 	if (tkt.tail - tkt.head) lock->contentions++;

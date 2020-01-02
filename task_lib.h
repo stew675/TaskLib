@@ -34,6 +34,9 @@
 #ifndef __TASK_LIB_H__
 #define __TASK_LIB_H__
 
+#define	TAKS_FLAGS_AFFINITY_FORCE	0x00000001
+#define	TAKS_FLAGS_AFFINITY_DISABLE	0x00000002
+
 // Some handy macros to use to define timeouts
 #define	TASK_TIMEOUT_NEVER		        (int64_t)(-1)
 #define	TASK_TIMEOUT_NONE		        (int64_t)(-1)
@@ -161,6 +164,6 @@ int TASK_instance_shutdown(int32_t ti, void *user_data, void (*shutdown_cb)(intp
 int TASK_instance_start(int32_t ti);
 
 // Creates a task instance
-int32_t TASK_instance_create(int num_workers_io, int max_workers_blocking, uint32_t max_tasks, int tcp_sndbuf_size);
+int32_t TASK_instance_create(int num_workers_io, int max_workers_blocking, uint32_t max_tasks, int tcp_sndbuf_size, uint64_t flags);
 
 #endif	// __TASK_LIB_H__

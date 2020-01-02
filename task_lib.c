@@ -103,40 +103,34 @@ static inline void __spin_unlock(register int64_t volatile *p)
 
 // AMD/Intel MP Hyper-threading friendly implementation of Fair Ticketed Spinlocks with progressive backoff
 #include <immintrin.h>
-#define __TICKET_LOCK_INITIALIZER { {0}, {0}}
 
 struct ticketlock {
-	struct __tickets {
-		int32_t head;
-		int32_t tail;
+	struct __ticket {
+		int32_t		 tail;
+		volatile int32_t head;
 	} tickets;
-	int64_t pad[7];
+	int64_t padding[7];
 };
 
-static __inline__ void ticket_lock_init(struct ticketlock *lock)
-{
-    *lock = (struct ticketlock)__TICKET_LOCK_INITIALIZER;
-}
+#define TICKET_LOCK_INITIALIZER	(struct ticketlock){0}
+#define ticket_unlock(x)	((x)->tickets.head++)
+#define ticket_init(x)		(*(x) = TICKET_LOCK_INITIALIZER)
 
-static __inline__ void ticket_lock(struct ticketlock *lock)
+static inline void ticket_lock(register struct ticketlock *lock)
 {
-	register struct __tickets tkt = { .tail = 1 };
-	register int32_t diff;
-
-	{ asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tkt), "+m"(*(&lock->tickets)) : :"memory", "cc"); }
-	while((diff = tkt.tail - tkt.head)) {
-		if (diff > 2) {
-			do { _mm_pause(); } while (--diff);
+	register struct __ticket tkt = ({ register struct __ticket tmp = {.tail = 1};
+					asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tmp),
+					"+m"(*(&lock->tickets)) : :"memory", "cc"); tmp;});
+	while (tkt.tail - tkt.head) {
+		// It's faster for the uncontested path to calculate tkt.head here
+		// It's also slightly faster when contesting to use > 2 than > 1
+		if ((tkt.head = (tkt.tail - tkt.head)) > 2) {
+			do { _mm_pause(); } while(--tkt.head);
 		} else {
 			_mm_pause();
 		}
-		tkt.head = *((volatile int32_t *)&(lock->tickets.head));
+		tkt.head = lock->tickets.head;
 	}
-}
-
-static __inline__ void ticket_unlock(struct ticketlock *lock)
-{
-	{ asm __volatile__("lock addl %1, %0\n" :"+m"(*(&lock->tickets.head)) :"ri"(1) : "memory","cc"); }
 }
 
 //-------------------------------------------------------------------------------------------
@@ -442,7 +436,7 @@ struct instance {
 	bool				is_client;		// If we're observed to connect()
 	bool				is_server;		// If we're observed to listen()
 	bool				flip;			// Affects CPU affinity flipping
-	bool				disable_affinity;	// Disables CPU affinity system
+	uint64_t			flags;
 
 	instance_state_t		state;
 	pthread_t			thr;
@@ -1306,7 +1300,7 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 	struct instance *i = __thr_current_instance;
 	struct worker *tw;
 
-	if (i->disable_affinity) {
+	if (i->flags & TAKS_FLAGS_AFFINITY_DISABLE) {
 		t->preferred_worker = NULL;
 		return;
 	}
@@ -1349,7 +1343,7 @@ worker_learn_cpu_affinity(struct task *t)
 	struct instance *i = __thr_current_instance;
 	int cpu;
 
-	if (i->disable_affinity) {
+	if (i->flags & TAKS_FLAGS_AFFINITY_DISABLE) {
 		return;
 	}
 
@@ -4180,7 +4174,7 @@ worker_create(struct instance *i, int worker_type)
 	spin_init(&w->lock);
 #endif
 #ifdef USE_TICKETLOCKS
-	ticket_lock_init(&w->lock);
+	ticket_init(&w->lock);
 #endif
 	STAILQ_INIT(&w->notifyq_locked);
 	STAILQ_INIT(&w->notifyq_batches);
@@ -4588,7 +4582,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		spin_init(i->tfd_locks_real + n);
 #endif
 #ifdef USE_TICKETLOCKS
-		ticket_lock_init(i->tfd_locks_real + n);
+		ticket_init(i->tfd_locks_real + n);
 #endif
 	}
 	i->tfd_locks = i->tfd_locks_real + 1;
@@ -5230,6 +5224,9 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	t->accept_cb_data = accept_cb_data;
 	i = w->instance;
 	i->is_server = true;
+	if (i->flags & TAKS_FLAGS_AFFINITY_FORCE) {
+		i->all_cpus_seen = true;
+	}
 
 	// Retrieve the local address the listen task is bound to
 	t->addrlen = sizeof(i->tfd_addrs[0]);
@@ -5306,6 +5303,9 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	t->wr_tt.expires_in_us = expires_in_us;
 	i = t->worker->instance;
 	i->is_client = true;
+	if (i->flags & TAKS_FLAGS_AFFINITY_FORCE) {
+		i->all_cpus_seen = true;
+	}
 
 	// Start the connect
 	while (1) {
@@ -5788,7 +5788,7 @@ TASK_instance_start(int32_t ti)
 
 
 int32_t
-TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks, int tcp_sndbuf_size)
+TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks, int tcp_sndbuf_size, uint64_t flags)
 {
 	struct instance *i = NULL;
 	int num_io_to_spawn = 0;
@@ -5828,6 +5828,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		goto TASK_instance_create_error;
 	}
 	__thr_current_instance = i;
+	i->flags = flags;
 
 	if (tcp_sndbuf_size == 0) {
 		tcp_sndbuf_size = (1024 * 1024 * 1024) / max_tasks;

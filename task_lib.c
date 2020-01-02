@@ -28,34 +28,52 @@
 
 #include "ph.h"
 #include "task_lib.h"
+#include <immintrin.h>
 
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
 #define USE_EPOLLONESHOT
 
 // Uncomment the following to turn on using pthread spinlocks for TFD table and worker locking
-// Best for near-zero contention scenarios
+// Best for low-load near-zero contention scenarios.  There isn't much difference between the
+// actual implementation of pthread spinlocks, and the hand-rolled spinlock code below, except
+// the hand-rolled spinlocks occupy an entire cache line which is important.  It isolates the
+// cache-line impact for memory barrier events when a spinlock is being acquired, from other
+// data, and even other spinlocks.  Where portability is essential, use pthread spinlocks,
+// otherwise it's always best to use the hand-rolled custom spinlock implementation instead.
 //#define USE_PTHREAD_SPINLOCKS
 
 // Uncomment the following to turn on using greedy spinlocks for TFD table and worker locking
-// Ideal for up to 10 threads contention scenarios
-//#define USE_SPINLOCKS
+// Ideal for most scenarios
+#define USE_SPINLOCKS
 
 // Uncomment the following to turn on using ticketed spinlocks for TFD table and worker locking
-// Ideal for all contention levels, but slower under minimum contention scenarios
-#define USE_TICKETLOCKS
+// Good performance for all contention levels, but slower than the greedy spinlocks mechanism
+// for minimal contention scenarios
+//#define USE_TICKETLOCKS
 
 // Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
 // be stored to __thr_current_instance->stragglers, which allows us to attach a debugger and
 // quickly find any active TFD's within the pool that probably should not still be active
 //#define TFD_POOL_DEBUG
 
-#define TASK_MAX_IO_DEPTH	2				// Max depth IO nested callbacks can be before queueing
-#define TASK_MAX_IO_UNIT	32768				// The maximum amount that may be read/written in one go
-#define TASK_LISTEN_BACKLOG	((int)1024)			// System auto-truncates it to system limit anyway
-#define	TASK_MAX_INSTANCES	16				// Maximum number of Task library instances allowed at once
+#define TASK_MAX_IO_DEPTH	2		// Max depth IO nested callbacks can be before queueing
+#define TASK_MAX_IO_UNIT	32768		// The maximum amount that may be read/written in one go
+#define TASK_LISTEN_BACKLOG	((int)1024)	// System auto-truncates it to system limit anyway
+#define	TASK_MAX_INSTANCES	16		// Maximum number of Task library instances allowed at once
 
-// I highly recommend NOT fiddling with the COLT1 value unless you understand what it will impact
+// In order to keep the paired heap priority queue from having to deal with IO timeouts that
+// are frequently cancelled again soon after being activated we have cool-off timer lists (colt's)
+// It's much cheaper to remove a timeout from one of the cool-off lists than when they are in the
+// priority queue.  All I/O timeouts > WORKER_TIME_COLT2 microseconds go onto the 2nd cool-off list.
+// Any timeouts not on the 2nd list with with timeouts > WORKER_TIME_COLT1 us go onto the 1st cool-off
+// list. Every (WORKER_TIME_COLT1 * 0.8) microseconds the timing system adds everything on the first
+// list to the priority queue, and swaps the 2nd list to the 1st list, and empties the 2nd list.
+// What this effectively means is that for all timeouts >8.1s get (on average) 5.4s to expire before
+// being placed into the priority queue, and all timeouts between 4.5s and 8.1s get, (on average) 1.8s
+// to expire before being placed into the priority queue.  All timeouts <4.5s get placed onto the
+// priority queue immediately.  This system is cheap, and cuts down on priority queue use for I/O
+// timeouts by ~98% in typical use cases
 #define	WORKER_TIME_COLT1	4500000				// 4s (expressed in microseconds)
 #define	WORKER_TIME_COLT2	(WORKER_TIME_COLT1 * 1.8)	// COLT1 * 1.8 (expressed in microseconds)
 #define TASK_MAX_EPOLL_WAIT_MS	(WORKER_TIME_COLT1 / 5000)	// 1/5th that of COLT1 (expressed in milliseconds)
@@ -67,6 +85,7 @@
 #define TASK_NS_TO_US(a)	(((int64_t)a) / 1000)
 #define TASK_US_TO_S(a)		(((int64_t)a) / 1000000)
 
+// The non-existent TFD Identifier
 #define TFD_NONE 		(int64_t)(0xffffffffffffffff)
 
 // Branch prediction optimisation macros
@@ -78,51 +97,50 @@
 #define unlikely(x) (x)
 #endif
 
-// Intel MP Hyper-threading friendly implementation of Unfair Spinlocks
-// Excellent performance for 1-6 contending threads
-#include <immintrin.h>
+// AMD/Intel MP Hyper-threading friendly implementation of Greedy Spinlocks
+// Excellent performance for 0-4 contending threads
 typedef struct {
-	int64_t lock[8];
-} __attribute__ ((aligned(64))) spin_lock_t;
+	uint64_t	lock;
+	uint64_t	spins;
+	uint64_t	pad[6];
+} __attribute__ ((aligned(64))) spinlock_t;
 
-static inline void __spin_lock(register int64_t volatile *p)
+#define	SPIN_LOCK_INITIALIZER	(spinlock_t){0}
+#define	spin_init(x)		(*(x) = SPIN_LOCK_INITIALIZER)
+#define	spin_unlock(x)		(*(uint64_t *)(x) = 0)
+
+static inline void spin_lock(register spinlock_t volatile *lock)
 {
-	while(unlikely(__sync_lock_test_and_set(p, 1))) {
-		do { _mm_pause(); } while (*p);
+	while(unlikely(__sync_lock_test_and_set((volatile uint64_t *)lock, 1))) {
+		// Switch the commented lines below to turn off/on (inexact) contention
+		// counting. Slows down the algorithm by about 10% to have it enabled
+		// do { _mm_pause(); lock->spins++;} while (*((volatile uint64_t *)lock));
+		do { _mm_pause();} while (*((volatile uint64_t *)lock));
 	}
 }
 
-static inline void __spin_unlock(register int64_t volatile *p)
-{
-	__sync_lock_release(p);
-}
-
-#define spin_init(lk)   (lk)->lock[0] = 0;
-#define spin_lock(lk)   __spin_lock((lk)->lock);
-#define spin_unlock(lk) __spin_unlock((lk)->lock);
-
-// AMD/Intel MP Hyper-threading friendly implementation of Fair Ticketed Spinlocks with progressive backoff
-#include <immintrin.h>
-
-struct ticketlock {
+// AMD/Intel MP Hyper-threading friendly implementation of Fair Ticketed Spinlocks with
+// progressive backoff.  Typically best for moderate contention scenarios and above
+typedef struct {
 	struct __ticket {
-		int32_t		 tail;
-		volatile int32_t head;
+		uint32_t	  tail;
+		volatile uint32_t head;
 	} tickets;
-	int64_t padding[7];
-};
+	uint64_t	spins;
+	uint64_t	pad[6];
+} __attribute__ ((aligned(64))) ticketlock_t;
 
-#define TICKET_LOCK_INITIALIZER	(struct ticketlock){0}
-#define ticket_unlock(x)	((x)->tickets.head++)
+#define TICKET_LOCK_INITIALIZER	(ticketlock_t){0}
 #define ticket_init(x)		(*(x) = TICKET_LOCK_INITIALIZER)
+#define ticket_unlock(x)	((x)->tickets.head++)
 
-static inline void ticket_lock(register struct ticketlock *lock)
+static inline void ticket_lock(register ticketlock_t *lock)
 {
 	register struct __ticket tkt = ({ register struct __ticket tmp = {.tail = 1};
 					asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tmp),
 					"+m"(*(&lock->tickets)) : :"memory", "cc"); tmp;});
 	while (tkt.tail - tkt.head) {
-		// It's faster for the uncontested path to calculate tkt.head here
+		// It's faster for the uncontested path to calculate tkt.head below
 		// It's also slightly faster when contesting to use > 2 than > 1
 		if ((tkt.head = (tkt.tail - tkt.head)) > 2) {
 			do { _mm_pause(); } while(--tkt.head);
@@ -130,6 +148,9 @@ static inline void ticket_lock(register struct ticketlock *lock)
 			_mm_pause();
 		}
 		tkt.head = lock->tickets.head;
+		// Uncomment the line below to turn on (inexact) contention counting
+		// It slows down the algorithm by about 10% to have it enabled
+		// lock->spins++;
 	}
 }
 
@@ -244,7 +265,7 @@ struct task {
 	uint32_t			io_depth;		// How many direct calls to allow before queueing
 	uint32_t			notifyqlen;		// Number of notifyq entries this task has
 	uint32_t			tfd_index;		// The node index in the table
-	int32_t				tfd_iteration;		// The iteration on the node
+	int32_t				cb_errno;		// Errno we want to propagate on callbacks
 	int32_t				fd;			// The actual system socket FD we're working on
 	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 
@@ -270,7 +291,7 @@ struct task {
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
 	const struct iovec		*wrv_iov;
-	int32_t				cb_errno;		// Errno we want to propagate on callbacks
+	int32_t				tfd_iteration;		// The iteration on the TFD node
 	int32_t				wrv_iovcnt;
 	size_t				wrv_buflen;
 	size_t				wrv_bufpos;
@@ -403,10 +424,10 @@ struct worker {
 	pthread_spinlock_t		lock;
 #endif
 #ifdef USE_SPINLOCKS
-__attribute__ ((aligned(64))) spin_lock_t lock;
+	spinlock_t			lock;
 #endif
 #ifdef USE_TICKETLOCKS
-__attribute__ ((aligned(64))) struct ticketlock	lock;
+	ticketlock_t			lock;
 #endif
 }  __attribute__ ((aligned(64)));
 
@@ -459,12 +480,12 @@ struct instance {
 	pthread_spinlock_t		*tfd_locks;
 #endif
 #ifdef USE_SPINLOCKS
-	spin_lock_t			*tfd_locks_real;
-	spin_lock_t			*tfd_locks;
+	spinlock_t			*tfd_locks_real;
+	spinlock_t			*tfd_locks;
 #endif
 #ifdef USE_TICKETLOCKS
-	struct ticketlock		*tfd_locks_real;
-	struct ticketlock		*tfd_locks;
+	ticketlock_t			*tfd_locks_real;
+	ticketlock_t			*tfd_locks;
 #endif
 
 	struct worker			*instance_worker;
@@ -476,7 +497,7 @@ struct instance {
 	uint64_t			per_task_sndbuf;
 
 	// CPU/Worker Affinity Fields
-	spin_lock_t			cpuspin;
+	spinlock_t			cpuspin;
 	int				worker_offset;
 	bool				all_cpus_seen;
 	bool				all_io_workers_affined;
@@ -518,7 +539,12 @@ static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define	lockless_worker(w)	(w == __thr_current_worker)
 
-#define	TASK_MAX_TFD_LOCKS	(256)		// Number of TFD spinlocks in an instance's lock pool. MUST be a power of 2
+// Number of TFD spinlocks in an instance's lock pool. MUST be a power of 2.  Altering this value provides
+// a non-intuitive performance impact. While more spinlock entries offer less spinlock contention, they
+// also are accessed fairly frequently, and so can cause frequent CPU cache contention misses if there are
+// too many, which can negatively impact overall performance.  128, 256, and 512 all appear to be good
+// compromise values with 256 appearing to offer the best performance across the widest set of load ranges
+#define	TASK_MAX_TFD_LOCKS	(256)	
 #define	TASK_TFD_LOCK_MASK	(TASK_MAX_TFD_LOCKS - 1)
 
 #ifdef USE_PTHREAD_SPINLOCKS
@@ -4559,10 +4585,10 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(pthread_spinlock_t);
 #endif
 #ifdef USE_SPINLOCKS
-	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(spin_lock_t);
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(spinlock_t);
 #endif
 #ifdef USE_TICKETLOCKS
-	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(struct ticketlock);
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(ticketlock_t);
 #endif
 	num_pages += (__page_size - 1);
 	num_pages /= __page_size;

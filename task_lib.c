@@ -992,6 +992,12 @@ task_lock(struct task *t, task_action_flag_t action)
 {
 	register uint32_t tfdi = t->tfd_index;
 
+	// Do not set IO timeout flags.  Their existence is already implied by
+	// their parent FLG_RD/FLG_WR flags
+	if (action & (FLG_RT | FLG_WT)) {
+		return;
+	}
+
 	tfd_lock(tfdi);
 	t->active_flags |= action;
 	tfd_unlock(tfdi);
@@ -1004,6 +1010,12 @@ static void
 task_unlock(struct task *t, task_action_flag_t action)
 {
 	register uint32_t tfdi = t->tfd_index;
+
+	// Do not set IO timeout flags.  Their existence is already implied by
+	// their parent FLG_RD/FLG_WR flags
+	if (action & (FLG_RT | FLG_WT)) {
+		return;
+	}
 
 	tfd_lock(tfdi);
 	t->active_flags &= ~(action);
@@ -1672,11 +1684,6 @@ task_activate_rd_timeout(register struct task *t)
 
 	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
 	worker_timer_update(w, &t->rd_tt, t->tfd);
-	if (likely(t->rd_tt.expiry_us >= 0)) {
-		task_lock(t, FLG_RT);
-	} else {
-		task_unlock(t, FLG_RT);
-	}
 } // task_activate_rd_timeout
 
 
@@ -1693,11 +1700,6 @@ task_activate_wr_timeout(register struct task *t)
 
 	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
 	worker_timer_update(w, &t->wr_tt, t->tfd);
-	if (likely(t->wr_tt.expiry_us >= 0)) {
-		task_lock(t, FLG_WT);
-	} else {
-		task_unlock(t, FLG_WT);
-	}
 } // task_activate_wr_timeout
 
 
@@ -1855,11 +1857,11 @@ task_cancel_timer(struct task *t, task_action_flag_t action)
 	} else if (action & FLG_TM) {
 		t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
 		worker_timer_update(t->worker, &t->tm_tt, TFD_NONE);
+		task_unlock(t, FLG_TM);	// Needed for FLG_TM only
 	} else {
 		// Bad timer type
 		assert(0);
 	}
-	task_unlock(t, action);
 } // task_cancel_timer
 
 

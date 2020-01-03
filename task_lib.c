@@ -29,6 +29,7 @@
 #include "ph.h"
 #include "task_lib.h"
 #include <immintrin.h>
+#include <stdatomic.h>
 
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
@@ -41,16 +42,16 @@
 // cache-line impact for memory barrier events when a spinlock is being acquired, from other
 // data, and even other spinlocks.  Where portability is essential, use pthread spinlocks,
 // otherwise it's always best to use the hand-rolled custom spinlock implementation instead.
-//#define USE_PTHREAD_SPINLOCKS
+// #define USE_PTHREAD_SPINLOCKS
 
 // Uncomment the following to turn on using greedy spinlocks for TFD table and worker locking
 // Ideal for most scenarios
-#define USE_SPINLOCKS
+// #define USE_SPINLOCKS
 
 // Uncomment the following to turn on using ticketed spinlocks for TFD table and worker locking
 // Good performance for all contention levels, but slower than the greedy spinlocks mechanism
 // for minimal contention scenarios
-//#define USE_TICKETLOCKS
+#define USE_TICKETLOCKS
 
 // Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
 // be stored to __thr_current_instance->stragglers, which allows us to attach a debugger and
@@ -97,6 +98,8 @@
 #define unlikely(x) (x)
 #endif
 
+//=================================  SPIN LOCK IMPLEMENTATION    ===================================//
+
 // Uncomment the following line to turn on spinlock statistics.  Turning this on slows
 // the respective spinlocks by 20% or so.  The statistics are not exacting in correctess
 // for reasons of speed, and recorded values are intended to be guidelines only
@@ -131,44 +134,50 @@ static inline void spin_lock(register spinlock_t volatile *lock)
 	}
 }
 
+//================================  TICKET LOCK IMPLEMENTATION    ==================================//
+
 // AMD/Intel MP Hyper-threading friendly implementation of Fair Ticketed Spinlocks with
 // progressive backoff.  Typically best for moderate contention scenarios and above
-typedef struct {
+typedef union {
+	uint64_t		  both;
 	struct __ticket {
-		volatile uint32_t head;
-		uint32_t	  tail;
+		volatile uint32_t head; // On little-endian architectures, head must appear before tail
+		uint32_t	  tail; // On big-endian architectures, tail must appear before head
 	} tickets;
-	volatile uint64_t	calls;
-	volatile uint64_t	contentions;
-	volatile uint64_t	spins;
+} __ticketlock_t;
+
+typedef struct {
+	volatile __ticketlock_t lock;
+	volatile uint64_t       calls;
+	volatile uint64_t       contentions;
+	volatile uint64_t       spins;
 	uint64_t		pad[4];
 } __attribute__ ((aligned(64))) ticketlock_t;
 
-#define TICKET_LOCK_INITIALIZER	(ticketlock_t){0}
+#define TICKET_LOCK_INITIALIZER (ticketlock_t){0}
 #define ticket_init(x)		(*(x) = TICKET_LOCK_INITIALIZER)
-#define ticket_unlock(x)	((x)->tickets.head++)
+#define ticket_unlock(x)	((x)->lock.tickets.head++)
 
 static inline void ticket_lock(register ticketlock_t *lock)
 {
-	register struct __ticket tkt = {.tail = 1};
-	
-	asm __volatile__("lock xaddq %q0, %1\n" :"+r"(tkt), "+m"(*(&lock->tickets)) : :"memory", "cc");
+	__ticketlock_t tkt = { .both = atomic_fetch_add(&lock->lock.both, 0x0000000100000000ull)};
+
 #ifdef __LOCK_STATISTICS
 	lock->calls++;
-	if (tkt.tail - tkt.head) lock->contentions++;
+	if (tkt.tickets.tail - tkt.tickets.head) lock->contentions++;
 #endif
-	while (tkt.tail - tkt.head) {
-		// It's faster for the uncontested path to calculate tkt.head below
+	while (tkt.tickets.tail - tkt.tickets.head) {
+		// It's faster for the uncontested path to calculate tkt.head here
 		// It's also slightly faster when contesting to use > 2 than > 1
-		if ((tkt.head = (tkt.tail - tkt.head)) > 2) {
-			do { _mm_pause(); } while(--tkt.head);
+		if ((tkt.tickets.head = (tkt.tickets.tail - tkt.tickets.head)) > 2) {
+			do { _mm_pause(); } while(--tkt.tickets.head);
 		} else {
 			_mm_pause();
 		}
 #ifdef __LOCK_STATISTICS
 		lock->spins++;
 #endif
-		tkt.head = lock->tickets.head;
+		tkt.tickets.head = lock->lock.tickets.head;
 	}
 }
 
@@ -977,26 +986,37 @@ task_free(struct task *t)
 } // task_free
 
 
+// Safely raises the flag on the task.
+static void
+task_lock(struct task *t, task_action_flag_t action)
+{
+	register uint32_t tfdi = t->tfd_index;
+
+	tfd_lock(tfdi);
+	t->active_flags |= action;
+	tfd_unlock(tfdi);
+} // task_lock
+
+
 // Safely lowers the flag on the task.  If all flags are down and the task
 // is in the DESTROY state, it decouples task from TFD table and frees it
 static void
 task_unlock(struct task *t, task_action_flag_t action)
 {
-	register uint64_t tfdi = t->tfd_index;
+	register uint32_t tfdi = t->tfd_index;
 
+	tfd_lock(tfdi);
 	t->active_flags &= ~(action);
 	if (unlikely(t->state == TASK_STATE_DESTROY)) {
-		if ((t->active_flags == 0) && (t->notifyqlen == 0) && (t->dormant->notifyqlen_locked == 0)) {
-			tfd_lock(tfdi);
-			if (t->state == TASK_STATE_DESTROY) {
-				if ((t->active_flags == 0) && (t->notifyqlen == 0) &&
-				    (ck_pr_load_64(&t->dormant->notifyqlen_locked) == 0)) {
-					task_free(t);
-				}
+		if ((t->active_flags == 0) && (t->notifyqlen == 0)) {
+			if (ck_pr_load_64(&t->dormant->notifyqlen_locked) == 0) {
+				tfd_unlock(tfdi);
+				task_free(t);
+				return;
 			}
-			tfd_unlock(tfdi);
 		}
 	}
+	tfd_unlock(tfdi);
 } // task_unlock
 
 
@@ -1587,7 +1607,7 @@ task_notify_action_queue:
 		STAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
 		worker_unlock(w);
 	}
-	t->active_flags |= action;
+	task_lock(t, action);
 	worker_notify(w);
 	return true;
 
@@ -1604,7 +1624,7 @@ task_notify_action_queue_first:
 		STAILQ_INSERT_HEAD(&w->notifyq_locked, tq, list);
 		worker_unlock(w);
 	}
-	t->active_flags |= action;
+	task_lock(t, action);
 	worker_notify(w);
 	return true;
 } // task_notify_action
@@ -1653,7 +1673,7 @@ task_activate_rd_timeout(register struct task *t)
 	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
 	worker_timer_update(w, &t->rd_tt, t->tfd);
 	if (likely(t->rd_tt.expiry_us >= 0)) {
-		t->active_flags |= FLG_RT;
+		task_lock(t, FLG_RT);
 	} else {
 		task_unlock(t, FLG_RT);
 	}
@@ -1674,7 +1694,7 @@ task_activate_wr_timeout(register struct task *t)
 	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
 	worker_timer_update(w, &t->wr_tt, t->tfd);
 	if (likely(t->wr_tt.expiry_us >= 0)) {
-		t->active_flags |= FLG_WT;
+		task_lock(t, FLG_WT);
 	} else {
 		task_unlock(t, FLG_WT);
 	}
@@ -1690,7 +1710,7 @@ task_create_event_flag(register struct task *t)
 	if (likely(t->rd_shut == false)) {
 		t->ev.events |= EPOLLRDHUP;
 	}
-	t->active_flags |= FLG_PW;
+	task_lock(t, FLG_PW);
 
 #ifdef USE_EPOLLONESHOT
 	t->ev.events |= EPOLLONESHOT;
@@ -1763,15 +1783,15 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 
 	if (flags & EPOLLIN) {
 		if (flags & EPOLLOUT) {
-			t->active_flags |= (FLG_PI | FLG_PO);
+			task_lock(t, FLG_PI | FLG_PO);
 			task_activate_rd_timeout(t);
 			task_activate_wr_timeout(t);
 		} else {
-			t->active_flags |= FLG_PI;
+			task_lock(t, FLG_PI);
 			task_activate_rd_timeout(t);
 		}
 	} else if (likely(flags & EPOLLOUT)) {
-		t->active_flags |= FLG_PO;
+		task_lock(t, FLG_PO);
 		task_activate_wr_timeout(t);
 	}
 
@@ -1905,7 +1925,7 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 	// If the user closes a connect socket, the FLG_CO doesn't carry though
 	// We need to catch and set it here so the task can get properly freed
 	if(t->type == TASK_TYPE_CONNECT) {
-		action |= FLG_CO;
+		task_lock(t, FLG_CO);
 	}
 
 	__thr_preferred_worker = NULL;
@@ -2067,13 +2087,13 @@ task_do_accept_cb(struct task *t)
 	t->accept_cb_data = NULL;
 
 	if (unlikely(cb == NULL)) {
-		t->active_flags |= FLG_CL;
+		task_lock(t, FLG_CL);
 		task_do_close_cb(t, FLG_AC);
 		return;
 	}
 
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
-		t->active_flags |= FLG_CL;
+		task_lock(t, FLG_CL);
 		task_do_close_cb(t, FLG_AC);
 		return;
 	}
@@ -2180,7 +2200,7 @@ task_do_connect_cb(struct task *t, int result)
 
 	// If there's no callback for the connection, all we can do it close it
 	if (unlikely(cb == NULL)) {
-		t->active_flags |= FLG_CL;
+		task_lock(t, FLG_CL);
 		task_do_close_cb(t, FLG_CO | FLG_WR);
 		return;
 	}
@@ -2263,7 +2283,7 @@ handle_timer_timeout:
 	if (t->tm_tt.expiry_us != timeout_us) {
 		t->tm_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->tm_tt, t->tfd);
-		t->active_flags |= action;
+		task_lock(t, action);
 		return;
 	}
 
@@ -2296,7 +2316,7 @@ handle_read_timeout:
 	if (t->rd_tt.expiry_us != timeout_us) {
 		t->rd_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->rd_tt, t->tfd);
-		t->active_flags |= action;
+		task_lock(t, action);
 		return;
 	}
 
@@ -2332,7 +2352,7 @@ handle_write_timeout:
 	if (t->wr_tt.expiry_us != timeout_us) {
 		t->wr_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->wr_tt, t->tfd);
-		t->active_flags |= action;
+		task_lock(t, action);
 		return;
 	}
 
@@ -2362,7 +2382,7 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 		worker_unlock(w);
 
 		tac = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
-		tac->active_flags |= FLG_CL;
+		task_lock(t, FLG_CL);
 		task_do_close_cb(tac, FLG_LI);
 	}
 } // task_shutdown_listen_children
@@ -2408,7 +2428,7 @@ worker_cleanup(struct worker *w)
 
 		// Just drop all the actions we see by forwarding them to task_do_close_cb()
 		t->close_cb = NULL;
-		t->active_flags |= FLG_CL;
+		task_lock(t, FLG_CL);
 		task_do_close_cb(t, action);
 	}
 
@@ -2679,7 +2699,7 @@ task_update_timer(struct task *t)
 
 	// Just update the timeout in the timeout system
 	worker_timer_update(w, &t->tm_tt, t->tfd);
-	t->active_flags |= FLG_TM;
+	task_lock(t, FLG_TM);
 } // task_update_timer
 
 
@@ -3311,7 +3331,7 @@ task_handle_listen_event(struct task *t)
 		}
 
 		t_new->cb_errno = 0;
-		t_new->active_flags |= FLG_AC;
+		task_lock(t, FLG_AC);
 		t_new->accept_cb = t->accept_cb;
 		t_new->accept_cb_data = t->accept_cb_data;
 		task_do_accept_cb(t_new);	// Unlocks t_new
@@ -3321,7 +3341,7 @@ task_handle_listen_event(struct task *t)
 task_handle_listen_event_fail:
 	// Major accept failure.  Cancel the accept task
 	// Inform user that accept is now failing/gone
-	t->active_flags |= FLG_CL;
+	task_lock(t, FLG_CL);
 	task_do_close_cb(t, FLG_RD | FLG_LI);	// Unlocks task
 } // task_handle_listen_event
 
@@ -4391,7 +4411,7 @@ instance_listen_balance(struct task *t)
 		nt->dormant->addrlen = t->dormant->addrlen;
 		nt->accept_cb = t->accept_cb;
 		nt->accept_cb_data = t->accept_cb_data;
-		nt->active_flags |= FLG_LI;
+		task_lock(nt, FLG_LI);
 		if (task_raise_event_flag(nt, EPOLLIN) < 0) {
 			perror("instance_listen_balance->task_raise_event_flag");
 			task_lower_event_flag(nt, (EPOLLIN | EPOLLOUT));
@@ -5386,7 +5406,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 		}
 
 		if ((errno == EINPROGRESS) || (errno == EAGAIN)) {
-			t->active_flags |= FLG_WR;
+			task_lock(t, FLG_WR);
 			if (task_raise_event_flag(t, EPOLLOUT) < 0) {
 				break;
 			}

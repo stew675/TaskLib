@@ -31,27 +31,12 @@
 #include <immintrin.h>
 #include <stdatomic.h>
 
+#define _GNU_SOURCE
+#include <pthread.h>
+
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
 #define USE_EPOLLONESHOT
-
-// Uncomment the following to turn on using pthread spinlocks for TFD table and worker locking
-// Best for low-load near-zero contention scenarios.  There isn't much difference between the
-// actual implementation of pthread spinlocks, and the hand-rolled spinlock code below, except
-// the hand-rolled spinlocks occupy half a cache line which is important.  This reduces the
-// cache-line impact for memory barrier events when a spinlock is being acquired, from other
-// data, and even other spinlocks.  Where portability is essential, use pthread spinlocks,
-// otherwise it's always best to use the hand-rolled custom spinlock implementation instead.
-// #define USE_PTHREAD_SPINLOCKS
-
-// Uncomment the following to turn on using greedy spinlocks for TFD table and worker locking
-// Ideal for most scenarios
-// #define USE_SPINLOCKS
-
-// Uncomment the following to turn on using ticketed spinlocks for TFD table and worker locking
-// Good performance for all contention levels, but slower than the greedy spinlocks mechanism
-// for minimal contention scenarios
-#define USE_TICKETLOCKS
 
 // Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
 // be stored to __thr_current_instance->stragglers, which allows us to attach a debugger and
@@ -98,88 +83,10 @@
 #define unlikely(x) (x)
 #endif
 
-//=================================  SPIN LOCK IMPLEMENTATION    ===================================//
-
-// Uncomment the following line to turn on spinlock statistics.  Turning this on slows
-// the respective spinlocks by 20% or so.  The statistics are not exacting in correctess
-// for reasons of speed, and recorded values are intended to be guidelines only
-// #define __LOCK_STATISTICS
-
-// AMD/Intel MP Hyper-threading friendly implementation of Greedy Spinlocks
-// Excellent performance for 0-4 contending threads
 typedef struct {
-	volatile uint64_t	lock;
-	volatile uint64_t	calls;
-	volatile uint64_t	contentions;
-	volatile uint64_t	spins;
-	uint64_t		pad[4];
-} __attribute__ ((aligned(64))) spinlock_t;
-
-#define	SPIN_LOCK_INITIALIZER	(spinlock_t){0}
-#define	spin_init(x)		(*(x) = SPIN_LOCK_INITIALIZER)
-#define	spin_unlock(x)		(*(uint64_t *)(x) = 0)
-
-static inline void spin_lock(register spinlock_t volatile *lock)
-{
-#ifdef __LOCK_STATISTICS
-	lock->calls++;
-#endif
-	while(unlikely(__sync_lock_test_and_set(((volatile uint64_t *)lock), 1))) {
-#ifdef __LOCK_STATISTICS
-		lock->contentions++;
-		do { _mm_pause(); lock->spins++;} while (*((volatile uint64_t *)lock));
-#else
-		do { _mm_pause();} while (*((volatile uint64_t *)lock));
-#endif
-	}
-}
-
-//================================  TICKET LOCK IMPLEMENTATION    ==================================//
-
-// AMD/Intel MP Hyper-threading friendly implementation of Fair Ticketed Spinlocks with
-// progressive backoff.  Typically best for moderate contention scenarios and above
-typedef union {
-	uint64_t		  both;
-	struct __ticket {
-		volatile uint32_t head; // On little-endian architectures, head must appear before tail
-		uint32_t	  tail; // On big-endian architectures, tail must appear before head
-	} tickets;
-} __ticketlock_t;
-
-typedef struct {
-	volatile __ticketlock_t lock;
-	volatile uint64_t       calls;
-	volatile uint64_t       contentions;
-	volatile uint64_t       spins;
-	uint64_t		pad[4];
-} __attribute__ ((aligned(64))) ticketlock_t;
-
-#define TICKET_LOCK_INITIALIZER (ticketlock_t){0}
-#define ticket_init(x)		(*(x) = TICKET_LOCK_INITIALIZER)
-#define ticket_unlock(x)	((x)->lock.tickets.head++)
-
-static inline void ticket_lock(register ticketlock_t *lock)
-{
-	__ticketlock_t tkt = { .both = atomic_fetch_add(&lock->lock.both, 0x0000000100000000ull)};
-
-#ifdef __LOCK_STATISTICS
-	lock->calls++;
-	if (tkt.tickets.tail - tkt.tickets.head) lock->contentions++;
-#endif
-	while (tkt.tickets.tail - tkt.tickets.head) {
-		// It's faster for the uncontested path to calculate tkt.head here
-		// It's also slightly faster when contesting to use > 2 than > 1
-		if ((tkt.tickets.head = (tkt.tickets.tail - tkt.tickets.head)) > 2) {
-			do { _mm_pause(); } while(--tkt.tickets.head);
-		} else {
-			_mm_pause();
-		}
-#ifdef __LOCK_STATISTICS
-		lock->spins++;
-#endif
-		tkt.tickets.head = lock->lock.tickets.head;
-	}
-}
+	pthread_mutex_t		lock;
+	uint64_t		pad[3];
+} __attribute__ ((aligned(64))) tfd_lock_t;
 
 //-------------------------------------------------------------------------------------------
 
@@ -226,7 +133,7 @@ enum {
 
 // The below are activity reference bits. The system works a bit like reference counting
 // except there's a limit to the number of references, and each reference is exclusive.
-// Doing it this way, protected by spinlocks, is way faster than using atomic counters
+// Doing it this way, protected by mutexes, is way faster than using atomic counters
 typedef enum {
 	FLG_NONE =	0x00000000,		// Special no flag for certain operations
 	FLG_RD	=	0x00000001,		// A read for a TFD is active in the library
@@ -459,15 +366,7 @@ struct worker {
 	worker_state_t			old_state;
 
 	// Put this all by itself at the end
-#ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spinlock_t		lock;
-#endif
-#ifdef USE_SPINLOCKS
-	spinlock_t			lock;
-#endif
-#ifdef USE_TICKETLOCKS
-	ticketlock_t			lock;
-#endif
+	pthread_mutex_t			lock;
 }  __attribute__ ((aligned(64)));
 
 // The ordering of these tasks states is important
@@ -512,18 +411,8 @@ struct instance {
 	uint64_t			tfd_pool_used;		// The total number of active tasks in the pool
 	uint32_t			tfd_pool_size;
 
-#ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spinlock_t		*tfd_locks_real;
-	pthread_spinlock_t		*tfd_locks;
-#endif
-#ifdef USE_SPINLOCKS
-	spinlock_t			*tfd_locks_real;
-	spinlock_t			*tfd_locks;
-#endif
-#ifdef USE_TICKETLOCKS
-	ticketlock_t			*tfd_locks_real;
-	ticketlock_t			*tfd_locks;
-#endif
+	tfd_lock_t			*tfd_locks_real;
+	tfd_lock_t			*tfd_locks;
 
 	struct worker			*instance_worker;
 	struct worker			**io_workers;
@@ -534,7 +423,7 @@ struct instance {
 	uint64_t			per_task_sndbuf;
 
 	// CPU/Worker Affinity Fields
-	spinlock_t			cpuspin;
+	pthread_mutex_t			cpulock;
 	int				worker_offset;
 	bool				all_cpus_seen;
 	bool				all_io_workers_affined;
@@ -576,34 +465,16 @@ static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define	lockless_worker(w)	(w == __thr_current_worker)
 
-// Number of TFD spinlocks in an instance's lock pool. MUST be a power of 2.  Altering this value provides
-// a non-intuitive performance impact. While more spinlock entries offer less spinlock contention, they
+// Number of TFD locks in an instance's lock pool. MUST be a power of 2.  Altering this value provides
+// a non-intuitive performance impact. While more lock entries offer less lock contention, they
 // also are accessed fairly frequently, and so can cause frequent CPU cache contention misses if there are
 // too many, which can negatively impact overall performance.  128, 256, 512 and 1024 all appear to be good
 // compromise values with 512 appearing to offer the best performance across the widest set of load ranges
 #define	TASK_MAX_TFD_LOCKS	(512)	
 #define	TASK_TFD_LOCK_MASK	(TASK_MAX_TFD_LOCKS - 1)
 
-#ifdef USE_PTHREAD_SPINLOCKS
-#undef USE_SPINLOCKS
-#undef USE_TICKETLOCKS
-#define	tfd_lock(lock_index)	pthread_spin_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#define	tfd_unlock(lock_index)	pthread_spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#endif
-
-#ifdef USE_SPINLOCKS
-#undef USE_PTHREAD_SPINLOCKS
-#undef USE_TICKETLOCKS
-#define	tfd_lock(lock_index)	spin_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#define	tfd_unlock(lock_index)	spin_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#endif
-
-#ifdef USE_TICKETLOCKS
-#undef USE_PTHREAD_SPINLOCKS
-#undef USE_SPINLOCKS
-#define	tfd_lock(lock_index)	ticket_lock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#define	tfd_unlock(lock_index)	ticket_unlock(__thr_current_instance->tfd_locks + ((lock_index) & TASK_TFD_LOCK_MASK))
-#endif
+#define	tfd_lock(lock_index)	pthread_mutex_lock(&__thr_current_instance->tfd_locks[((lock_index) & TASK_TFD_LOCK_MASK)].lock)
+#define	tfd_unlock(lock_index)	pthread_mutex_unlock(&__thr_current_instance->tfd_locks[((lock_index) & TASK_TFD_LOCK_MASK)].lock)
 
 // ---------------------------------------------------------------------------------------------//
 //					DEBUGGING STUFF						//
@@ -724,30 +595,14 @@ get_time_us(time_precision_t prec)
 static inline void
 worker_lock(struct worker *w)
 {
-#ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_lock(&w->lock);
-#endif
-#ifdef USE_SPINLOCKS
-	spin_lock(&w->lock);
-#endif
-#ifdef USE_TICKETLOCKS
-	ticket_lock(&w->lock);
-#endif
+	pthread_mutex_lock(&w->lock);
 } // worker_lock
 
 
 static inline void
 worker_unlock(struct worker *w)
 {
-#ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_unlock(&w->lock);
-#endif
-#ifdef USE_SPINLOCKS
-	spin_unlock(&w->lock);
-#endif
-#ifdef USE_TICKETLOCKS
-	ticket_unlock(&w->lock);
-#endif
+	pthread_mutex_unlock(&w->lock);
 } // worker_lock
 
 
@@ -979,10 +834,10 @@ task_free(struct task *t)
 	task_destroy_timeouts(t);
 	task_init(t, t->tfd_index);
 
-	spin_lock(&i->cpuspin);
+	pthread_mutex_lock(&i->cpulock);
 	t->task_next = i->free_tasks;
 	i->free_tasks = t;
-	spin_unlock(&i->cpuspin);
+	pthread_mutex_unlock(&i->cpulock);
 } // task_free
 
 
@@ -1138,16 +993,16 @@ task_get_free_task(void)
 		return NULL;
 	}
 	
-	spin_lock(&i->cpuspin);
+	pthread_mutex_lock(&i->cpulock);
 	if ((t = i->free_tasks) == NULL) {
-		spin_unlock(&i->cpuspin);
+		pthread_mutex_unlock(&i->cpulock);
 		errno = EMFILE;
 		return NULL;
 	}
 	i->free_tasks = t->task_next;
 	assert(t->state == TASK_STATE_UNUSED);
 	t->state = TASK_STATE_ACTIVE;
-	spin_unlock(&i->cpuspin);
+	pthread_mutex_unlock(&i->cpulock);
 
 	tfdi = t->tfd_index;
 	t->tfd = t->dormant->tfd_iteration;
@@ -1183,14 +1038,14 @@ get_cpu_of_sock(int sock)
 		return -1;
 	}
 
-	spin_lock(&i->cpuspin);
+	pthread_mutex_lock(&i->cpulock);
 	if (i->cpus[cpu].seen == true) {
-		spin_unlock(&i->cpuspin);
+		pthread_mutex_unlock(&i->cpulock);
 		return cpu;
 	}
 	i->cpus[cpu].seen = true;
 	i->num_cpus_seen++;
-	spin_unlock(&i->cpuspin);
+	pthread_mutex_unlock(&i->cpulock);
 
 	if (i->num_cpus_seen == i->num_cpus) {
 		i->all_cpus_seen = true;
@@ -1304,10 +1159,10 @@ set_one_workers_affinity(int cpu)
 	int row, tcpu;
 	bool outgoing;
 
-	// Not ideal that we're holding spinlocks for this amount of time
+	// Not ideal that we're holding a mutex for this amount of time
 	// but we only do it once for each IO worker, ever, so it's okay
 
-	spin_lock(&i->cpuspin);
+	pthread_mutex_lock(&i->cpulock);
 
 	// Pick a direction based on observed operation.  If we're both
 	// client and server, just alternate directions each time
@@ -1338,7 +1193,7 @@ set_one_workers_affinity(int cpu)
 	}
 	if (w == NULL) {
 		i->all_io_workers_affined = true;
-		spin_unlock(&i->cpuspin);
+		pthread_mutex_unlock(&i->cpulock);
 		return;
 	}
 
@@ -1377,7 +1232,7 @@ set_one_workers_affinity(int cpu)
 	w->affined_cpu = tcpu;
 
 	// We can finally release the lock!
-	spin_unlock(&i->cpuspin);
+	pthread_mutex_unlock(&i->cpulock);
 
 	// Actually set the affinity now of w to tcpu
 	set_worker_cpu_affinity(w, tcpu);
@@ -2492,9 +2347,8 @@ worker_destroy(struct worker *w)
 		w->max_events = 0;
 	}
 
-#ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_destroy(&w->lock);
-#endif
+	pthread_mutex_destroy(&w->lock);
+
 	free(w);
 	w = NULL;
 } // worker_destroy
@@ -4217,6 +4071,10 @@ worker_create(struct instance *i, int worker_type)
 {
 	register struct worker *w = NULL;
 	register size_t sz;
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
 
 	if ((worker_type != WORKER_TYPE_IO) && (worker_type != WORKER_TYPE_BLOCKING)) {
 		errno = EINVAL;
@@ -4248,15 +4106,8 @@ worker_create(struct instance *i, int worker_type)
 	w->affined_cpu = -1;
 	w->curtime_us = get_time_us(TASK_TIME_PRECISE);
 	w->gepfd = -1;
-#ifdef USE_PTHREAD_SPINLOCKS
-	pthread_spin_init(&w->lock, PTHREAD_PROCESS_PRIVATE);
-#endif
-#ifdef USE_SPINLOCKS
-	spin_init(&w->lock);
-#endif
-#ifdef USE_TICKETLOCKS
-	ticket_init(&w->lock);
-#endif
+
+	pthread_mutex_init(&w->lock, &attr);
 	STAILQ_INIT(&w->notifyq_locked);
 	STAILQ_INIT(&w->notifyq_batches);
 	STAILQ_INIT(&w->freeq_locked);
@@ -4538,11 +4389,9 @@ instance_destroy(struct instance *i)
 		i->io_workers = NULL;
 	}
 	if (i->tfd_pool) {
-#ifdef USE_PTHREAD_SPINLOCKS
 		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
-			pthread_spin_destroy(i->tfd_locks + n);
+			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
 		}
-#endif
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
 	}
@@ -4593,6 +4442,10 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 {
 	register size_t num_pages;
 	uint32_t n;
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
 
 	// Don't allow less than 100 tfd entries for pool size
 	pool_size = (pool_size < 100) ? 100 : pool_size;
@@ -4634,16 +4487,8 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		i->free_tasks = t;
 	}
 
-	// Allocate the spinlock storage now
-#ifdef USE_PTHREAD_SPINLOCKS
-	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(pthread_spinlock_t);
-#endif
-#ifdef USE_SPINLOCKS
-	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(spinlock_t);
-#endif
-#ifdef USE_TICKETLOCKS
-	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(ticketlock_t);
-#endif
+	// Allocate the lock storage now
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(tfd_lock_t);
 	num_pages += (__page_size - 1);
 	num_pages /= __page_size;
 
@@ -4655,15 +4500,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 	whatevs.a = i->tfd_locks_real;
 	memset(whatevs.b, 0, num_pages * __page_size);
 	for (n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
-#ifdef USE_PTHREAD_SPINLOCKS
-		pthread_spin_init(i->tfd_locks_real + n, PTHREAD_PROCESS_PRIVATE);
-#endif
-#ifdef USE_SPINLOCKS
-		spin_init(i->tfd_locks_real + n);
-#endif
-#ifdef USE_TICKETLOCKS
-		ticket_init(i->tfd_locks_real + n);
-#endif
+		pthread_mutex_init(&(i->tfd_locks_real[n].lock), &attr);
 	}
 	i->tfd_locks = i->tfd_locks_real + 1;
 	return 0;
@@ -4675,6 +4512,10 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 {
 	uint32_t ti;
 	struct instance *i, *oldi;
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
 
 	oldi = __thr_current_instance;
 	pthread_mutex_lock(&creation_lock);
@@ -4705,7 +4546,9 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 
 	i->state = INSTANCE_STATE_CREATED;
 	i->thr = pthread_self();
-	pthread_mutex_init(&i->lock, NULL);
+
+
+	pthread_mutex_init(&i->lock, &attr);
 
 	TAILQ_INIT(&i->workers_created);
 	TAILQ_INIT(&i->workers_running);
@@ -4727,7 +4570,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
-	spin_init(&i->cpuspin);
+	pthread_mutex_init(&i->cpulock, &attr);
 
 	// CPU/Worker affinity setup
 	i->num_cpus_seen = 0;

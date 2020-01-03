@@ -4,6 +4,8 @@
 //
 
 #define _GNU_SOURCE
+#define __USE_GNU
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -28,7 +30,6 @@
 #include <ck_pr.h>
 #include <signal.h>
 #include <execinfo.h>
-#include <pthread.h>
 #include <sched.h>
 
 #ifndef __TASK_LIB_H__

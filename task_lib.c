@@ -66,7 +66,8 @@
 // fairly frequently, and so can cause excessive CPU cache contention misses if there are too many,
 // which will negatively impact overall performance.  Values in the low-middling 100's appear to be
 // good compromise values
-#define	TASK_MAX_TFD_LOCKS	(509)
+#define	TASK_MAX_TFD_LOCKS		(509)
+#define TFDI_TO_LOCK_INDEX(tfdi)	(tfdi % TASK_MAX_TFD_LOCKS)
 
 // Uncomment to enable use of ticketed spinlocks, instead of adaptive pthread mutexes.  The main
 // reason for why you'd want to do this is to gather statistics about the contention rates of the
@@ -76,22 +77,29 @@
 // statistics about the time spent in TFD locks with gprof using ticketlocks
 // #define USE_TICKET_LOCKS
 
+struct locked_action {
+	uint64_t		action;
+	struct locked_action	*next;
+};
+
 #ifdef USE_TICKET_LOCKS
 typedef struct {
 	ticketlock_t		lock;
+	struct locked_action	*free_actions;
 } __attribute__ ((aligned(64))) tfd_lock_t;
 
-#define	tfd_lock(lock_index)	ticket_lock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
-#define	tfd_unlock(lock_index)	ticket_unlock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
+#define	tfd_lock(tfdi)	 ticket_lock(&__thr_current_instance->tfd_locks[TFDI_TO_LOCK_INDEX(tfdi)].lock)
+#define	tfd_unlock(tfdi) ticket_unlock(&__thr_current_instance->tfd_locks[TFDI_TO_LOCK_INDEX(tfdi)].lock)
 
 #else
 
 typedef struct {
 	pthread_mutex_t		lock;
+	struct locked_action	*free_actions;
 } __attribute__ ((aligned(64))) tfd_lock_t;
 
-#define	tfd_lock(lock_index)	pthread_mutex_lock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
-#define	tfd_unlock(lock_index)	pthread_mutex_unlock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
+#define	tfd_lock(tfdi)	 pthread_mutex_lock(&__thr_current_instance->tfd_locks[TFDI_TO_LOCK_INDEX(tfdi)].lock)
+#define	tfd_unlock(tfdi) pthread_mutex_unlock(&__thr_current_instance->tfd_locks[TFDI_TO_LOCK_INDEX(tfdi)].lock)
 #endif
 
 //-------------------------------------------------------------------------------------------
@@ -163,6 +171,7 @@ typedef enum {
 	FLG_GFD	=	0x00080000,		// A Get FD operation is already in progress
 	FLG_SD	=	0x00100000,		// A Shutdown operation is in progress
 	FLG_AC	=	0x00200000,		// A newly accepted task
+	FLG_DRP = 	0x00400000,		// If this a drop of another action
 } task_action_flag_t;
 
 struct ntfyq {
@@ -195,10 +204,12 @@ struct task_dormant {
 	// cache line (64 bytes width) as that will get flushed when it gets updated.
 __attribute__ ((aligned(64))) uint64_t	notifyqlen_locked;	// Number of locked notifyq entries this task has
 	int64_t				age;			// Time this task was created
-	socklen_t			addrlen;		// The valid length of the data in .addr
 	uint32_t			migrations;		// Number of times the task has migrated
 	int32_t				tfd_iteration;		// The iteration on the TFD node
 	struct ntfyq_list		listen_children;	// The list of child accept tasks
+	void				*close_cb_data;		//  User data to pass to the close callback
+	void				(*close_cb)(int64_t tfd, void *close_cb_data);
+	socklen_t			addrlen;		// The valid length of the data in .addr
 } __attribute__ ((aligned(64)));
 
 struct task {
@@ -294,12 +305,11 @@ struct task {
 	//===================================    CALLBACK FIELDS    ====================================//
 	//----------------------------------------------------------------------------------------------//
 
-	void				*close_cb_data;		//  User data to pass to the close callback
-	void				(*close_cb)(int64_t tfd, void *close_cb_data);
 	void				*accept_cb_data;
 	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
 	void				*connect_cb_data;
 	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
+	struct locked_action		*active_flags_locked;	// Queue of locked actions
 	struct task			*task_next;		// List of free tasks
 	struct task_dormant		*dormant;
 
@@ -864,15 +874,74 @@ task_free(struct task *t)
 } // task_free
 
 
+// Assumes that the lock for the tfd lock index is already held
+static inline void
+task_put_locked_action(uint32_t tfdi, struct locked_action *lact)
+{
+	register uint64_t lock_index = TFDI_TO_LOCK_INDEX(tfdi);
+
+	memset(lact, 0, sizeof(*lact));
+	lact->next = __thr_current_instance->tfd_locks[lock_index].free_actions;
+	__thr_current_instance->tfd_locks[lock_index].free_actions = lact;
+} // task_put_locked_action
+
+
+// Assumes that the lock for the tfd lock index is already held
+static inline struct locked_action *
+task_get_locked_action(uint32_t tfdi)
+{
+	register uint64_t lock_index = TFDI_TO_LOCK_INDEX(tfdi);
+	struct locked_action *lact;
+
+	lact = __thr_current_instance->tfd_locks[lock_index].free_actions;
+	if (lact) {
+		__thr_current_instance->tfd_locks[lock_index].free_actions = lact->next;
+		lact->next = NULL;
+		free(lact);
+	}
+	lact = calloc(1, sizeof(struct locked_action));
+	return lact;
+} // task_get_locked_action
+
+
 static void
 task_pickup_flags(struct task *t)
 {
+	assert(lockless_worker(t->worker));
 	if (t->active_flags_locked) {
+		struct locked_action *lalr = NULL, *lal = NULL, *tmp;
+		uint32_t tfdi = t->tfd_index;
+
 		tfd_lock(tfdi);
-		t->active_flags |= t->active_flags_locked;
-		t->active_flags_locked = 0;
-		t->active_flags &= ~(t->cancel_flags_locked);
-		t->cancel_flags_locked = 0;
+		lalr = t->active_flags_locked;
+		t->active_flags_locked = NULL;
+		tfd_unlock(tfdi);
+
+		// Now reverse the order
+		while ((tmp = lalr) != NULL) {
+			lalr = tmp->next;
+			tmp->next = lal;
+			lal = tmp;
+		}
+
+		// Now play it back and apply to the active_flags
+		while ((tmp = lal) != NULL) {
+			if (tmp->action & FLG_DRP) {
+				t->active_flags &= ~(tmp->action);
+			} else {
+				t->active_flags |= tmp->action;
+			}
+			lal = tmp->next;
+			tmp->next = lalr;
+			lalr = tmp;
+		}
+
+		// Now free the list
+		tfd_lock(tfdi);
+		while ((tmp = lalr) != NULL) {
+			lalr = tmp->next;
+			task_put_locked_action(tfdi, tmp);
+		}
 		tfd_unlock(tfdi);
 	}
 } // task_pickup_flags
@@ -884,21 +953,27 @@ task_lock(struct task *t, task_action_flag_t action)
 {
 	register uint32_t tfdi = t->tfd_index;
 
-	// Do not set IO timeout flags.  Their existence is already implied by
-	// their parent FLG_RD/FLG_WR flags
+	// Do not process IO timeout flags.  Their existence is
+	// already implied by their parent FLG_RD/FLG_WR flags
 	if (action & (FLG_RT | FLG_WT)) {
 		return;
 	}
 
 	if (!lockless_worker(t->worker)) {
+		struct locked_action *lact;
+
 		tfd_lock(tfdi);
-		t->active_flags_locked |= action;
-		t->cancel_flags_locked &= ~(action);
+		lact = task_get_locked_action(tfdi);
+		assert(lact);
+		lact->action = action;
+		lact->next = t->active_flags_locked;
+		t->active_flags_locked = lact;
 		tfd_unlock(tfdi);
 		return;
+	} else {
+		task_pickup_flags(t);
+		t->active_flags |= action;
 	}
-
-	t->active_flags |= action;
 } // task_lock
 
 
@@ -909,30 +984,39 @@ task_unlock(struct task *t, task_action_flag_t action)
 {
 	register uint32_t tfdi = t->tfd_index;
 
-	// Do not set IO timeout flags.  Their existence is already implied by
-	// their parent FLG_RD/FLG_WR flags
+	// Do not process IO timeout flags.  Their existence is
+	// already implied by their parent FLG_RD/FLG_WR flags
 	if (action & (FLG_RT | FLG_WT)) {
 		return;
 	}
 
 	if (!lockless_worker(t->worker)) {
+		struct locked_action *lact;
+
 		tfd_lock(tfdi);
-		t->cancel_flags_locked |= action;
-		t->active_flags_locked &= ~(action);
+		lact = task_get_locked_action(tfdi);
+		assert(lact);
+		lact->action = (action | FLG_DRP);
+		lact->next = t->active_flags_locked;
+		t->active_flags_locked = lact;
 		tfd_unlock(tfdi);
 		return;
 	}
 
 	task_pickup_flags(t);
-
 	t->active_flags &= ~(action);
 	if (unlikely(t->state == TASK_STATE_DESTROY)) {
 		if ((t->active_flags == 0) && (t->notifyqlen == 0)) {
+			// Need to grab the tfd lock to check the next 2 items
+			tfd_lock(tfdi);
 			if (ck_pr_load_64(&t->dormant->notifyqlen_locked) == 0) {
-				tfd_unlock(tfdi);
-				task_free(t);
-				return;
+				if (t->active_flags_locked == NULL) {
+					tfd_unlock(tfdi);
+					task_free(t);
+					return;
+				}
 			}
+			tfd_unlock(tfdi);
 		}
 	}
 } // task_unlock
@@ -945,6 +1029,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 {
 	register uint32_t tfdi = (uint32_t)(tfd & 0xffffffff);
 	register struct task *t;
+	register struct worker *w;
 
 	// Validate the instance
 	if (unlikely(__thr_current_instance == NULL)) {
@@ -984,30 +1069,47 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 	}
 
 	t = __thr_current_instance->tfd_pool + tfdi;
-
-	tfd_lock(tfdi);
-	if (unlikely(t == NULL)) {
-		tfd_unlock(tfdi);
-		errno = ENOENT;
-		return NULL;
-	}
-
-	if (unlikely(t->state != TASK_STATE_ACTIVE)) {
-		tfd_unlock(tfdi);
+	if ((w = t->worker) == NULL) {
 		errno = EBADF;
 		return NULL;
 	}
 
-	if (unlikely(!!(action & t->active_flags))) {
-		tfd_unlock(tfdi);
-		errno = EINPROGRESS;
-		return NULL;
-	}
+	if (!lockless_worker(w)) {
+		struct locked_action *lact;
 
-	t->active_flags_locked &= t->cancel_flags_locked;
-	t->cancel_flags_locked = 0;
-	t->active_flags |= action;
-	tfd_unlock(tfdi);
+		tfd_lock(tfdi);
+		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+			tfd_unlock(tfdi);
+			errno = EBADF;
+			return NULL;
+		}
+
+		if (unlikely(!!(action & t->active_flags))) {
+			tfd_unlock(tfdi);
+			errno = EINPROGRESS;
+			return NULL;
+		}
+
+		lact = task_get_locked_action(tfdi);
+		assert(lact);
+		lact->action = (action | FLG_DRP);
+		lact->next = t->active_flags_locked;
+		t->active_flags_locked = lact;
+		tfd_unlock(tfdi);
+	} else {
+		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+			errno = EBADF;
+			return NULL;
+		}
+
+		if (unlikely(!!(action & t->active_flags))) {
+			errno = EINPROGRESS;
+			return NULL;
+		}
+
+		task_pickup_flags(t);
+		t->active_flags |= action;
+	}
 
 	errno = 0;
 	return t;
@@ -1054,6 +1156,7 @@ task_get_free_task(void)
 	}
 	i->free_tasks = t->task_next;
 	assert(t->state == TASK_STATE_UNUSED);
+	assert(t->active_flags_locked == NULL);
 	t->state = TASK_STATE_ACTIVE;
 	pthread_mutex_unlock(&i->cpulock);
 
@@ -1822,8 +1925,8 @@ task_cancel_read(struct task *t)
 static void
 task_do_close_cb(struct task *t)
 {
-	void (*cb)(int64_t tfd, void *close_cb_data) = t->close_cb;
-	void *cb_data = t->close_cb_data;
+	void (*cb)(int64_t tfd, void *close_cb_data) = t->dormant->close_cb;
+	void *cb_data = t->dormant->close_cb_data;
 	int err = t->cb_errno;
 	int64_t tfd = t->tfd;
 
@@ -1873,9 +1976,9 @@ task_do_close_cb(struct task *t)
 	t->rd_cb = NULL;
 	t->wrv_cb = NULL;
 	t->rdv_cb = NULL;
-	t->close_cb = NULL;
 	t->accept_cb = NULL;
 	t->connect_cb = NULL;
+	t->dormant->close_cb = NULL;
 
 	// Cancel the timeouts
 	task_destroy_timeouts(t);
@@ -2341,7 +2444,7 @@ worker_cleanup(struct worker *w)
 		}
 
 		// Just drop all the actions we see by forwarding them to task_do_close_cb()
-		t->close_cb = NULL;
+		t->dormant->close_cb = NULL;
 		task_lock(t, FLG_CL);
 		if ((action & FLG_CL) == 0) {
 			task_unlock(t, action);
@@ -2661,8 +2764,8 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	t->worker = w;
 	ck_pr_inc_64(&w->num_tasks);
 	t->type = type;
-	t->close_cb = close_cb;
-	t->close_cb_data = close_cb_data;
+	t->dormant->close_cb = close_cb;
+	t->dormant->close_cb_data = close_cb_data;
 	t->fd = fd;
 
 	// task_get_free_tfd() already locked the task for us
@@ -3231,11 +3334,13 @@ task_handle_listen_event(struct task *t)
 		// own.  The caller can distingish between the two by inspecting the tfd that
 		// arrives on the accept close callback.  If the tfd matches the accept tfd,
 		// then the close is on the accept task, otherwise it is for the new task
-		if ((t_new = task_create(i, TASK_TYPE_IO, cfd, NULL, t->close_cb_data, t->close_cb, false)) == NULL) {
+		if ((t_new = task_create(i, TASK_TYPE_IO, cfd, NULL, t->dormant->close_cb_data,
+		     			 t->dormant->close_cb, false)) == NULL) {
 			// We failed to create a task structure for it :(  Inform user
 			// of the failure so they're aware of us dropping connections
 			if (t->accept_cb) {
-				t->accept_cb(-1, t->accept_cb_data);    // t is still locked at this point
+				// t is still locked at this point
+				t->accept_cb(-1, t->accept_cb_data);
 			}
 			close(cfd);
 			continue;
@@ -4335,7 +4440,8 @@ instance_listen_balance(struct task *t)
 		}
 
 		// Create a child task to look after the socket. Ensure to specify the worker for the new task
-		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->close_cb_data, t->close_cb, false)) == NULL) {
+		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->dormant->close_cb_data,
+				      t->dormant->close_cb, false)) == NULL) {
 			perror("instance_listen_balance->task_create");
 			continue;
 		}
@@ -4472,9 +4578,14 @@ instance_destroy(struct instance *i)
 	}
 	if (i->tfd_pool) {
 		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+			struct locked_action *lact;
 #ifndef USE_TICKET_LOCKS
 			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
 #endif
+			while ((lact = i->tfd_locks[n].free_actions) != NULL) {
+				i->tfd_locks[n].free_actions = lact->next;
+				free(lact);
+			}
 		}
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
@@ -5389,8 +5500,8 @@ TASK_socket_set_close_cb(int64_t tfd, void *close_cb_data, void (*close_cb)(int6
 	}
 
 	// Set the task's close callback information
-	t->close_cb = close_cb;
-	t->close_cb_data = close_cb_data;
+	t->dormant->close_cb = close_cb;
+	t->dormant->close_cb_data = close_cb_data;
 	task_unlock(t, FLG_CCB);
 	return 0;
 } // TASK_socket_set_close_cb

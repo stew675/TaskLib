@@ -197,12 +197,14 @@ echoes_start(int64_t tfd, int64_t lateness_us, void *user_data)
 		}
 		if (TASK_socket_bind(acpt->tfd, (struct sockaddr *)(acpt_addrs[n]), sizeof(struct sockaddr_in)) < 0) {
 			perror("parse_acceptor_args->TASK_socket_bind");
-			close(acpt->tfd);
+			TASK_close(acpt->tfd);
+			free(acpt);
 			continue;
 		}
 		if (TASK_socket_listen(acpt->tfd, (void *)acpt, accept_cb) < 0) {
 			perror("parse_acceptor_args->TASK_socket_listen");
-			close(acpt->tfd);
+			TASK_close(acpt->tfd);
+			free(acpt);
 			continue;
 		}
 		fprintf(stderr, "Listening on: %s %d\n", inet_ntoa(acpt_addrs[n]->sin_addr), (int)ntohs(acpt_addrs[n]->sin_port));

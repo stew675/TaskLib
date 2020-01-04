@@ -41,7 +41,7 @@ static inline void ticket_lock(register ticketlock_t *lock)
 	asm __volatile__ ("lock xaddq %q0, %1\n" : "+r"(tkt), "+m"(lock->tickets) : : "memory", "cc");
 	while (tkt.tail - tkt.head) {
 #ifdef __TICKET_LOCK_STATISTICS
-		contentions++;
+		contentions = 1;
 #endif
 		// It's slightly faster for the uncontested path to calculate tkt.head here
 		tkt.head = tkt.tail - tkt.head;

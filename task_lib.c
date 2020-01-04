@@ -37,7 +37,7 @@
 // Uncomment the following to turn on "straggler" detection. A small set of active TFD's will
 // be stored to __thr_current_instance->stragglers, which allows us to attach a debugger and
 // quickly find any active TFD's within the pool that probably should not still be active
-//#define TFD_POOL_DEBUG
+// #define TFD_POOL_DEBUG
 
 // General tuning/limit settings
 #define TASK_MAX_IO_DEPTH	2		// Max depth IO nested callbacks can be before queueing
@@ -66,7 +66,7 @@
 // fairly frequently, and so can cause excessive CPU cache contention misses if there are too many,
 // which will negatively impact overall performance.  Values in the low-middling 100's appear to be
 // good compromise values
-#define	TASK_MAX_TFD_LOCKS	(512)	
+#define	TASK_MAX_TFD_LOCKS	(509)
 
 // Uncomment to enable use of ticketed spinlocks, instead of adaptive pthread mutexes.  The main
 // reason for why you'd want to do this is to gather statistics about the contention rates of the
@@ -74,7 +74,7 @@
 // than the adaptive pthread mutexes, but performance is terrible if the worker threads ever get
 // context switched by the Linux scheduler. It is slightly easier however to gather profiling
 // statistics about the time spent in TFD locks with gprof using ticketlocks
-//#define USE_TICKET_LOCKS
+// #define USE_TICKET_LOCKS
 
 #ifdef USE_TICKET_LOCKS
 typedef struct {
@@ -3305,20 +3305,29 @@ worker_check_timeouts(struct worker *w)
 
 		if (t->tm_tt.node == timer_node) {
 			action = FLG_TM;
+			if ((t->active_flags & FLG_TM) == 0) {
+				// The timer got cancelled
+				task_cancel_timer(t, FLG_TM);
+				task_unlock(t, FLG_TM);
+				continue;
+			}
 		} else if (t->rd_tt.node == timer_node) {
 			action = FLG_RT;
+			if ((t->active_flags & FLG_RD) == 0) {
+				// The read for this timeout isn't active
+				task_cancel_timer(t, FLG_RT);
+				continue;
+			}
 		} else if (t->wr_tt.node == timer_node) {
 			action = FLG_WT;
+			if ((t->active_flags & FLG_WR) == 0) {
+				// The write for this timeout isn't active
+				task_cancel_timer(t, FLG_WT);
+				continue;
+			}
 		} else {
 			// We have a dangling node with no owner?
 			assert(0);
-		}
-
-		// Check if the action got cancelled
-		if ((t->active_flags & action) == 0) {
-			task_cancel_timer(t, action);
-			task_unlock(t, action);
-			continue;
 		}
 
 		// If Task is in Destroy State, unlock and go
@@ -3608,6 +3617,8 @@ worker_process_notifyq(register struct worker *w)
 				t->notifyqlen--;
 			}
 
+			// Drop the notify action entirely if the tfd doesn't match.  It's likely
+			// to be a stale notification from a task that already terminated
 			if (unlikely(tfd != t->tfd)) {
 				continue;
 			}
@@ -3620,9 +3631,9 @@ worker_process_notifyq(register struct worker *w)
 				}
 			}
 
-			// Check if the action got cancelled
-			if (unlikely((t->active_flags & action) == 0)) {
-				if (action != FLG_CL) {
+			// Check if the action got cancelled.  Allow close and io timeouts through though
+			if ((action & (FLG_CL | FLG_WT | FLG_RT)) == 0) {
+				if ((t->active_flags & action) == 0) {
 					task_unlock(t, action);
 					continue;
 				}

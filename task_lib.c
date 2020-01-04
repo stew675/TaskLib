@@ -28,11 +28,7 @@
 
 #include "ph.h"
 #include "task_lib.h"
-#include <immintrin.h>
-#include <stdatomic.h>
-
-#define _GNU_SOURCE
-#include <pthread.h>
+#include "ticketlock.h"
 
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
@@ -43,50 +39,60 @@
 // quickly find any active TFD's within the pool that probably should not still be active
 //#define TFD_POOL_DEBUG
 
+// General tuning/limit settings
 #define TASK_MAX_IO_DEPTH	2		// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768		// The maximum amount that may be read/written in one go
 #define TASK_LISTEN_BACKLOG	((int)1024)	// System auto-truncates it to system limit anyway
 #define	TASK_MAX_INSTANCES	16		// Maximum number of Task library instances allowed at once
 
-// In order to keep the paired heap priority queue from having to deal with IO timeouts that
-// are frequently cancelled again soon after being activated we have cool-off timer lists (colt's)
+// In order to keep the paired heap priority queue from having to deal with IO timeouts that are
+// frequently cancelled again soon after being activated we have cool-off timer lists (colt's).
 // It's much cheaper to remove a timeout from one of the cool-off lists than when they are in the
-// priority queue.  All I/O timeouts > WORKER_TIME_COLT2 microseconds go onto the 2nd cool-off list.
-// Any timeouts not on the 2nd list with with timeouts > WORKER_TIME_COLT1 us go onto the 1st cool-off
-// list. Every (WORKER_TIME_COLT1 * 0.8) microseconds the timing system adds everything on the first
-// list to the priority queue, and swaps the 2nd list to the 1st list, and empties the 2nd list.
-// What this effectively means is that for all timeouts >8.1s get (on average) 5.4s to expire before
-// being placed into the priority queue, and all timeouts between 4.5s and 8.1s get, (on average) 1.8s
-// to expire before being placed into the priority queue.  All timeouts <4.5s get placed onto the
-// priority queue immediately.  This system is cheap, and cuts down on priority queue use for I/O
-// timeouts by ~98% in typical use cases
-#define	WORKER_TIME_COLT1	4500000				// 4s (expressed in microseconds)
+// priority queue.  All I/O timeouts > WORKER_TIME_COLT2 microseconds go onto the 2nd cool-off
+// list.  Any timeouts not on the 2nd list with with timeouts > WORKER_TIME_COLT1 us go onto the
+// 1st cool-off list. Every (WORKER_TIME_COLT1 * 0.8) microseconds the timing system adds everything
+// on the first list to the priority queue, and swaps the 2nd list to the 1st list, and empties the
+// 2nd list.  What this effectively means is that for all timeouts >8.1s get (on average) 5.4s to
+// expire before being placed into the priority queue, and all timeouts between 4.5s and 8.1s get,
+// (on average) 1.8s to expire before being placed into the priority queue.  All timeouts <4.5s get
+// placed onto the priority queue immediately.  This system is cheap, and cuts down on priority queue
+// use for I/O timeouts by ~98% in typical use cases
+#define	WORKER_TIME_COLT1	4500000				// 4.5s (expressed in microseconds)
 #define	WORKER_TIME_COLT2	(WORKER_TIME_COLT1 * 1.8)	// COLT1 * 1.8 (expressed in microseconds)
-#define TASK_MAX_EPOLL_WAIT_MS	(WORKER_TIME_COLT1 / 5000)	// 1/5th that of COLT1 (expressed in milliseconds)
+#define TASK_MAX_EPOLL_WAIT_MS	(WORKER_TIME_COLT1 / 5000)	// 1/5th that of COLT1 (expressed in millisecs)
 
-// Handy time unit conversion macros
-#define TASK_MS_TO_US(a)	(((int64_t)a) * 1000)
-#define TASK_US_TO_MS(a)	(((int64_t)a) / 1000)
-#define TASK_S_TO_US(a)		(((int64_t)a) * 1000000)
-#define TASK_NS_TO_US(a)	(((int64_t)a) / 1000)
-#define TASK_US_TO_S(a)		(((int64_t)a) / 1000000)
+// Number of TFD locks in an instance's lock pool.  Altering this value provides a non-intuitive
+// performance impact. While more lock entries offer less lock contention, they also are accessed
+// fairly frequently, and so can cause excessive CPU cache contention misses if there are too many,
+// which will negatively impact overall performance.  Values in the low-middling 100's appear to be
+// good compromise values
+#define	TASK_MAX_TFD_LOCKS	(512)	
 
-// The non-existent TFD Identifier
-#define TFD_NONE 		(int64_t)(0xffffffffffffffff)
+// Uncomment to enable use of ticketed spinlocks, instead of adaptive pthread mutexes.  The main
+// reason for why you'd want to do this is to gather statistics about the contention rates of the
+// TFD lookup table locks to better tune the lock table sizes.  Ticket locks are slightly faster
+// than the adaptive pthread mutexes, but performance is terrible if the worker threads ever get
+// context switched by the Linux scheduler. It is slightly easier however to gather profiling
+// statistics about the time spent in TFD locks with gprof using ticketlocks
+//#define USE_TICKET_LOCKS
 
-// Branch prediction optimisation macros
-#if __GNUC__ >= 3
-#define likely(x) __builtin_expect((x), 1)
-#define unlikely(x) __builtin_expect((x), 0)
+#ifdef USE_TICKET_LOCKS
+typedef struct {
+	ticketlock_t		lock;
+} __attribute__ ((aligned(64))) tfd_lock_t;
+
+#define	tfd_lock(lock_index)	ticket_lock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
+#define	tfd_unlock(lock_index)	ticket_unlock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
+
 #else
-#define likely(x) (x)
-#define unlikely(x) (x)
-#endif
 
 typedef struct {
 	pthread_mutex_t		lock;
-	uint64_t		pad[3];
 } __attribute__ ((aligned(64))) tfd_lock_t;
+
+#define	tfd_lock(lock_index)	pthread_mutex_lock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
+#define	tfd_unlock(lock_index)	pthread_mutex_unlock(&__thr_current_instance->tfd_locks[((lock_index) % TASK_MAX_TFD_LOCKS)].lock)
+#endif
 
 //-------------------------------------------------------------------------------------------
 
@@ -453,28 +459,35 @@ struct instance {
 	void				*shutdown_data;
 };
 
-static __thread int64_t		__thr_preferred_age;
-static __thread struct worker	*__thr_current_worker = NULL;		// The current IO worker.  MUST BE NULL if current thread is not an IO worker
-static __thread struct worker	*__thr_preferred_worker = NULL;		// A preferred target IO worker for nested task IO
-static __thread struct instance	*__thr_current_instance = NULL;
+// ---------------------------------------------------------------------------------------------//
+//		   General Macros/definitions and global/per-thread variables			//
+//----------------------------------------------------------------------------------------------//
 
 static struct instance		*instances[TASK_MAX_INSTANCES];
 static bool initialised = false;
 static size_t __page_size;
 static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define	lockless_worker(w)	(w == __thr_current_worker)
+// The current IO worker.  MUST BE NULL if current thread is not an IO worker
+static __thread struct worker	*__thr_current_worker = NULL;
+// A preferred target IO worker for nested task IO
+static __thread struct worker	*__thr_preferred_worker = NULL;
+static __thread struct instance	*__thr_current_instance = NULL;
+static __thread int64_t		__thr_preferred_age;
 
-// Number of TFD locks in an instance's lock pool. MUST be a power of 2.  Altering this value provides
-// a non-intuitive performance impact. While more lock entries offer less lock contention, they
-// also are accessed fairly frequently, and so can cause frequent CPU cache contention misses if there are
-// too many, which can negatively impact overall performance.  128, 256, 512 and 1024 all appear to be good
-// compromise values with 512 appearing to offer the best performance across the widest set of load ranges
-#define	TASK_MAX_TFD_LOCKS	(512)	
-#define	TASK_TFD_LOCK_MASK	(TASK_MAX_TFD_LOCKS - 1)
+// How to identify if we're on the worker thread we're assigned to
+#define	lockless_worker(w)	((w) == __thr_current_worker)
 
-#define	tfd_lock(lock_index)	pthread_mutex_lock(&__thr_current_instance->tfd_locks[((lock_index) & TASK_TFD_LOCK_MASK)].lock)
-#define	tfd_unlock(lock_index)	pthread_mutex_unlock(&__thr_current_instance->tfd_locks[((lock_index) & TASK_TFD_LOCK_MASK)].lock)
+// Handy time unit conversion macros
+#define TASK_MS_TO_US(a)	(((int64_t)a) * 1000)
+#define TASK_US_TO_MS(a)	(((int64_t)a) / 1000)
+#define TASK_S_TO_US(a)		(((int64_t)a) * 1000000)
+#define TASK_NS_TO_US(a)	(((int64_t)a) / 1000)
+#define TASK_US_TO_S(a)		(((int64_t)a) / 1000000)
+
+// The non-existent TFD Identifier
+#define TFD_NONE 		(int64_t)(0xffffffffffffffff)
+
 
 // ---------------------------------------------------------------------------------------------//
 //					DEBUGGING STUFF						//
@@ -572,6 +585,15 @@ do_bt(void)
 
 	free(strings);
 }
+#endif
+
+// Branch prediction optimisation macros
+#if __GNUC__ >= 3
+#define likely(x) __builtin_expect((x), 1)
+#define unlikely(x) __builtin_expect((x), 0)
+#else
+#define likely(x) (x)
+#define unlikely(x) (x)
 #endif
 
 // Get the microsecond current time into the given int64_t pointer space
@@ -4390,7 +4412,9 @@ instance_destroy(struct instance *i)
 	}
 	if (i->tfd_pool) {
 		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+#ifndef USE_TICKET_LOCKS
 			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
+#endif
 		}
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
@@ -4442,10 +4466,12 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 {
 	register size_t num_pages;
 	uint32_t n;
+#ifndef USE_TICKET_LOCKS
 	pthread_mutexattr_t attr;
 
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+#endif
 
 	// Don't allow less than 100 tfd entries for pool size
 	pool_size = (pool_size < 100) ? 100 : pool_size;
@@ -4487,7 +4513,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		i->free_tasks = t;
 	}
 
-	// Allocate the lock storage now
+	// Allocate the lock storage now.  We 
 	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(tfd_lock_t);
 	num_pages += (__page_size - 1);
 	num_pages /= __page_size;
@@ -4500,7 +4526,11 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 	whatevs.a = i->tfd_locks_real;
 	memset(whatevs.b, 0, num_pages * __page_size);
 	for (n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
+#ifdef USE_TICKET_LOCKS
+		ticket_init(&(i->tfd_locks_real[n].lock));
+#else
 		pthread_mutex_init(&(i->tfd_locks_real[n].lock), &attr);
+#endif
 	}
 	i->tfd_locks = i->tfd_locks_real + 1;
 	return 0;

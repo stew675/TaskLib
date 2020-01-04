@@ -116,8 +116,7 @@ typedef enum {
 	TASK_TYPE_IO = 1,
 	TASK_TYPE_TIMER = 2,
 	TASK_TYPE_CONNECT = 3,
-	TASK_TYPE_LISTEN_PARENT = 4,
-	TASK_TYPE_LISTEN_CHILD = 5
+	TASK_TYPE_LISTEN = 4
 } task_type_t;
 
 typedef enum {
@@ -217,7 +216,8 @@ struct task {
 					rd_shut:1,		// If the read side is shutdown
 					wr_shut:1,		// If the write side is shutdown
 					forward_close:1,	// Temporarily allow close action forwarding
-					unused:19;
+					listen_child:1,		// If task is a child listener
+					unused:18;
 	int64_t				tfd;			// Task File Descriptor that identifies this task
 	struct epoll_event		ev;			// The current epoll events we're waiting on
 	int32_t				epfd;			// The worker epoll fd the above fd is registered with
@@ -512,11 +512,12 @@ task_dump(struct task *t)
 	case	TASK_TYPE_CONNECT:
 		fprintf(stderr, "CONNECT, State = ");
 		break;
-	case	TASK_TYPE_LISTEN_PARENT:
-		fprintf(stderr, "ACCEPT_PARENT, State = ");
-		break;
-	case	TASK_TYPE_LISTEN_CHILD:
-		fprintf(stderr, "ACCEPT_CHILD, State = ");
+	case	TASK_TYPE_LISTEN:
+		if (t->listen_child) {
+			fprintf(stderr, "LISTEN_CHILD, State = ");
+		} else {
+			fprintf(stderr, "LISTEN_PARENT, State = ");
+		}
 		break;
 	default:
 		fprintf(stderr, "BAD TYPE, State = ");
@@ -863,6 +864,20 @@ task_free(struct task *t)
 } // task_free
 
 
+static void
+task_pickup_flags(struct task *t)
+{
+	if (t->active_flags_locked) {
+		tfd_lock(tfdi);
+		t->active_flags |= t->active_flags_locked;
+		t->active_flags_locked = 0;
+		t->active_flags &= ~(t->cancel_flags_locked);
+		t->cancel_flags_locked = 0;
+		tfd_unlock(tfdi);
+	}
+} // task_pickup_flags
+
+
 // Safely raises the flag on the task.
 static void
 task_lock(struct task *t, task_action_flag_t action)
@@ -875,9 +890,15 @@ task_lock(struct task *t, task_action_flag_t action)
 		return;
 	}
 
-	tfd_lock(tfdi);
+	if (!lockless_worker(t->worker)) {
+		tfd_lock(tfdi);
+		t->active_flags_locked |= action;
+		t->cancel_flags_locked &= ~(action);
+		tfd_unlock(tfdi);
+		return;
+	}
+
 	t->active_flags |= action;
-	tfd_unlock(tfdi);
 } // task_lock
 
 
@@ -894,7 +915,16 @@ task_unlock(struct task *t, task_action_flag_t action)
 		return;
 	}
 
-	tfd_lock(tfdi);
+	if (!lockless_worker(t->worker)) {
+		tfd_lock(tfdi);
+		t->cancel_flags_locked |= action;
+		t->active_flags_locked &= ~(action);
+		tfd_unlock(tfdi);
+		return;
+	}
+
+	task_pickup_flags(t);
+
 	t->active_flags &= ~(action);
 	if (unlikely(t->state == TASK_STATE_DESTROY)) {
 		if ((t->active_flags == 0) && (t->notifyqlen == 0)) {
@@ -905,7 +935,6 @@ task_unlock(struct task *t, task_action_flag_t action)
 			}
 		}
 	}
-	tfd_unlock(tfdi);
 } // task_unlock
 
 
@@ -975,6 +1004,8 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		return NULL;
 	}
 
+	t->active_flags_locked &= t->cancel_flags_locked;
+	t->cancel_flags_locked = 0;
 	t->active_flags |= action;
 	tfd_unlock(tfdi);
 
@@ -1477,7 +1508,7 @@ task_notify_action(struct task *t, task_action_flag_t action)
 
 	if (action == FLG_RD) {
 		// If it's an listener.  Queue it in front of everything else
-		if (unlikely((t->active_flags & FLG_LI) != 0)) {
+		if (unlikely(t->type == TASK_TYPE_LISTEN)) {
 			goto task_notify_action_queue_first;
 		}
 		goto task_notify_action_queue;
@@ -1554,8 +1585,8 @@ task_activate_rd_timeout(register struct task *t)
 		return;
 	}
 
-	// Acceptors have no timeouts
-	if (unlikely(!!(t->active_flags & FLG_LI))) {
+	// Listeners have no timeouts
+	if (unlikely(t->type == TASK_TYPE_LISTEN)) {
 		return;
 	}
 
@@ -1789,7 +1820,7 @@ task_cancel_read(struct task *t)
 
 
 static void
-task_do_close_cb(struct task *t, task_action_flag_t action)
+task_do_close_cb(struct task *t)
 {
 	void (*cb)(int64_t tfd, void *close_cb_data) = t->close_cb;
 	void *cb_data = t->close_cb_data;
@@ -1810,7 +1841,7 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 	__thr_preferred_worker = NULL;
 
 	// If it's a listener, remove it from the worker's listeners list
-	if (t->active_flags & FLG_LI) {
+	if (t->type == TASK_TYPE_LISTEN) {
 		register struct worker *w = t->worker;
 
 		if (w) {
@@ -1852,18 +1883,18 @@ task_do_close_cb(struct task *t, task_action_flag_t action)
 	// If we're a child listener, don't make the close callback.  The caller
 	// only knows about the parent listener and won't know what to do with a
 	// a child listener since it isn't even aware of its existence
-	if ((cb == NULL) || (t->type == TASK_TYPE_LISTEN_CHILD)) {
-		task_unlock(t, action | FLG_CL);
+	if ((cb == NULL) || (t->listen_child)) {
+		task_unlock(t, FLG_CL);
 		return;
 	}
 
 	// If the instance is shutting down, don't make any callbacks
  	if (__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN) {
-		task_unlock(t, action | FLG_CL);
+		task_unlock(t, FLG_CL);
 		return;
 	}
 
-	task_unlock(t, action | FLG_CL);
+	task_unlock(t, FLG_CL);
 	errno = err;
 	cb(tfd, cb_data);
 } // task_do_close_cb
@@ -1967,13 +1998,15 @@ task_do_accept_cb(struct task *t)
 
 	if (unlikely(cb == NULL)) {
 		task_lock(t, FLG_CL);
-		task_do_close_cb(t, FLG_AC);
+		task_unlock(t, FLG_AC);
+		task_do_close_cb(t);
 		return;
 	}
 
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
 		task_lock(t, FLG_CL);
-		task_do_close_cb(t, FLG_AC);
+		task_unlock(t, FLG_AC);
+		task_do_close_cb(t);
 		return;
 	}
 
@@ -2080,7 +2113,8 @@ task_do_connect_cb(struct task *t, int result)
 	// If there's no callback for the connection, all we can do it close it
 	if (unlikely(cb == NULL)) {
 		task_lock(t, FLG_CL);
-		task_do_close_cb(t, FLG_CO | FLG_WR);
+		task_unlock(t, FLG_CO | FLG_WR);
+		task_do_close_cb(t);
 		return;
 	}
 
@@ -2262,7 +2296,8 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 
 		tac = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
 		task_lock(t, FLG_CL);
-		task_do_close_cb(tac, FLG_LI);
+		task_unlock(t, FLG_LI);
+		task_do_close_cb(tac);
 	}
 } // task_shutdown_listen_children
 
@@ -2308,7 +2343,10 @@ worker_cleanup(struct worker *w)
 		// Just drop all the actions we see by forwarding them to task_do_close_cb()
 		t->close_cb = NULL;
 		task_lock(t, FLG_CL);
-		task_do_close_cb(t, action);
+		if ((action & FLG_CL) == 0) {
+			task_unlock(t, action);
+		}
+		task_do_close_cb(t);
 	}
 
 	// Now remove all our free notification entries
@@ -2595,8 +2633,7 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	// Validate the FD parameter
 	switch (type) {
 	case TASK_TYPE_IO:
-	case TASK_TYPE_LISTEN_PARENT:
-	case TASK_TYPE_LISTEN_CHILD:
+	case TASK_TYPE_LISTEN:
 		if (fd < 0) {
 			// Reject task creation for invalid fd's
 			errno = EBADF;
@@ -3220,7 +3257,8 @@ task_handle_listen_event_fail:
 	// Major accept failure.  Cancel the accept task
 	// Inform user that accept is now failing/gone
 	task_lock(t, FLG_CL);
-	task_do_close_cb(t, FLG_RD | FLG_LI);	// Unlocks task
+	task_unlock(t, FLG_RD | FLG_LI);
+	task_do_close_cb(t);	// Unlocks task
 } // task_handle_listen_event
 
 
@@ -3248,7 +3286,7 @@ task_handle_io_event(struct task *t, task_action_flag_t action)
 	if (action & FLG_RD) {
 		if (likely(t->rd_state == TASK_READ_STATE_BUFFER)) {
 			task_read_buffer(t, true);	// Unlocks the task for us
-		} else if (t->active_flags & FLG_LI) {
+		} else if (t->type == TASK_TYPE_LISTEN) {
 			task_handle_listen_event(t);	// Unlocks the task for us
 		} else if (t->rd_state == TASK_READ_STATE_VECTOR) {
 			task_read_vector(t, true);	// Unlocks the task for us
@@ -3302,6 +3340,8 @@ worker_check_timeouts(struct worker *w)
 		}
 
 		assert(t->worker == w);
+
+		task_pickup_flags(t);
 
 		if (t->tm_tt.node == timer_node) {
 			action = FLG_TM;
@@ -3623,6 +3663,8 @@ worker_process_notifyq(register struct worker *w)
 				continue;
 			}
 
+			task_pickup_flags(t);
+
 			// If Task is not in the Active State, unlock and go
 			if (unlikely(t->state != TASK_STATE_ACTIVE)) {
 				if (action != FLG_CL) {
@@ -3658,12 +3700,16 @@ worker_process_notifyq(register struct worker *w)
 
 			if (unlikely(action == FLG_CL)) {
 				// If we're an accept parent with children then shut them down now
-				if (t->type == TASK_TYPE_LISTEN_PARENT) {
-					task_shutdown_listen_children(w, t);
-					task_do_close_cb(t, FLG_LI);
+				if (t->type == TASK_TYPE_LISTEN) {
+					if (t->listen_child == 0) {
+						task_shutdown_listen_children(w, t);
+						task_lock(t, FLG_CL);
+						task_unlock(t, FLG_LI);
+						task_do_close_cb(t);
+					}
 					continue;
 				}
-				task_do_close_cb(t, FLG_CL);	// FLG_CL is always reset by task_do_close_cb
+				task_do_close_cb(t);	// FLG_CL is always reset by task_do_close_cb
 				continue;
 			}
 
@@ -3878,7 +3924,9 @@ worker_do_io_epoll(register struct worker *w)
 			continue;
 		}
 
-		// Check if the action got cancelled
+		task_pickup_flags(t);
+
+		// Check if the action got cancelled.
 		if ((t->active_flags & FLG_PW) == 0) {
 			task_unlock(t, FLG_PW);
 			continue;
@@ -3924,7 +3972,7 @@ worker_do_io_epoll_fail:
 		// Nice normal events.  Yay!
 
 		// Handle accepts directly, no queueing
-		if (unlikely((t->active_flags & FLG_LI) != 0)) {
+		if (unlikely(t->type == TASK_TYPE_LISTEN)) {
 			assert(revents == EPOLLIN);
 			task_handle_io_event(t, FLG_RD);
 			continue;
@@ -4287,13 +4335,14 @@ instance_listen_balance(struct task *t)
 		}
 
 		// Create a child task to look after the socket. Ensure to specify the worker for the new task
-		if ((nt = task_create(i, TASK_TYPE_LISTEN_CHILD, nfd, w, t->close_cb_data, t->close_cb, false)) == NULL) {
+		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->close_cb_data, t->close_cb, false)) == NULL) {
 			perror("instance_listen_balance->task_create");
 			continue;
 		}
 
 		// Convert new task to an listener type and inform task to expect incoming events
 		memcpy(&nt->dormant->addr, &t->dormant->addr, t->dormant->addrlen);
+		nt->listen_child = 1;
 		nt->dormant->addrlen = t->dormant->addrlen;
 		nt->accept_cb = t->accept_cb;
 		nt->accept_cb_data = t->accept_cb_data;
@@ -5186,7 +5235,8 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	if (t == NULL) return -1;	// errno already set
 
 	// Convert this task to a parent listener type and inform task to expect incoming events
-	t->type = TASK_TYPE_LISTEN_PARENT;
+	t->type = TASK_TYPE_LISTEN;
+	t->listen_child = 0;
 	t->accept_cb = accept_cb;
 	t->accept_cb_data = accept_cb_data;
 	i = w->instance;

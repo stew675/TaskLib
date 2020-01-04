@@ -39,6 +39,9 @@
 // quickly find any active TFD's within the pool that probably should not still be active
 // #define TFD_POOL_DEBUG
 
+// Uncomment to have the sizes of various structures printed out at startup
+// #define DEBUG_SIZES
+
 // General tuning/limit settings
 #define TASK_MAX_IO_DEPTH	2		// Max depth IO nested callbacks can be before queueing
 #define TASK_MAX_IO_UNIT	32768		// The maximum amount that may be read/written in one go
@@ -66,7 +69,7 @@
 // fairly frequently, and so can cause excessive CPU cache contention misses if there are too many,
 // which will negatively impact overall performance.  Values in the low-middling 100's appear to be
 // good compromise values
-#define	TASK_MAX_TFD_LOCKS		(509)
+#define	TASK_MAX_TFD_LOCKS		(127)
 #define TFDI_TO_LOCK_INDEX(tfdi)	(tfdi % TASK_MAX_TFD_LOCKS)
 
 // Uncomment to enable use of ticketed spinlocks, instead of adaptive pthread mutexes.  The main
@@ -203,7 +206,6 @@ struct task_dormant {
 	// notifyqlen_locked is updated by an atomic count operation.  We want to keep it on its own CPU
 	// cache line (64 bytes width) as that will get flushed when it gets updated.
 __attribute__ ((aligned(64))) uint64_t	notifyqlen_locked;	// Number of locked notifyq entries this task has
-	int64_t				age;			// Time this task was created
 	uint32_t			migrations;		// Number of times the task has migrated
 	int32_t				tfd_iteration;		// The iteration on the TFD node
 	struct ntfyq_list		listen_children;	// The list of child accept tasks
@@ -233,7 +235,7 @@ struct task {
 	struct epoll_event		ev;			// The current epoll events we're waiting on
 	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 	struct worker			*worker;		// The current io worker task is bound to
-	struct worker			*preferred_worker;	// To initiate task io worker migration
+	struct locked_action		*active_flags_locked;	// Queue of locked actions
 	int32_t				fd;			// The actual system socket FD we're working on
 	int32_t				cb_errno;		// Errno we want to propagate on callbacks
 	uint32_t			io_depth;		// How many direct calls to allow before queueing
@@ -309,7 +311,8 @@ struct task {
 	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
 	void				*connect_cb_data;
 	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
-	struct locked_action		*active_flags_locked;	// Queue of locked actions
+	int64_t				age;			// Time this task was created
+	struct worker			*preferred_worker;	// To initiate task io worker migration
 	struct task			*task_next;		// List of free tasks
 	struct task_dormant		*dormant;
 
@@ -548,7 +551,7 @@ task_dump(struct task *t)
 		break;
 	}
 	fprintf(stderr, "FD = %d, errno = %d, age = %ld, migrations = %d\n",
-			t->fd, t->cb_errno, t->dormant->age, t->dormant->migrations);
+			t->fd, t->cb_errno, t->age, t->dormant->migrations);
 	fprintf(stderr, "\n");
 } // task_dump
 
@@ -841,7 +844,7 @@ task_init(struct task *t, uint32_t tfdi)
 
 	t->dormant = __thr_current_instance->tfd_dormant + tfdi;
 	t->dormant->tfd_iteration = iteration;
-	t->dormant->age = get_time_us(TASK_TIME_COARSE);		// Set the age
+	t->age = get_time_us(TASK_TIME_COARSE);		// Set the age
 	STAILQ_INIT(&t->dormant->listen_children);
 
 	t->state = TASK_STATE_UNUSED;
@@ -880,7 +883,6 @@ task_put_locked_action(uint32_t tfdi, struct locked_action *lact)
 {
 	register uint64_t lock_index = TFDI_TO_LOCK_INDEX(tfdi);
 
-	memset(lact, 0, sizeof(*lact));
 	lact->next = __thr_current_instance->tfd_locks[lock_index].free_actions;
 	__thr_current_instance->tfd_locks[lock_index].free_actions = lact;
 } // task_put_locked_action
@@ -897,7 +899,7 @@ task_get_locked_action(uint32_t tfdi)
 	if (lact) {
 		__thr_current_instance->tfd_locks[lock_index].free_actions = lact->next;
 		lact->next = NULL;
-		free(lact);
+		return lact;
 	}
 	lact = calloc(1, sizeof(struct locked_action));
 	return lact;
@@ -905,45 +907,42 @@ task_get_locked_action(uint32_t tfdi)
 
 
 static void
-task_pickup_flags(struct task *t)
+task_pickup_flags(register struct task *t)
 {
-	assert(lockless_worker(t->worker));
-	if (t->active_flags_locked) {
-		struct locked_action *lalr = NULL, *lal = NULL, *tmp;
-		uint32_t tfdi = t->tfd_index;
+	register struct locked_action *lalr = NULL, *lal = NULL, *tmp;
+	register uint32_t tfdi = t->tfd_index;
 
-		tfd_lock(tfdi);
-		lalr = t->active_flags_locked;
-		t->active_flags_locked = NULL;
-		tfd_unlock(tfdi);
+	tfd_lock(tfdi);
+	lalr = t->active_flags_locked;
+	t->active_flags_locked = NULL;
+	tfd_unlock(tfdi);
 
-		// Now reverse the order
-		while ((tmp = lalr) != NULL) {
-			lalr = tmp->next;
-			tmp->next = lal;
-			lal = tmp;
-		}
-
-		// Now play it back and apply to the active_flags
-		while ((tmp = lal) != NULL) {
-			if (tmp->action & FLG_DRP) {
-				t->active_flags &= ~(tmp->action);
-			} else {
-				t->active_flags |= tmp->action;
-			}
-			lal = tmp->next;
-			tmp->next = lalr;
-			lalr = tmp;
-		}
-
-		// Now free the list
-		tfd_lock(tfdi);
-		while ((tmp = lalr) != NULL) {
-			lalr = tmp->next;
-			task_put_locked_action(tfdi, tmp);
-		}
-		tfd_unlock(tfdi);
+	// Now reverse the order
+	while ((tmp = lalr) != NULL) {
+		lalr = tmp->next;
+		tmp->next = lal;
+		lal = tmp;
 	}
+
+	// Now play it back and apply to the active_flags
+	while ((tmp = lal) != NULL) {
+		if (tmp->action & FLG_DRP) {
+			t->active_flags &= ~(tmp->action);
+		} else {
+			t->active_flags |= tmp->action;
+		}
+		lal = tmp->next;
+		tmp->next = lalr;
+		lalr = tmp;
+	}
+
+	// Now free the list
+	tfd_lock(tfdi);
+	while ((tmp = lalr) != NULL) {
+		lalr = tmp->next;
+		task_put_locked_action(tfdi, tmp);
+	}
+	tfd_unlock(tfdi);
 } // task_pickup_flags
 
 
@@ -971,7 +970,9 @@ task_lock(struct task *t, task_action_flag_t action)
 		tfd_unlock(tfdi);
 		return;
 	} else {
-		task_pickup_flags(t);
+		if (t->active_flags_locked) {
+			task_pickup_flags(t);
+		}
 		t->active_flags |= action;
 	}
 } // task_lock
@@ -1003,7 +1004,9 @@ task_unlock(struct task *t, task_action_flag_t action)
 		return;
 	}
 
-	task_pickup_flags(t);
+	if (t->active_flags_locked) {
+		task_pickup_flags(t);
+	}
 	t->active_flags &= ~(action);
 	if (unlikely(t->state == TASK_STATE_DESTROY)) {
 		if ((t->active_flags == 0) && (t->notifyqlen == 0)) {
@@ -1107,7 +1110,9 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 			return NULL;
 		}
 
-		task_pickup_flags(t);
+		if (t->active_flags_locked) {
+			task_pickup_flags(t);
+		}
 		t->active_flags |= action;
 	}
 
@@ -2030,7 +2035,7 @@ task_do_readv_cb(struct task *t, ssize_t result)
 
 	if (likely(t->worker == __thr_current_worker)) {
 		__thr_preferred_worker = __thr_current_worker;
-		__thr_preferred_age = t->dormant->age;
+		__thr_preferred_age = t->age;
 	} else {
 		__thr_preferred_worker = NULL;
 	}
@@ -2071,7 +2076,7 @@ task_do_read_cb(struct task *t, ssize_t result)
 
 	if (likely(t->worker == __thr_current_worker)) {
 		__thr_preferred_worker = __thr_current_worker;
-		__thr_preferred_age = t->dormant->age;
+		__thr_preferred_age = t->age;
 	} else {
 		__thr_preferred_worker = NULL;
 	}
@@ -2145,7 +2150,7 @@ task_do_writev_cb(struct task *t, ssize_t result)
 
 	if (likely(t->worker == __thr_current_worker)) {
 		__thr_preferred_worker = __thr_current_worker;
-		__thr_preferred_age = t->dormant->age;
+		__thr_preferred_age = t->age;
 	} else {
 		__thr_preferred_worker = NULL;
 	}
@@ -2186,7 +2191,7 @@ task_do_write_cb(struct task *t, ssize_t result)
 
 	if (likely(t->worker == __thr_current_worker)) {
 		__thr_preferred_worker = __thr_current_worker;
-		__thr_preferred_age = t->dormant->age;
+		__thr_preferred_age = t->age;
 	} else {
 		__thr_preferred_worker = NULL;
 	}
@@ -3446,7 +3451,9 @@ worker_check_timeouts(struct worker *w)
 
 		assert(t->worker == w);
 
-		task_pickup_flags(t);
+		if (t->active_flags_locked) {
+			task_pickup_flags(t);
+		}
 
 		if (t->tm_tt.node == timer_node) {
 			action = FLG_TM;
@@ -3768,7 +3775,9 @@ worker_process_notifyq(register struct worker *w)
 				continue;
 			}
 
-			task_pickup_flags(t);
+			if (t->active_flags_locked) {
+				task_pickup_flags(t);
+			}
 
 			// If Task is not in the Active State, unlock and go
 			if (unlikely(t->state != TASK_STATE_ACTIVE)) {
@@ -4029,7 +4038,9 @@ worker_do_io_epoll(register struct worker *w)
 			continue;
 		}
 
-		task_pickup_flags(t);
+		if (t->active_flags_locked) {
+			task_pickup_flags(t);
+		}
 
 		// Check if the action got cancelled.
 		if ((t->active_flags & FLG_PW) == 0) {
@@ -4988,7 +4999,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	if (__thr_preferred_worker != NULL) {
 		if (__thr_preferred_worker != __thr_current_worker) {
 			if (t->preferred_worker == NULL) {
-				if (__thr_preferred_age < t->dormant->age) {
+				if (__thr_preferred_age < t->age) {
 					// Move ourselves to the senior task worker
 					t->preferred_worker = __thr_preferred_worker;
 					task_notify_action(t, FLG_MG);
@@ -5060,7 +5071,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 
 	// Set worker migration preference if needed
 	if (unlikely(__thr_preferred_worker && (__thr_preferred_worker != __thr_current_worker))) {
-		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->dormant->age)) {
+		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->age)) {
 			// Move ourselves to the senior task worker
 			t->preferred_worker = __thr_preferred_worker;
 			task_notify_action(t, FLG_MG);
@@ -5151,7 +5162,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 
 	// Set worker migration preference if needed
 	if (__thr_preferred_worker && (__thr_preferred_worker != __thr_current_worker)) {
-		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->dormant->age)) {
+		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->age)) {
 			// Move ourselves to the senior task worker
 			t->preferred_worker = __thr_preferred_worker;
 			task_notify_action(t, FLG_MG);
@@ -5220,7 +5231,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 
 	// Set worker migration preference if needed
 	if (unlikely(__thr_preferred_worker && (__thr_preferred_worker != __thr_current_worker))) {
-		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->dormant->age)) {
+		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->age)) {
 			// Move ourselves to the senior task worker
 			t->preferred_worker = __thr_preferred_worker;
 			task_notify_action(t, FLG_MG);
@@ -5925,6 +5936,12 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	if (!initialised) {
 		struct sigaction sa[1];
 		int32_t ti;
+
+#ifdef DEBUG_SIZES
+		printf("sizeof(tfd_lock_t)=%lu\n", sizeof(tfd_lock_t));
+		printf("sizeof(struct task)=%lu\n", sizeof(struct task));
+		printf("sizeof(struct task_dormant)=%lu\n", sizeof(struct task_dormant));
+#endif
 
 		__page_size = sysconf(_SC_PAGESIZE);
 		memset(sa, 0, sizeof(struct sigaction));

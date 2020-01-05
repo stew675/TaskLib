@@ -951,12 +951,6 @@ task_lock(struct task *t, task_action_flag_t action)
 {
 	register uint32_t tfdi = t->tfd_index;
 
-	// Do not process IO timeout flags.  Their existence is
-	// already implied by their parent FLG_RD/FLG_WR flags
-	if (action & (FLG_RT | FLG_WT)) {
-		return;
-	}
-
 	if (!lockless_worker(t->worker)) {
 		struct locked_action *lact;
 
@@ -984,13 +978,7 @@ task_unlock(struct task *t, task_action_flag_t action)
 {
 	register uint32_t tfdi = t->tfd_index;
 
-	// Do not process IO timeout flags.  Their existence is
-	// already implied by their parent FLG_RD/FLG_WR flags
-	if (action & (FLG_RT | FLG_WT)) {
-		return;
-	}
-
-	if (!lockless_worker(t->worker)) {
+	if (unlikely(!lockless_worker(t->worker))) {
 		struct locked_action *lact;
 
 		tfd_lock(tfdi);
@@ -1076,7 +1064,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		return NULL;
 	}
 
-	if (!lockless_worker(w)) {
+	if (unlikely(!lockless_worker(w))) {
 		struct locked_action *lact;
 
 		tfd_lock(tfdi);
@@ -1637,11 +1625,18 @@ task_notify_action(struct task *t, task_action_flag_t action)
 		STAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
 		worker_unlock(w);
 	}
-	// Only call task lock if we actually need to
-	if ((t->active_flags & action) == 0) {
-		task_lock(t, action);
+	// Only call task_lock() if we actually need to
+	if (unlikely((t->active_flags & action) == 0)) {
+		// Do not lock IO timeout flags.  Their existence is
+		// already implied by their parent FLG_RD/FLG_WR flags
+		if ((action & (FLG_RT | FLG_WT)) == 0) {
+			task_lock(t, action);
+		}
 	}
-	worker_notify(w);
+	// Only call worker_notify() if we actually need to
+	if (unlikely(w->notified == false)) {
+		worker_notify(w);
+	}
 	return true;
 } // task_notify_action
 
@@ -1674,7 +1669,7 @@ task_activate_rd_timeout(register struct task *t)
 	register struct worker *w = t->worker;
 
 	// If we're not on the correct worker thread, queue a notify instead
-	if (!lockless_worker(w)) {
+	if (unlikely(!lockless_worker(w))) {
 		task_notify_action(t, FLG_RT);
 		return;
 	}
@@ -1695,7 +1690,7 @@ task_activate_wr_timeout(register struct task *t)
 	register struct worker *w = t->worker;
 
 	// If we're not on the correct worker thread, queue a notify instead
-	if (!lockless_worker(w)) {
+	if (unlikely(!lockless_worker(w))) {
 		task_notify_action(t, FLG_WT);
 		return;
 	}
@@ -2269,7 +2264,7 @@ handle_timer_timeout:
 	if (t->tm_tt.expiry_us != timeout_us) {
 		t->tm_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->tm_tt, t->tfd);
-		task_lock(t, action);
+		task_lock(t, FLG_TM);
 		return;
 	}
 
@@ -2302,7 +2297,6 @@ handle_read_timeout:
 	if (t->rd_tt.expiry_us != timeout_us) {
 		t->rd_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->rd_tt, t->tfd);
-		task_lock(t, action);
 		return;
 	}
 
@@ -2338,7 +2332,6 @@ handle_write_timeout:
 	if (t->wr_tt.expiry_us != timeout_us) {
 		t->wr_tt.expiry_us = timeout_us;
 		worker_timer_update(w, &t->wr_tt, t->tfd);
-		task_lock(t, action);
 		return;
 	}
 
@@ -2414,6 +2407,9 @@ worker_cleanup(struct worker *w)
 		}
 
 		// Just drop all the actions we see by forwarding them to task_do_close_cb()
+		if (action & (FLG_RT | FLG_WT)) {
+			continue;
+		}
 		t->dormant->close_cb = NULL;
 		task_lock(t, FLG_CL);
 		if ((action & FLG_CL) == 0) {
@@ -2488,7 +2484,6 @@ worker_destroy(struct worker *w)
 
 
 // Selects an io worker to send a task to.  We just do a round robin selection
-// XXX - Implement a more advanced load-balance worker selection here as needed
 static struct worker *
 worker_select_io_worker(struct instance *i, struct task *t, bool outgoing)
 {
@@ -3376,7 +3371,7 @@ static void
 worker_check_timeouts(struct worker *w)
 {
 	// Pickup new timer heap entries from the timer cool-off lists as needed
-	if (w->curtime_us > w->colt_next) {
+	if (unlikely(w->curtime_us > w->colt_next)) {
 		worker_timer_switch_lists(w);
 	}
 
@@ -3388,7 +3383,7 @@ worker_check_timeouts(struct worker *w)
 		register struct task *t;
 
 		timer_node = pheap_get_min_node(w->timer_queue, (void **)&expiry_us, (void **)&data);
-		if (unlikely(timer_node == NULL)) {
+		if (timer_node == NULL) {
 			break;
 		}
 
@@ -3404,9 +3399,6 @@ worker_check_timeouts(struct worker *w)
 
 		// Determine which timeout fired
 		t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
-		if (unlikely(t == NULL)) {
-			continue;
-		}
 
 		assert(t->worker == w);
 
@@ -3414,41 +3406,51 @@ worker_check_timeouts(struct worker *w)
 			task_pickup_flags(t);
 		}
 
-		if (t->tm_tt.node == timer_node) {
-			action = FLG_TM;
-			if ((t->active_flags & FLG_TM) == 0) {
-				// The timer got cancelled
+		if (likely(t->state == TASK_STATE_ACTIVE)) {
+			if (t->tm_tt.node == timer_node) {
+				action = FLG_TM;
+				if ((t->active_flags & FLG_TM) == 0) {
+					// The timer got cancelled
+					task_cancel_timer(t, FLG_TM);
+					task_unlock(t, FLG_TM);
+					continue;
+				}
+			} else if (t->rd_tt.node == timer_node) {
+				action = FLG_RT;
+				if ((t->active_flags & FLG_RD) == 0) {
+					// The read for this timeout isn't active
+					task_cancel_timer(t, FLG_RT);
+					continue;
+				}
+			} else if (t->wr_tt.node == timer_node) {
+				action = FLG_WT;
+				if ((t->active_flags & FLG_WR) == 0) {
+					// The write for this timeout isn't active
+					task_cancel_timer(t, FLG_WT);
+					continue;
+				}
+			} else {
+				// We have a dangling node with no owner?
+				assert(0);
+			}
+
+			task_do_timeout_cb(t, action, expiry_us);	// Unlocks the task for us
+		} else if (t->state == TASK_STATE_DESTROY) {
+			if (t->tm_tt.node == timer_node) {
 				task_cancel_timer(t, FLG_TM);
 				task_unlock(t, FLG_TM);
-				continue;
-			}
-		} else if (t->rd_tt.node == timer_node) {
-			action = FLG_RT;
-			if ((t->active_flags & FLG_RD) == 0) {
-				// The read for this timeout isn't active
+			} else if (t->rd_tt.node == timer_node) {
 				task_cancel_timer(t, FLG_RT);
-				continue;
-			}
-		} else if (t->wr_tt.node == timer_node) {
-			action = FLG_WT;
-			if ((t->active_flags & FLG_WR) == 0) {
-				// The write for this timeout isn't active
+			} else if (t->wr_tt.node == timer_node) {
 				task_cancel_timer(t, FLG_WT);
-				continue;
+			} else {
+				// We have a dangling node with no owner?
+				assert(0);
 			}
 		} else {
-			// We have a dangling node with no owner?
+			// There should never be active timers left on an inactive task
 			assert(0);
 		}
-
-		// If Task is in Destroy State, unlock and go
-		if (unlikely(t->state == TASK_STATE_DESTROY)) {
-			task_cancel_timer(t, action);
-			task_unlock(t, action);
-			continue;
-		}
-
-		task_do_timeout_cb(t, action, expiry_us);	// Unlocks the task for us
 	}
 } // worker_check_timeouts
 
@@ -3724,7 +3726,7 @@ worker_process_notifyq(register struct worker *w)
 
 			t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
 
-			if (unlikely(locked)) {
+			if (locked) {
 				ck_pr_dec_64(&t->dormant->notifyqlen_locked);
 			} else {
 				t->notifyqlen--;
@@ -3749,8 +3751,8 @@ worker_process_notifyq(register struct worker *w)
 			}
 
 			// Check if the action got cancelled.  Allow close and io timeouts through though
-			if ((action & (FLG_CL | FLG_WT | FLG_RT)) == 0) {
-				if ((t->active_flags & action) == 0) {
+			if ((t->active_flags & action) == 0) {
+				if ((action & (FLG_CL | FLG_WT | FLG_RT)) == 0) {
 					task_unlock(t, action);
 					continue;
 				}
@@ -3786,10 +3788,10 @@ worker_process_notifyq(register struct worker *w)
 			}
 
 			if (likely(!!(action & (FLG_RT | FLG_WT)))) {
-				if (action == FLG_RT) {
-					task_activate_rd_timeout(t);
-				} else {
+				if (action == FLG_WT) {
 					task_activate_wr_timeout(t);
+				} else {
+					task_activate_rd_timeout(t);
 				}
 				continue;
 			}
@@ -3835,8 +3837,8 @@ worker_process_notifyq(register struct worker *w)
 			assert(0);
 		}
 
-		if (num_processed > 0) {
-			if (locked) {
+		if (likely(num_processed > 0)) {
+			if (unlikely(locked)) {
 				// Concat any remainder back to the actual lists
 				worker_lock(w);
 				w->notifyqlen_locked -= num_processed;
@@ -3951,7 +3953,7 @@ worker_do_io_epoll(register struct worker *w)
 	while (true) {
 		wait_time = get_next_epoll_timeout_ms(w);
 		nfds = epoll_wait(w->gepfd, w->events, w->max_events, wait_time);
-		if (nfds < 0) {
+		if (unlikely(nfds < 0)) {
 			if (errno == EINTR) {
 				continue;
 			}
@@ -3976,7 +3978,7 @@ worker_do_io_epoll(register struct worker *w)
 	}
 
 	// Scan through the list of all the events we've received
-	for (int n = 0; likely(n < nfds); n++) {
+	for (int n = 0; n < nfds; n++) {
 		register int64_t tfd = (int64_t)w->events[n].data.u64;
 		register uint32_t tfdi = (uint32_t)(tfd & 0xffffffff);
 		register uint32_t revents = w->events[n].events;
@@ -4001,12 +4003,12 @@ worker_do_io_epoll(register struct worker *w)
 			continue;
 		}
 
-		if (t->active_flags_locked) {
+		if (unlikely(t->active_flags_locked != NULL)) {
 			task_pickup_flags(t);
 		}
 
 		// Check if the action got cancelled.
-		if ((t->active_flags & FLG_PW) == 0) {
+		if (unlikely((t->active_flags & FLG_PW) == 0)) {
 			task_unlock(t, FLG_PW);
 			continue;
 		}
@@ -4217,7 +4219,6 @@ worker_start_failed:
 
 
 // Create a new worker state and initialise it
-// XXX - Implement a CPU scheduling affinity selection mechanism for better multi-processing efficiency
 static struct worker *
 worker_create(struct instance *i, int worker_type)
 {

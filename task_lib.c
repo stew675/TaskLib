@@ -1532,25 +1532,10 @@ instance_notify(struct instance *i)
 
 
 static struct ntfyq *
-worker_notify_get_free_ntfyq(struct worker *w)
+worker_notify_get_free_ntfyq(register struct worker *w)
 {
 	register struct ntfyq *tq = NULL;
 	register size_t batch_size, n;
-
-	if (likely(lockless_worker(w))) {
-		if (likely((tq = STAILQ_FIRST(&w->freeq)) != NULL)) {
-			STAILQ_REMOVE_HEAD(&w->freeq, list);
-			return tq;
-		}
-	} else {
-		worker_lock(w);
-		if (likely((tq = STAILQ_FIRST(&w->freeq_locked)) != NULL)) {
-			STAILQ_REMOVE_HEAD(&w->freeq_locked, list);
-			worker_unlock(w);
-			return tq;
-		}
-		worker_unlock(w);
-	}
 
 	// Grab an aligned system page of memory, and we'll dice it up ourselves
 	if ((tq = aligned_alloc(__page_size, __page_size)) == NULL) {
@@ -1587,7 +1572,7 @@ worker_notify_get_free_ntfyq(struct worker *w)
 
 // Must be called with the task lock held. 
 static bool
-task_notify_action(struct task *t, task_action_flag_t action)
+task_notify_action(register struct task *t, register task_action_flag_t action)
 {
 	register int64_t tfd = t->tfd;
 	register struct ntfyq *tq = NULL;
@@ -1607,27 +1592,48 @@ task_notify_action(struct task *t, task_action_flag_t action)
 		t->state = TASK_STATE_DESTROY;
 	}
 
-	// Get free action from the task worker's free notifyq list
-	tq = worker_notify_get_free_ntfyq(w);
-	if (unlikely(tq == NULL)) {
-		assert(tq != NULL);	// Out of memory
-		return false;
-	}
-
-	tq->tfd = tfd;
-	tq->action = action;
-
 	if (likely(lockless_worker(w))) {
+		if (likely((tq = STAILQ_FIRST(&w->freeq)) != NULL)) {
+			STAILQ_REMOVE_HEAD(&w->freeq, list);
+		} else {
+			tq = worker_notify_get_free_ntfyq(w);
+			if (unlikely(tq == NULL)) {
+				assert(tq != NULL);	// Out of memory
+				return false;
+			}
+		}
+
+		tq->tfd = tfd;
+		tq->action = action;
+
 		w->notifyqlen++;
 		t->notifyqlen++;
 		STAILQ_INSERT_TAIL(&w->notifyq, tq, list);
 	} else {
 		ck_pr_inc_64(&t->dormant->notifyqlen_locked);
 		worker_lock(w);
+		if ((tq = STAILQ_FIRST(&w->freeq_locked)) != NULL) {
+			STAILQ_REMOVE_HEAD(&w->freeq_locked, list);
+		} else {
+			// Can't be holding the worker lock when
+			// calling worker_notify_get_free_ntfyq
+			worker_unlock(w);
+			tq = worker_notify_get_free_ntfyq(w);
+			if (unlikely(tq == NULL)) {
+				assert(tq != NULL);	// Out of memory
+				return false;
+			}
+			worker_lock(w);
+		}
+
+		tq->tfd = tfd;
+		tq->action = action;
+
 		w->notifyqlen_locked++;
 		STAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
 		worker_unlock(w);
 	}
+
 	// Only call task_lock() if we actually need to
 	if (unlikely((t->active_flags & action) == 0)) {
 		// Do not lock IO timeout flags.  Their existence is
@@ -1636,6 +1642,7 @@ task_notify_action(struct task *t, task_action_flag_t action)
 			task_lock(t, action);
 		}
 	}
+
 	// Only call worker_notify() if we actually need to
 	if (unlikely(w->notified == false)) {
 		worker_notify(w);
@@ -4445,7 +4452,23 @@ instance_listen_balance(struct task *t)
 		worker_unlock(w);
 
 		// Add the new listener to the parent listener list
-		struct ntfyq *ntq = worker_notify_get_free_ntfyq(w);
+		struct ntfyq *ntq = NULL;
+
+		if (lockless_worker(w)) {
+			if ((ntq = STAILQ_FIRST(&w->freeq)) != NULL) {
+				STAILQ_REMOVE_HEAD(&w->freeq, list);
+			}
+		} else {
+			worker_lock(w);
+			if ((ntq = STAILQ_FIRST(&w->freeq_locked)) != NULL) {
+				STAILQ_REMOVE_HEAD(&w->freeq_locked, list);
+			}
+			worker_unlock(w);
+		}
+		if (ntq == NULL) {
+			ntq = worker_notify_get_free_ntfyq(w);
+			assert(ntq != NULL);	// Out of memory
+		}
 		ntq->tfd = nt->tfd;
 		ntq->action = FLG_LI;
 		STAILQ_INSERT_TAIL(&t->dormant->listen_children, ntq, list);

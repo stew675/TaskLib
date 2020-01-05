@@ -164,8 +164,6 @@ typedef enum {
 	FLG_MG	=	0x00000200,		// A Migration Event is active
 	FLG_CL	=	0x00000400,		// A Close Event is active
 	FLG_BND	=	0x00000800,		// A Bind operation is in progress
-	FLG_PI	=	0x00001000,		// Task is waiting for a POLLIN event
-	FLG_PO	=	0x00002000,		// Task is waiting for a POLLOUT event
 	FLG_DBG	=	0x00004000,		// Task Debug API in progress
 	FLG_CCB =	0x00008000,		// A Close CallBack API is in progress
 	FLG_TC	=	0x00010000,		// A Timer Cancel API is in progress
@@ -359,6 +357,7 @@ struct worker {
 	struct epoll_event 		*events;
 	struct pollfd 			*pollfds;
 	struct task			*listeners;
+	bool				poll_listeners;
 	int32_t				max_events;
 	int32_t				max_pollfds;
 	int				gepfd;			// General epoll_wait fd
@@ -1614,16 +1613,6 @@ task_notify_action(struct task *t, task_action_flag_t action)
 	tq->tfd = tfd;
 	tq->action = action;
 
-	if (action == FLG_RD) {
-		// If it's an listener.  Queue it in front of everything else
-		if (unlikely(t->type == TASK_TYPE_LISTEN)) {
-			goto task_notify_action_queue_first;
-		}
-		goto task_notify_action_queue;
-	}
-
-	// Anything else left over falls through and is queued
-task_notify_action_queue:
 	if (likely(lockless_worker(w))) {
 		w->notifyqlen++;
 		t->notifyqlen++;
@@ -1633,23 +1622,6 @@ task_notify_action_queue:
 		worker_lock(w);
 		w->notifyqlen_locked++;
 		STAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
-		worker_unlock(w);
-	}
-	task_lock(t, action);
-	worker_notify(w);
-	return true;
-
-task_notify_action_queue_first:
-	// Queue it at the head of the notifyq
-	if (lockless_worker(w)) {
-		w->notifyqlen++;
-		t->notifyqlen++;
-		STAILQ_INSERT_HEAD(&w->notifyq, tq, list);
-	} else {
-		ck_pr_inc_64(&t->dormant->notifyqlen_locked);
-		worker_lock(w);
-		w->notifyqlen_locked++;
-		STAILQ_INSERT_HEAD(&w->notifyq_locked, tq, list);
 		worker_unlock(w);
 	}
 	task_lock(t, action);
@@ -1671,14 +1643,12 @@ task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
 	} else if (us_from_now < TASK_TIMEOUT_ONE_YEAR) {
 		// Set to the current worker time plus the us_from_now plus half
 		// the worker's maximum epoll timeout.  It'll be close enough
-		new_tm_us = get_time_us(TASK_TIME_COARSE) + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
+		new_tm_us = __thr_current_worker->curtime_us + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
 	} else {
-		us_from_now = TASK_TIMEOUT_ONE_YEAR;
+		new_tm_us = __thr_current_worker->curtime_us + TASK_TIMEOUT_ONE_YEAR;
 	}
 
-	if (new_tm_us != *p_tm) {
-		*p_tm = new_tm_us;
-	}
+	*p_tm = new_tm_us;
 } // task_update_io_timeout
 
 
@@ -1756,6 +1726,8 @@ task_create_event_flag(register struct task *t)
 static int
 task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
+	register int res;
+
 	if (flags & EPOLLIN) {
 		if (unlikely(t->rd_shut)) {
 			errno = EPIPE;
@@ -1773,43 +1745,29 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 	t->ev.events |= flags;
 
 	if (unlikely(t->epfd < 0)) {
-		// We need to to EPOLL_CTL_ADD instead
-		if (task_create_event_flag(t) < 0) {
-			t->ev.events &= ~flags;
-			if (flags & EPOLLIN) {
-				task_unlock(t, FLG_RD);
-			}
-			if (flags & EPOLLOUT) {
-				task_unlock(t, FLG_WR);
-			}
-			return -1;
-		}
+		res = task_create_event_flag(t);	// We need to do EPOLL_CTL_ADD instead
 	} else {
-		if (unlikely(epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev) < 0)) {
-			t->ev.events &= ~flags;
-			if (flags & EPOLLIN) {
-				task_unlock(t, FLG_RD);
-			}
-			if (flags & EPOLLOUT) {
-				task_unlock(t, FLG_WR);
-			}
-			return -1;
+		res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
+	}
+
+	if (unlikely(res < 0)) {
+		t->ev.events &= ~flags;
+		if (flags & EPOLLIN) {
+			task_unlock(t, FLG_RD);
 		}
+		if (flags & EPOLLOUT) {
+			task_unlock(t, FLG_WR);
+		}
+		return -1;
 	}
 
 	t->committed_events = (t->ev.events & 0xff);
 
 	if (flags & EPOLLIN) {
-		if (flags & EPOLLOUT) {
-			task_lock(t, FLG_PI | FLG_PO);
-			task_activate_rd_timeout(t);
-			task_activate_wr_timeout(t);
-		} else {
-			task_lock(t, FLG_PI);
-			task_activate_rd_timeout(t);
-		}
-	} else if (likely(flags & EPOLLOUT)) {
-		task_lock(t, FLG_PO);
+		task_activate_rd_timeout(t);
+	}
+
+	if (flags & EPOLLOUT) {
 		task_activate_wr_timeout(t);
 	}
 
@@ -1828,16 +1786,6 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 		return 0;
 	}
 
-	if (flags & EPOLLIN) {
-		if (flags & EPOLLOUT) {
-			task_unlock(t, FLG_PI | FLG_PO);
-		} else {
-			task_unlock(t, FLG_PI);
-		}
-	} else if (likely(flags & EPOLLOUT)) {
-		task_unlock(t, FLG_PO);
-	}
-
 	// Lower the flags on the task
 	t->ev.events &= ~flags;
 
@@ -1845,6 +1793,7 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 	// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
 	// if there's no other IN/OUT flag still set
 	if ((t->ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
+		t->committed_events = 0;
 		return 0;
 	}
 #endif
@@ -1968,7 +1917,7 @@ task_do_close_cb(struct task *t)
 			shutdown(t->fd, SHUT_RDWR);
 			close(t->fd);
 		}
-		task_unlock(t, FLG_PW | FLG_PI | FLG_PO);	// Disable All Poll Wait Flags Now
+		task_unlock(t, FLG_PW);		// Disable All Poll Wait Flags Now
 		t->epfd = -1;
 		t->fd = -1;
 		task_cancel_read(t);
@@ -3373,43 +3322,37 @@ task_handle_listen_event_fail:
 
 
 static void
-task_handle_io_event(struct task *t, task_action_flag_t action)
+task_handle_wr_event(struct task *t)
 {
-	// At this point, we have a task, and it's already locked for us
-
 	// Write stuff out as needed
-	if (action & FLG_WR) {
-		if (likely(t->wr_state == TASK_WRITE_STATE_BUFFER)) {
-			task_write_buffer(t, true);		// Unlocks the task for us
-		} else if (unlikely(t->type == TASK_TYPE_CONNECT)) {
-			task_handle_connect_event(t);		// Unlocks the task for us
-		} else if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
-			task_write_vector(t, true);		// Unlocks the task for us
-		} else {
-			// Do nothing
-			task_unlock(t, action);
-		}
-		return;
+	if (likely(t->wr_state == TASK_WRITE_STATE_BUFFER)) {
+		task_write_buffer(t, true);		// Unlocks the task for us
+	} else if (unlikely(t->type == TASK_TYPE_CONNECT)) {
+		task_handle_connect_event(t);		// Unlocks the task for us
+	} else if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
+		task_write_vector(t, true);		// Unlocks the task for us
+	} else {
+		// Do nothing
+		task_unlock(t, FLG_WR);
 	}
+} // task_handle_wr_event
 
+
+static void
+task_handle_rd_event(struct task *t)
+{
 	// Read in whatever as directed
-	if (action & FLG_RD) {
-		if (likely(t->rd_state == TASK_READ_STATE_BUFFER)) {
-			task_read_buffer(t, true);	// Unlocks the task for us
-		} else if (t->type == TASK_TYPE_LISTEN) {
-			task_handle_listen_event(t);	// Unlocks the task for us
-		} else if (t->rd_state == TASK_READ_STATE_VECTOR) {
-			task_read_vector(t, true);	// Unlocks the task for us
-		} else {
-			// Do nothing
-			task_unlock(t, action);
-		}
-		return;
+	if (likely(t->rd_state == TASK_READ_STATE_BUFFER)) {
+		task_read_buffer(t, true);	// Unlocks the task for us
+	} else if (t->type == TASK_TYPE_LISTEN) {
+		task_handle_listen_event(t);	// Unlocks the task for us
+	} else if (t->rd_state == TASK_READ_STATE_VECTOR) {
+		task_read_vector(t, true);	// Unlocks the task for us
+	} else {
+		// Do nothing
+		task_unlock(t, FLG_RD);
 	}
-
-	// Task is still locked.  Unlock it here and go
-	task_unlock(t, action);
-} // task_handle_io_event
+} // task_handle_rd_event
 
 
 // Process anything that has expired on the worker's timeout queue
@@ -3831,12 +3774,12 @@ worker_process_notifyq(register struct worker *w)
 
 			// IO actions are usually the most common. Test for them first
 			if (action == FLG_WR) {
-				task_handle_io_event(t, FLG_WR);	// Releases the task lock
+				task_handle_wr_event(t);	// Releases the task lock
 				continue;
 			}
 
 			if (action == FLG_RD) {
-				task_handle_io_event(t, FLG_RD);	// Releases the task lock
+				task_handle_rd_event(t);	// Releases the task lock
 				continue;
 			}
 
@@ -3991,6 +3934,7 @@ worker_do_io_epoll(register struct worker *w)
 
 	// Determine the initial time we want to be waiting in epoll for
 	// Wait for something to happen!
+	w->poll_listeners = true;
 	while (true) {
 		wait_time = get_next_epoll_timeout_ms(w);
 		nfds = epoll_wait(w->gepfd, w->events, w->max_events, wait_time);
@@ -4008,8 +3952,14 @@ worker_do_io_epoll(register struct worker *w)
 	w->curtime_us = get_time_us(TASK_TIME_PRECISE);
 	worker_check_timeouts(w);
 
-	if (nfds == 0) {
-		return;
+	if (nfds < w->max_events) {
+		// No need to explicitly poll the listeners
+		// if we didn't cap-out for active events
+		w->poll_listeners = false;
+
+		if (nfds == 0) {
+			return;
+		}
 	}
 
 	// Scan through the list of all the events we've received
@@ -4058,11 +4008,11 @@ worker_do_io_epoll_fail:
 			task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
 			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 			if (t->active_flags & FLG_RD) {
-				task_handle_io_event(t, FLG_RD);	// Unlocks  the task
+				task_handle_rd_event(t);	// Unlocks  the task
 				continue;
 			}
 			if (t->active_flags & FLG_WR) {
-				task_handle_io_event(t, FLG_WR);	// Unlocks  the task
+				task_handle_wr_event(t);	// Unlocks  the task
 				continue;
 			}
 			task_unlock(t, FLG_PW);
@@ -4075,7 +4025,7 @@ worker_do_io_epoll_fail:
 			t->rd_shut = true;
 			if (t->active_flags & FLG_RD) {
 				task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
-				task_handle_io_event(t, FLG_RD);	// Unlocks  the task
+				task_handle_rd_event(t);	// Unlocks  the task
 				continue;
 			}
 			task_lower_event_flag(t, EPOLLRDHUP);
@@ -4090,7 +4040,7 @@ worker_do_io_epoll_fail:
 		// Handle accepts directly, no queueing
 		if (unlikely(t->type == TASK_TYPE_LISTEN)) {
 			assert(revents == EPOLLIN);
-			task_handle_io_event(t, FLG_RD);
+			task_handle_rd_event(t);
 			continue;
 		}
 
@@ -4099,22 +4049,21 @@ worker_do_io_epoll_fail:
 			if (revents & EPOLLOUT) {
 				// If get both, just queue both
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				task_notify_action(t, FLG_WR);			// Queue the write
-				task_handle_io_event(t, FLG_RD);		// Unlocks the task
-				continue;
-			} else {
-				task_lower_event_flag(t, EPOLLIN);
-				if (do_direct) {
-					task_handle_io_event(t, FLG_RD);	// Unlocks the task
-				} else {
-					task_notify_action(t, FLG_RD);
-				}
+				task_notify_action(t, FLG_WR);		// Queue the write
+				task_handle_rd_event(t);		// Unlocks the task
 				continue;
 			}
+			task_lower_event_flag(t, EPOLLIN);
+			if (do_direct) {
+				task_handle_rd_event(t);		// Unlocks the task
+			} else {
+				task_notify_action(t, FLG_RD);
+			}
+			continue;
 		} else if (revents & EPOLLOUT) {
 			task_lower_event_flag(t, EPOLLOUT);
 			if (do_direct) {
-				task_handle_io_event(t, FLG_WR);		// Unlocks the task
+				task_handle_wr_event(t);		// Unlocks the task
 			} else {
 				task_notify_action(t, FLG_WR);
 			}
@@ -4143,7 +4092,9 @@ worker_loop_io(void *arg)
 
 	while(w->state == WORKER_STATE_RUNNING) {
 		worker_do_io_epoll(w);
-		worker_poll_listeners(w);
+		if (w->poll_listeners) {
+			worker_poll_listeners(w);
+		}
 		worker_process_notifyq(w);
 	}
 

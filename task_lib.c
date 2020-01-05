@@ -1536,6 +1536,7 @@ worker_notify_get_free_ntfyq(register struct worker *w)
 {
 	register struct ntfyq *tq = NULL;
 	register size_t batch_size, n;
+	struct ntfyq_list freeq;
 
 	// Grab an aligned system page of memory, and we'll dice it up ourselves
 	if ((tq = aligned_alloc(__page_size, __page_size)) == NULL) {
@@ -1546,7 +1547,6 @@ worker_notify_get_free_ntfyq(register struct worker *w)
 
 	// Add all our new entries to a local list.  We can minimise
 	// the time we hold the worker lock for by doing it this way
-	struct ntfyq_list freeq;
 
 	STAILQ_INIT(&freeq);
 	for (n = 2; n < batch_size; n++) {
@@ -1593,7 +1593,8 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 	}
 
 	if (likely(lockless_worker(w))) {
-		if (likely((tq = STAILQ_FIRST(&w->freeq)) != NULL)) {
+		tq = STAILQ_FIRST(&w->freeq);
+		if (likely(tq != NULL)) {
 			STAILQ_REMOVE_HEAD(&w->freeq, list);
 		} else {
 			tq = worker_notify_get_free_ntfyq(w);
@@ -1612,7 +1613,8 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 	} else {
 		ck_pr_inc_64(&t->dormant->notifyqlen_locked);
 		worker_lock(w);
-		if ((tq = STAILQ_FIRST(&w->freeq_locked)) != NULL) {
+		tq = STAILQ_FIRST(&w->freeq_locked);
+		if (tq != NULL) {
 			STAILQ_REMOVE_HEAD(&w->freeq_locked, list);
 		} else {
 			// Can't be holding the worker lock when
@@ -1651,49 +1653,40 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 } // task_notify_action
 
 
-// Update the task expiry timeout for a socket operation
-static inline void
-task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
+// Calculate the expiry timeout for a socket operation
+static inline int64_t
+task_calculate_io_timeout(register int64_t us_from_now)
 {
-	register int64_t new_tm_us, old_tm_us = *p_tm;
-
-	if (unlikely(us_from_now < 0)) {
-		new_tm_us = TIMER_TIME_CANCEL;
-	} else if (us_from_now < 5000000) {
-		new_tm_us = get_time_us(TASK_TIME_PRECISE) + us_from_now;
-	} else if (us_from_now < TASK_TIMEOUT_ONE_YEAR) {
-		// Set to the current worker time plus the us_from_now plus half
-		// the worker's maximum epoll timeout.  It'll be close enough
-		new_tm_us = __thr_current_worker->curtime_us + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500);
-	} else {
-		new_tm_us = __thr_current_worker->curtime_us + TASK_TIMEOUT_ONE_YEAR;
+	if (us_from_now < 5000000) {
+		if (us_from_now < 0) {
+			return TIMER_TIME_CANCEL;
+		}
+		return (get_time_us(TASK_TIME_PRECISE) + us_from_now);
 	}
-
-	if (new_tm_us != old_tm_us) {
-		*p_tm = new_tm_us;
+	if (unlikely(us_from_now > TASK_TIMEOUT_ONE_YEAR)) {
+		return __thr_current_worker->curtime_us + TASK_TIMEOUT_ONE_YEAR;
 	}
-} // task_update_io_timeout
+	// Set to the current worker time plus the us_from_now plus half
+	// the worker's maximum epoll timeout.  It'll be close enough
+	return (__thr_current_worker->curtime_us + us_from_now + (TASK_MAX_EPOLL_WAIT_MS * 500));
+} // task_calculate_io_timeout
 
 
 static inline void
 task_activate_rd_timeout(register struct task *t)
 {
-	register struct worker *w = t->worker;
-
-	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
-	worker_timer_update(w, &t->rd_tt, t->tfd);
+	t->rd_tt.expiry_us = task_calculate_io_timeout(t->rd_tt.expires_in_us);
 	t->rd_tt.expires_in_us = TIMER_TIME_DESTROY;
+	worker_timer_update(t->worker, &t->rd_tt, t->tfd);
 } // task_activate_rd_timeout
 
 
 static inline void
 task_activate_wr_timeout(register struct task *t)
 {
-	register struct worker *w = t->worker;
-
-	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
-	worker_timer_update(w, &t->wr_tt, t->tfd);
+	t->wr_tt.expiry_us = task_calculate_io_timeout(t->wr_tt.expires_in_us);
 	t->wr_tt.expires_in_us = TIMER_TIME_DESTROY;
+	worker_timer_update(t->worker, &t->wr_tt, t->tfd);
 } // task_activate_wr_timeout
 
 
@@ -3696,7 +3689,7 @@ worker_process_notifyq(register struct worker *w)
 	// Start with locked list first, and then process the unlocked one
 	for (register uint32_t locked = 0; locked < 2; locked++) {
 		register uint32_t num_processed = 0;
-		struct ntfyq_list notifyq, freeq;
+		struct ntfyq_list notifyq;
 
 		// Check the notifyq lists
 		if (locked) {
@@ -3715,10 +3708,9 @@ worker_process_notifyq(register struct worker *w)
 			STAILQ_CONCAT(&notifyq, &w->notifyq);
 		}
 
-		STAILQ_INIT(&freeq);
-
 		w->curtime_us = get_time_us(TASK_TIME_PRECISE);
-		while (likely((tq = STAILQ_FIRST(&notifyq)) != NULL)) {
+
+		STAILQ_FOREACH(tq, &notifyq, list) {
 			register struct task *t = NULL;
 			register int64_t tfd;
 			register task_action_flag_t action;
@@ -3729,12 +3721,10 @@ worker_process_notifyq(register struct worker *w)
 				worker_do_timeout_check(w);
 			}
 
-			STAILQ_REMOVE_HEAD(&notifyq, list);
 			tfd = tq->tfd;
 			action = tq->action;
 			tq->tfd = TFD_NONE;
 			tq->action = FLG_NONE;
-			STAILQ_INSERT_HEAD(&freeq, tq, list);
 
 			t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
 
@@ -3853,21 +3843,20 @@ worker_process_notifyq(register struct worker *w)
 			assert(0);
 		}
 
+		// Concat any remainder back to the actual lists. Put the
+		// just processed entries at the front of the freeq
 		if (likely(num_processed > 0)) {
 			if (unlikely(locked)) {
-				// Concat any remainder back to the actual lists
 				worker_lock(w);
 				w->notifyqlen_locked -= num_processed;
-				STAILQ_CONCAT(&w->notifyq_locked, &notifyq);
-				STAILQ_CONCAT(&freeq, &w->freeq_locked);
-				STAILQ_CONCAT(&w->freeq_locked, &freeq);
+				STAILQ_CONCAT(&notifyq, &w->freeq_locked);
+				STAILQ_CONCAT(&w->freeq_locked, &notifyq);
 				worker_unlock(w);
 			} else {
 				// Concat any remainder back to the actual lists
 				w->notifyqlen -= num_processed;
-				STAILQ_CONCAT(&w->notifyq, &notifyq);
-				STAILQ_CONCAT(&freeq, &w->freeq);
-				STAILQ_CONCAT(&w->freeq, &freeq);
+				STAILQ_CONCAT(&notifyq, &w->freeq);
+				STAILQ_CONCAT(&w->freeq, &notifyq);
 			}
 		}
 	}
@@ -3876,7 +3865,7 @@ worker_process_notifyq(register struct worker *w)
 //#define VALIDATE_QLEN
 #ifdef VALIDATE_QLEN
 	uint64_t actual_len = 0;
-	TAILQ_FOREACH(tq, &w->notifyq, list) {
+	STAILQ_FOREACH(tq, &w->notifyq, list) {
 		actual_len++;
 	}
 

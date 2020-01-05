@@ -1405,7 +1405,7 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 	struct instance *i = __thr_current_instance;
 	struct worker *tw;
 
-	if (i->flags & TAKS_FLAGS_AFFINITY_DISABLE) {
+	if (i->flags & TASK_FLAGS_AFFINITY_DISABLE) {
 		t->preferred_worker = NULL;
 		return;
 	}
@@ -1422,7 +1422,9 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 
 		// At least set the incoming affinity for the TCP connection
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
-		setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu));
+		if (__thr_current_instance->flags & TASK_FLAGS_AFFINITY_NET) {
+			setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu));
+		}
 		return;
 	}
 
@@ -1436,7 +1438,9 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 
 		// At least set the incoming affinity for the TCP connection
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
-		setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &w->affined_cpu, sizeof(w->affined_cpu));
+		if (__thr_current_instance->flags & TASK_FLAGS_AFFINITY_NET) {
+			setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &w->affined_cpu, sizeof(w->affined_cpu));
+		}
 		return;
 	}
 } // task_set_initial_preferred_worker
@@ -1448,7 +1452,11 @@ worker_learn_cpu_affinity(struct task *t)
 	struct instance *i = __thr_current_instance;
 	int cpu;
 
-	if (i->flags & TAKS_FLAGS_AFFINITY_DISABLE) {
+	if (i->flags & TASK_FLAGS_AFFINITY_DISABLE) {
+		return;
+	}
+
+	if ((__thr_current_instance->flags & TASK_FLAGS_AFFINITY_CPU) == 0){
 		return;
 	}
 
@@ -1541,7 +1549,6 @@ worker_notify_get_free_ntfyq(struct worker *w)
 	if (likely(lockless_worker(w))) {
 		if (likely((tq = STAILQ_FIRST(&w->freeq)) != NULL)) {
 			STAILQ_REMOVE_HEAD(&w->freeq, list);
-			memset(tq, 0, sizeof(struct ntfyq));
 			return tq;
 		}
 	} else {
@@ -1561,19 +1568,25 @@ worker_notify_get_free_ntfyq(struct worker *w)
 	memset(tq, 0, __page_size);
 	batch_size = __page_size / sizeof(struct ntfyq);
 
-	// We don't use the first entry, but instead stick it on a worker list
-	// so we have a list of what memory to pass to free() later
+	// Add all our new entries to a local list.  We can minimise
+	// the time we hold the worker lock for by doing it this way
+	struct ntfyq_list freeq;
+
+	STAILQ_INIT(&freeq);
+	for (n = 2; n < batch_size; n++) {
+		STAILQ_INSERT_TAIL(&freeq, (tq + n), list);
+	}
+
+	// We don't use the first entry, but instead stick it on a worker
+	// list so we have a list of what memory to pass to free() later
 	worker_lock(w);
 	STAILQ_INSERT_TAIL(&w->notifyq_batches, tq, list);
 	if (likely(lockless_worker(w))) {
+		// Don't need to hold the lock if we're on the worker
 		worker_unlock(w);
-		for (n = 2; n < batch_size; n++) {
-			STAILQ_INSERT_TAIL(&w->freeq, (tq + n), list);
-		}
+		STAILQ_CONCAT(&w->freeq, &freeq);
 	} else {
-		for (n = 2; n < batch_size; n++) {
-			STAILQ_INSERT_TAIL(&w->freeq_locked, (tq + n), list);
-		}
+		STAILQ_CONCAT(&w->freeq_locked, &freeq);
 		worker_unlock(w);
 	}
 
@@ -1585,11 +1598,11 @@ worker_notify_get_free_ntfyq(struct worker *w)
 static bool
 task_notify_action(struct task *t, task_action_flag_t action)
 {
-	struct worker *w = t->worker;
 	register int64_t tfd = t->tfd;
 	register struct ntfyq *tq = NULL;
+	register struct worker *w = t->worker;
 
-	if (unlikely(w == NULL)) {	// This can sometimes be true during shutdown
+	if (unlikely(w == NULL)) {	// This can be true sometimes during shutdown
 		return false;
 	}
 
@@ -1624,7 +1637,10 @@ task_notify_action(struct task *t, task_action_flag_t action)
 		STAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
 		worker_unlock(w);
 	}
-	task_lock(t, action);
+	// Only call task lock if we actually need to
+	if ((t->active_flags & action) == 0) {
+		task_lock(t, action);
+	}
 	worker_notify(w);
 	return true;
 } // task_notify_action
@@ -3596,7 +3612,9 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 
 	if (tw->affined_cpu >= 0) {
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
-		setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu));
+		if (__thr_current_instance->flags & TASK_FLAGS_AFFINITY_NET) {
+			setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu));
+		}
 	}
 
 	// Wake up the target worker with the migration event that just happened
@@ -3755,45 +3773,40 @@ worker_process_notifyq(register struct worker *w)
 				continue;
 			}
 
-			if (unlikely(action == FLG_CL)) {
+			// It's a change action from here on.  Process the action we got
+
+			// IO actions are usually the most common. Test for them first
+			if (likely(!!(action & (FLG_RD | FLG_WR)))) {
+				if (action == FLG_WR) {
+					task_handle_wr_event(t);	// Releases the task lock
+				} else {
+					task_handle_rd_event(t);	// Releases the task lock
+				}
+				continue;
+			}
+
+			if (likely(!!(action & (FLG_RT | FLG_WT)))) {
+				if (action == FLG_RT) {
+					task_activate_rd_timeout(t);
+				} else {
+					task_activate_wr_timeout(t);
+				}
+				continue;
+			}
+
+			if (action == FLG_CL) {
 				// If we're an accept parent with children then shut them down now
 				if (t->type == TASK_TYPE_LISTEN) {
 					if (t->listen_child == 0) {
 						task_shutdown_listen_children(w, t);
-						task_lock(t, FLG_CL);
 						task_unlock(t, FLG_LI);
-						task_do_close_cb(t);
 					}
-					continue;
 				}
 				task_do_close_cb(t);	// FLG_CL is always reset by task_do_close_cb
 				continue;
 			}
 
-			// It's a change action from here on.  Process the action we got
-
-			// IO actions are usually the most common. Test for them first
-			if (action == FLG_WR) {
-				task_handle_wr_event(t);	// Releases the task lock
-				continue;
-			}
-
-			if (action == FLG_RD) {
-				task_handle_rd_event(t);	// Releases the task lock
-				continue;
-			}
-
-			if (action == FLG_RT) {
-				task_activate_rd_timeout(t);
-				continue;
-			}
-
-			if (action == FLG_WT) {
-				task_activate_wr_timeout(t);
-				continue;
-			}
-
-			if (likely(action == FLG_TM)) {
+			if (action == FLG_TM) {
 				task_update_timer(t);			// Releases the task lock
 				continue;
 			}
@@ -3999,29 +4012,29 @@ worker_do_io_epoll(register struct worker *w)
 		}
 
 		// Handle ERROR/HUP events first
-		if (unlikely(unlikely(!!(revents & EPOLLERR)) || unlikely(!!(revents & EPOLLHUP)))) {
-worker_do_io_epoll_fail:
+		if (unlikely(!!(revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)))) {
 			// Shutdown both connection sides and force an IO event
 			// which should make a system call to detect what happened
-			t->rd_shut = true;
-			t->wr_shut = true;
-			task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
-			if (t->active_flags & FLG_RD) {
-				task_handle_rd_event(t);	// Unlocks  the task
+			if (revents & (EPOLLERR | EPOLLHUP)) {
+worker_do_io_epoll_fail:
+				t->rd_shut = true;
+				t->wr_shut = true;
+				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
+				epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
+				if (t->active_flags & FLG_RD) {
+					task_handle_rd_event(t);	// Unlocks  the task
+					continue;
+				}
+				if (t->active_flags & FLG_WR) {
+					task_handle_wr_event(t);	// Unlocks  the task
+					continue;
+				}
+				task_unlock(t, FLG_PW);
+				task_notify_action(t, FLG_CL);
 				continue;
 			}
-			if (t->active_flags & FLG_WR) {
-				task_handle_wr_event(t);	// Unlocks  the task
-				continue;
-			}
-			task_unlock(t, FLG_PW);
-			task_notify_action(t, FLG_CL);
-			continue;
-		}
 
-		// Handle RDHUP case now
-		if (unlikely(!!(revents & EPOLLRDHUP))) {
+			// Must be a RDHUP then
 			t->rd_shut = true;
 			if (t->active_flags & FLG_RD) {
 				task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
@@ -4036,25 +4049,16 @@ worker_do_io_epoll_fail:
 		}
 
 		// Nice normal events.  Yay!
-
-		// Handle accepts directly, no queueing
-		if (unlikely(t->type == TASK_TYPE_LISTEN)) {
-			assert(revents == EPOLLIN);
-			task_handle_rd_event(t);
-			continue;
-		}
-
-		// Need to queue instead. Place the events on worker notifyq
 		if (revents & EPOLLIN) {
 			if (revents & EPOLLOUT) {
-				// If get both, just queue both
+				// Write is active too, just queue that
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				task_notify_action(t, FLG_WR);		// Queue the write
-				task_handle_rd_event(t);		// Unlocks the task
-				continue;
+				task_notify_action(t, FLG_WR);
+			} else {
+				task_lower_event_flag(t, EPOLLIN);
 			}
-			task_lower_event_flag(t, EPOLLIN);
-			if (do_direct) {
+			// Handle accepts directly, no queueing
+			if (do_direct || (t->type == TASK_TYPE_LISTEN)) {
 				task_handle_rd_event(t);		// Unlocks the task
 			} else {
 				task_notify_action(t, FLG_RD);
@@ -5314,7 +5318,7 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	t->accept_cb_data = accept_cb_data;
 	i = w->instance;
 	i->is_server = true;
-	if (i->flags & TAKS_FLAGS_AFFINITY_FORCE) {
+	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
 		i->all_cpus_seen = true;
 	}
 
@@ -5393,7 +5397,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	t->wr_tt.expires_in_us = expires_in_us;
 	i = t->worker->instance;
 	i->is_client = true;
-	if (i->flags & TAKS_FLAGS_AFFINITY_FORCE) {
+	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
 		i->all_cpus_seen = true;
 	}
 

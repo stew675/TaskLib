@@ -851,6 +851,9 @@ task_init(struct task *t, uint32_t tfdi)
 	t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
+	t->tm_tt.expires_in_us = TIMER_TIME_DESTROY;
+	t->wr_tt.expires_in_us = TIMER_TIME_DESTROY;
+	t->rd_tt.expires_in_us = TIMER_TIME_DESTROY;
 	t->rd_state = TASK_READ_STATE_IDLE;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 	t->ev.data.u64 = TFD_NONE;	// Just means it's not in epoll_wait() list yet
@@ -1645,7 +1648,7 @@ task_notify_action(struct task *t, task_action_flag_t action)
 static inline void
 task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
 {
-	register int64_t new_tm_us;
+	register int64_t new_tm_us, old_tm_us = *p_tm;
 
 	if (unlikely(us_from_now < 0)) {
 		new_tm_us = TIMER_TIME_CANCEL;
@@ -1659,7 +1662,9 @@ task_update_io_timeout(register int64_t us_from_now, register int64_t *p_tm)
 		new_tm_us = __thr_current_worker->curtime_us + TASK_TIMEOUT_ONE_YEAR;
 	}
 
-	*p_tm = new_tm_us;
+	if (new_tm_us != old_tm_us) {
+		*p_tm = new_tm_us;
+	}
 } // task_update_io_timeout
 
 
@@ -1668,19 +1673,9 @@ task_activate_rd_timeout(register struct task *t)
 {
 	register struct worker *w = t->worker;
 
-	// If we're not on the correct worker thread, queue a notify instead
-	if (unlikely(!lockless_worker(w))) {
-		task_notify_action(t, FLG_RT);
-		return;
-	}
-
-	// Listeners have no timeouts
-	if (unlikely(t->type == TASK_TYPE_LISTEN)) {
-		return;
-	}
-
 	task_update_io_timeout(t->rd_tt.expires_in_us, &t->rd_tt.expiry_us);
 	worker_timer_update(w, &t->rd_tt, t->tfd);
+	t->rd_tt.expires_in_us = TIMER_TIME_DESTROY;
 } // task_activate_rd_timeout
 
 
@@ -1689,14 +1684,9 @@ task_activate_wr_timeout(register struct task *t)
 {
 	register struct worker *w = t->worker;
 
-	// If we're not on the correct worker thread, queue a notify instead
-	if (unlikely(!lockless_worker(w))) {
-		task_notify_action(t, FLG_WT);
-		return;
-	}
-
 	task_update_io_timeout(t->wr_tt.expires_in_us, &t->wr_tt.expiry_us);
 	worker_timer_update(w, &t->wr_tt, t->tfd);
+	t->wr_tt.expires_in_us = TIMER_TIME_DESTROY;
 } // task_activate_wr_timeout
 
 
@@ -1774,12 +1764,27 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 
 	t->committed_events = (t->ev.events & 0xff);
 
+	// Activate the IO timeouts as required
 	if (flags & EPOLLIN) {
-		task_activate_rd_timeout(t);
+		if (t->rd_tt.expires_in_us != TIMER_TIME_DESTROY) {
+			// If we're not on the correct worker thread, queue a notify instead
+			if (unlikely(!lockless_worker(t->worker))) {
+				task_notify_action(t, FLG_RT);
+			} else {
+				task_activate_rd_timeout(t);
+			}
+		}
 	}
 
 	if (flags & EPOLLOUT) {
-		task_activate_wr_timeout(t);
+		if (t->wr_tt.expires_in_us != TIMER_TIME_DESTROY) {
+			// If we're not on the correct worker thread, queue a notify instead
+			if (unlikely(!lockless_worker(t->worker))) {
+				task_notify_action(t, FLG_WT);
+			} else {
+				task_activate_wr_timeout(t);
+			}
+		}
 	}
 
 	return 0;
@@ -3789,9 +3794,13 @@ worker_process_notifyq(register struct worker *w)
 
 			if (likely(!!(action & (FLG_RT | FLG_WT)))) {
 				if (action == FLG_WT) {
-					task_activate_wr_timeout(t);
+					if (t->wr_tt.expires_in_us != TIMER_TIME_DESTROY) {
+						task_activate_wr_timeout(t);
+					}
 				} else {
-					task_activate_rd_timeout(t);
+					if (t->rd_tt.expires_in_us != TIMER_TIME_DESTROY) {
+						task_activate_rd_timeout(t);
+					}
 				}
 				continue;
 			}
@@ -4419,6 +4428,7 @@ instance_listen_balance(struct task *t)
 		nt->dormant->addrlen = t->dormant->addrlen;
 		nt->accept_cb = t->accept_cb;
 		nt->accept_cb_data = t->accept_cb_data;
+		nt->rd_tt.expires_in_us = TIMER_TIME_DESTROY;
 		task_lock(nt, FLG_LI);
 		if (task_raise_event_flag(nt, EPOLLIN) < 0) {
 			perror("instance_listen_balance->task_raise_event_flag");
@@ -5356,6 +5366,8 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 		return -1;
 	}
 
+	// Listeners do not have IO timeouts.  Make sure of it
+	t->rd_tt.expires_in_us = TIMER_TIME_DESTROY;
 	if (task_raise_event_flag(t, EPOLLIN) < 0) {
 		int err = errno;
 		task_unlock(t, FLG_LI);

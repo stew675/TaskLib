@@ -176,7 +176,8 @@ typedef enum {
 } task_action_flag_t;
 
 struct ntfyq {
-	STAILQ_ENTRY(ntfyq)		list;
+//	STAILQ_ENTRY(ntfyq)		list;
+	struct ntfyq			*next;
 	uint64_t			tfd;
 	uint32_t			action;
 	uint32_t			unused;
@@ -206,7 +207,8 @@ struct task_dormant {
 __attribute__ ((aligned(64))) uint64_t	notifyqlen_locked;	// Number of locked notifyq entries this task has
 	uint32_t			migrations;		// Number of times the task has migrated
 	int32_t				tfd_iteration;		// The iteration on the TFD node
-	struct ntfyq_list		listen_children;	// The list of child accept tasks
+	struct ntfyq			*listen_children;	// The list of child accept tasks
+	struct task			*task_next;		// List of free tasks
 	void				*close_cb_data;		//  User data to pass to the close callback
 	void				(*close_cb)(int64_t tfd, void *close_cb_data);
 	socklen_t			addrlen;		// The valid length of the data in .addr
@@ -232,8 +234,8 @@ struct task {
 	int64_t				tfd;			// Task File Descriptor that identifies this task
 	struct epoll_event		ev;			// The current epoll events we're waiting on
 	int32_t				epfd;			// The worker epoll fd the above fd is registered with
+	struct ntfyq			*freeq;			// The list of child accept tasks
 	struct worker			*worker;		// The current io worker task is bound to
-	struct locked_action		*active_flags_locked;	// Queue of locked actions
 	int32_t				fd;			// The actual system socket FD we're working on
 	int32_t				cb_errno;		// Errno we want to propagate on callbacks
 	uint32_t			io_depth;		// How many direct calls to allow before queueing
@@ -247,8 +249,8 @@ struct task {
 
 	// Timer Task Information
 	struct task_timer		tm_tt;			// 48 bytes - Timer Information
-	void				*tm_cb_data;
-	void				(*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
+	int64_t				age;			// Time this task was created
+	struct locked_action		*active_flags_locked;	// Queue of locked actions
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -260,19 +262,20 @@ struct task {
 	const char			*wr_buf;
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
-	const struct iovec		*wrv_iov;
 	uint32_t			tfd_index;		// The node index in the table
-	int32_t				wrv_iovcnt;
-	size_t				wrv_buflen;
-	size_t				wrv_bufpos;
-	void				*wr_cb_data;
+	uint32_t			committed_events;	// Events verifiably committed via epoll_ctl
+	// Data read fields
+	char				*rd_buf;
+	size_t				rd_buflen;
+	size_t				rd_bufpos;
+	struct worker			*preferred_worker;	// To initiate task io worker migration
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
 	// General Write Fields
 	struct task_timer		wr_tt;			// 48 bytes - WR Timeout Information
+	void				*wr_cb_data;
 	void				(*wr_cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data);
-	void				(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -283,21 +286,19 @@ struct task {
 
 	// General Read Fields
 	struct task_timer		rd_tt;			// 48 bytes - RD Timeout Information
+	void				*rd_cb_data;
 	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
-	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
-	// Data read fields
-	char				*rd_buf;
-	size_t				rd_buflen;
-	size_t				rd_bufpos;
+	const struct iovec		*wrv_iov;
+	size_t				wrv_buflen;
+	size_t				wrv_bufpos;
+	void				(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data);
 	const struct iovec		*rdv_iov;
-	uint32_t			committed_events;	// Events verifiably committed via epoll_ctl
-	int32_t				rdv_iovcnt;
 	size_t				rdv_buflen;
 	size_t				rdv_bufpos;
-	void				*rd_cb_data;
+	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -309,9 +310,10 @@ struct task {
 	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
 	void				*connect_cb_data;
 	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
-	int64_t				age;			// Time this task was created
-	struct worker			*preferred_worker;	// To initiate task io worker migration
-	struct task			*task_next;		// List of free tasks
+	void				*tm_cb_data;
+	void				(*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
+	int32_t				wrv_iovcnt;
+	int32_t				rdv_iovcnt;
 	struct task_dormant		*dormant;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
@@ -344,12 +346,23 @@ struct worker {
 	uint32_t			type;
 	void				*timer_queue;
 	int64_t				curtime_us;
+	struct ntfyq			*notifyq_batches;
+	struct ntfyq			*freeq;
+	struct ntfyq			*freeq_locked;
+
+	struct ntfyq			*notifyq_head;
+	struct ntfyq			*notifyq_tail;
+	struct ntfyq			*notifyq_locked_head;
+	struct ntfyq			*notifyq_locked_tail;
+
+	/*
 	struct ntfyq_list		notifyq_batches;
 
 	struct ntfyq_list		notifyq;
 	struct ntfyq_list		freeq;
 	struct ntfyq_list		notifyq_locked;
 	struct ntfyq_list		freeq_locked;
+	*/
 
 
 	pthread_t			thr;
@@ -820,13 +833,13 @@ task_remove_list(register struct task **head, register struct task *t)
 		return;
 	}
 	if (*head == t) {
-		*head = t->task_next;
+		*head = t->dormant->task_next;
 		return;
 	}
-	for (scan = *head; scan->task_next != NULL; scan = scan->task_next) {
-		if (scan->task_next == t) {
-			scan->task_next = t->task_next;
-			t->task_next = NULL;
+	for (scan = *head; scan->dormant->task_next != NULL; scan = scan->dormant->task_next) {
+		if (scan->dormant->task_next == t) {
+			scan->dormant->task_next = t->dormant->task_next;
+			t->dormant->task_next = NULL;
 			return;
 		}
 	}
@@ -837,14 +850,16 @@ static void
 task_init(struct task *t, uint32_t tfdi)
 {
 	int32_t iteration = ((__thr_current_instance->tfd_dormant + tfdi)->tfd_iteration + 1) % 8388608;
+	struct ntfyq *freeq = t->freeq;
 
 	memset((__thr_current_instance->tfd_pool + tfdi), 0, sizeof(struct task));
 	memset((__thr_current_instance->tfd_dormant + tfdi), 0, sizeof(struct task_dormant));
 
+	t->freeq = freeq;
 	t->dormant = __thr_current_instance->tfd_dormant + tfdi;
 	t->dormant->tfd_iteration = iteration;
 	t->age = get_time_us(TASK_TIME_COARSE);		// Set the age
-	STAILQ_INIT(&t->dormant->listen_children);
+//	STAILQ_INIT(&t->dormant->listen_children);
 
 	t->state = TASK_STATE_UNUSED;
 	t->tfd_index = tfdi;
@@ -873,7 +888,7 @@ task_free(struct task *t)
 	task_init(t, t->tfd_index);
 
 	pthread_mutex_lock(&i->cpulock);
-	t->task_next = i->free_tasks;
+	t->dormant->task_next = i->free_tasks;
 	i->free_tasks = t;
 	pthread_mutex_unlock(&i->cpulock);
 } // task_free
@@ -1149,7 +1164,7 @@ task_get_free_task(void)
 		errno = EMFILE;
 		return NULL;
 	}
-	i->free_tasks = t->task_next;
+	i->free_tasks = t->dormant->task_next;
 	assert(t->state == TASK_STATE_UNUSED);
 	assert(t->active_flags_locked == NULL);
 	t->state = TASK_STATE_ACTIVE;
@@ -1534,9 +1549,9 @@ instance_notify(struct instance *i)
 static struct ntfyq *
 worker_notify_get_free_ntfyq(register struct worker *w)
 {
-	register struct ntfyq *tq = NULL;
+	register struct ntfyq *freeq_head = NULL, *freeq_tail = NULL;
+	register struct ntfyq *tq = NULL, *ntq;
 	register size_t batch_size, n;
-	struct ntfyq_list freeq;
 
 	// Grab an aligned system page of memory, and we'll dice it up ourselves
 	if ((tq = aligned_alloc(__page_size, __page_size)) == NULL) {
@@ -1548,21 +1563,30 @@ worker_notify_get_free_ntfyq(register struct worker *w)
 	// Add all our new entries to a local list.  We can minimise
 	// the time we hold the worker lock for by doing it this way
 
-	STAILQ_INIT(&freeq);
 	for (n = 2; n < batch_size; n++) {
-		STAILQ_INSERT_TAIL(&freeq, (tq + n), list);
+		ntq = tq + n;
+		if (freeq_tail == NULL) {
+			freeq_head = ntq;
+		} else {
+			freeq_tail->next = ntq;
+		}
+		freeq_tail = ntq;
+		ntq->next = NULL;
 	}
 
 	// We don't use the first entry, but instead stick it on a worker
 	// list so we have a list of what memory to pass to free() later
 	worker_lock(w);
-	STAILQ_INSERT_TAIL(&w->notifyq_batches, tq, list);
+	tq->next = w->notifyq_batches;
+	w->notifyq_batches = tq;
 	if (likely(lockless_worker(w))) {
 		// Don't need to hold the lock if we're on the worker
 		worker_unlock(w);
-		STAILQ_CONCAT(&w->freeq, &freeq);
+		freeq_tail->next = w->freeq;
+		w->freeq = freeq_head;
 	} else {
-		STAILQ_CONCAT(&w->freeq_locked, &freeq);
+		freeq_tail->next = w->freeq_locked;
+		w->freeq_locked = freeq_head;
 		worker_unlock(w);
 	}
 
@@ -1593,9 +1617,10 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 	}
 
 	if (likely(lockless_worker(w))) {
-		tq = STAILQ_FIRST(&w->freeq);
-		if (likely(tq != NULL)) {
-			STAILQ_REMOVE_HEAD(&w->freeq, list);
+		if (likely((tq = t->freeq) != NULL)) {
+			t->freeq = tq->next;
+		} else if (likely((tq = w->freeq) != NULL)) {
+			w->freeq = tq->next;
 		} else {
 			tq = worker_notify_get_free_ntfyq(w);
 			if (unlikely(tq == NULL)) {
@@ -1609,13 +1634,18 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 
 		w->notifyqlen++;
 		t->notifyqlen++;
-		STAILQ_INSERT_TAIL(&w->notifyq, tq, list);
+		if (w->notifyq_tail == NULL) {
+			w->notifyq_head = tq;
+		} else {
+			w->notifyq_tail->next = tq;
+		}
+		w->notifyq_tail = tq;
+		tq->next = NULL;
 	} else {
 		ck_pr_inc_64(&t->dormant->notifyqlen_locked);
 		worker_lock(w);
-		tq = STAILQ_FIRST(&w->freeq_locked);
-		if (tq != NULL) {
-			STAILQ_REMOVE_HEAD(&w->freeq_locked, list);
+		if (likely((tq = w->freeq_locked) != NULL)) {
+			w->freeq_locked = tq->next;
 		} else {
 			// Can't be holding the worker lock when
 			// calling worker_notify_get_free_ntfyq
@@ -1632,7 +1662,13 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 		tq->action = action;
 
 		w->notifyqlen_locked++;
-		STAILQ_INSERT_TAIL(&w->notifyq_locked, tq, list);
+		if (w->notifyq_locked_tail == NULL) {
+			w->notifyq_locked_head = tq;
+		} else {
+			w->notifyq_locked_tail->next = tq;
+		}
+		w->notifyq_locked_tail = tq;
+		tq->next = NULL;
 		worker_unlock(w);
 	}
 
@@ -2349,20 +2385,19 @@ handle_write_timeout:
 static void
 task_shutdown_listen_children(struct worker *w, struct task *t)
 {
-	struct ntfyq *tq;
+	register struct ntfyq *tq;
 
-	while ((tq = STAILQ_FIRST(&t->dormant->listen_children)) != NULL) {
+	while ((tq = t->dormant->listen_children) != NULL) {
 		int64_t tfd;
 		struct task *tac;	// Accept Child
 
-		// Pull accept child off list.  We already have the task lock
-		STAILQ_REMOVE_HEAD(&t->dormant->listen_children, list);
+		t->dormant->listen_children->next = tq;
+
 		tfd = tq->tfd;
-		tq->tfd = TFD_NONE;
-		tq->action = FLG_NONE;
 
 		worker_lock(w);
-		STAILQ_INSERT_TAIL(&w->freeq_locked, tq, list);
+		tq->next = w->freeq_locked;
+		w->freeq_locked = tq;
 		worker_unlock(w);
 
 		tac = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
@@ -2377,34 +2412,43 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 static void
 worker_cleanup(struct worker *w)
 {
-	struct ntfyq_list notifyq, freeq;
-	register struct ntfyq *tq;
+	register struct ntfyq *qhead, *qtail, *tq;
 
-	if (unlikely(STAILQ_EMPTY(&w->notifyq))) {
+	if ((w->notifyq_head == NULL) && (w->notifyq_locked_head == NULL)) {
 		return;		// Nothing to do
 	}
 
-	STAILQ_INIT(&notifyq);
-	STAILQ_INIT(&freeq);
-
+	
 	// Bulk grab the queue to process.  This minimises lock contention/churn
-	STAILQ_CONCAT(&notifyq, &w->notifyq);
+	qhead = w->notifyq_head;
+	qtail = w->notifyq_tail;
+	w->notifyq_head = NULL;
+	w->notifyq_tail = NULL;
+	w->freeq = NULL;
+
 	worker_lock(w);
-	STAILQ_CONCAT(&notifyq, &w->notifyq_locked);
-	STAILQ_CONCAT(&freeq, &w->freeq_locked);
+	if (w->notifyq_locked_head != NULL) {
+		if (qtail != NULL) {
+			qtail->next = w->notifyq_locked_head;
+		} else {
+			qhead = w->notifyq_locked_head;
+		}
+		qtail = w->notifyq_locked_tail;
+		w->notifyq_locked_head = NULL;
+		w->notifyq_locked_tail = NULL;
+	}
+	w->freeq_locked = NULL;
 	worker_unlock(w);
 
-	while (likely((tq = STAILQ_FIRST(&notifyq)) != NULL)) {
+	for (tq = qhead; tq != NULL; tq = tq->next) {
 		struct task *t = NULL;
 		register int64_t tfd;
 		task_action_flag_t action;
 
-		STAILQ_REMOVE_HEAD(&notifyq, list);
 		tfd = tq->tfd;
 		action = tq->action;
 		tq->tfd = TFD_NONE;
 		tq->action = FLG_NONE;
-		STAILQ_INSERT_TAIL(&freeq, tq, list);
 
 		t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
 		if (t->state != TASK_STATE_ACTIVE) {
@@ -2423,16 +2467,13 @@ worker_cleanup(struct worker *w)
 		task_do_close_cb(t);
 	}
 
-	// Now remove all our free notification entries
-	while((tq = STAILQ_FIRST(&freeq))) {
-		STAILQ_REMOVE_HEAD(&freeq, list);
-	}
-
 	// Free up our batch allocated memory
-	while((tq = STAILQ_FIRST(&w->notifyq_batches))) {
-		STAILQ_REMOVE_HEAD(&w->notifyq_batches, list);
+	worker_lock(w);
+	while ((tq = w->notifyq_batches) != NULL) {
+		w->notifyq_batches = tq->next;
 		free(tq);
 	}
+	worker_unlock(w);
 } // worker_cleanup
 
 
@@ -3688,49 +3729,46 @@ worker_process_notifyq(register struct worker *w)
 
 	// Start with locked list first, and then process the unlocked one
 	for (register uint32_t locked = 0; locked < 2; locked++) {
+		register struct ntfyq *notifyq = NULL, *lockedq = NULL;
 		register uint32_t num_processed = 0;
-		struct ntfyq_list notifyq;
+
+		register int64_t tfd;
+		register task_action_flag_t action;
+		register struct task *t;
 
 		// Check the notifyq lists
 		if (locked) {
-			if (STAILQ_EMPTY(&w->notifyq_locked)) {
+			if (w->notifyq_locked_head == NULL) {
 				continue;
 			}
-			STAILQ_INIT(&notifyq);
 			worker_lock(w);
-			STAILQ_CONCAT(&notifyq, &w->notifyq_locked);
+			notifyq = w->notifyq_locked_head;
+			w->notifyq_locked_head = NULL;
+			w->notifyq_locked_tail = NULL;
 			worker_unlock(w);
+			lockedq = notifyq;
 		} else {
-			if (STAILQ_EMPTY(&w->notifyq)) {
+			if ((notifyq = w->notifyq_head) == NULL) {
 				continue;
 			}
-			STAILQ_INIT(&notifyq);
-			STAILQ_CONCAT(&notifyq, &w->notifyq);
+			w->notifyq_head = NULL;
+			w->notifyq_tail = NULL;
 		}
 
 		w->curtime_us = get_time_us(TASK_TIME_PRECISE);
 
-		STAILQ_FOREACH(tq, &notifyq, list) {
-			register struct task *t = NULL;
-			register int64_t tfd;
-			register task_action_flag_t action;
-
+		while (likely((tq = notifyq) != NULL)) {
+			notifyq = tq->next;
 			num_processed++;
-
-			if (unlikely(++w->processed_total >= w->processed_tc)) {
-				worker_do_timeout_check(w);
-			}
 
 			tfd = tq->tfd;
 			action = tq->action;
-			tq->tfd = TFD_NONE;
-			tq->action = FLG_NONE;
-
 			t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
-
 			if (locked) {
 				ck_pr_dec_64(&t->dormant->notifyqlen_locked);
 			} else {
+				tq->next = t->freeq;
+				t->freeq = tq;
 				t->notifyqlen--;
 			}
 
@@ -3738,6 +3776,10 @@ worker_process_notifyq(register struct worker *w)
 			// to be a stale notification from a task that already terminated
 			if (unlikely(tfd != t->tfd)) {
 				continue;
+			}
+
+			if (unlikely(++w->processed_total >= w->processed_tc)) {
+				worker_do_timeout_check(w);
 			}
 
 			if (t->active_flags_locked) {
@@ -3849,14 +3891,12 @@ worker_process_notifyq(register struct worker *w)
 			if (unlikely(locked)) {
 				worker_lock(w);
 				w->notifyqlen_locked -= num_processed;
-				STAILQ_CONCAT(&notifyq, &w->freeq_locked);
-				STAILQ_CONCAT(&w->freeq_locked, &notifyq);
+				while ((tq = lockedq) != NULL) {
+					lockedq = tq->next;
+					tq->next = w->freeq_locked;
+					w->freeq_locked = tq;
+				}
 				worker_unlock(w);
-			} else {
-				// Concat any remainder back to the actual lists
-				w->notifyqlen -= num_processed;
-				STAILQ_CONCAT(&notifyq, &w->freeq);
-				STAILQ_CONCAT(&w->freeq, &notifyq);
 			}
 		}
 	}
@@ -3882,7 +3922,7 @@ worker_poll_listeners(register struct worker *w)
 	register struct task *t;
 	register int numfds;
 
-	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->task_next) {
+	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->dormant->task_next) {
 		w->pollfds[numfds].fd = t->fd;
 		w->pollfds[numfds].events = POLLIN;
 		w->pollfds[numfds].revents = 0;
@@ -3892,7 +3932,7 @@ worker_poll_listeners(register struct worker *w)
 		return;
 	}
 
-	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->task_next) {
+	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->dormant->task_next) {
 		if (w->pollfds[numfds].revents & EPOLLIN) {
 			task_handle_listen_event(t);	// Unlocks the task for us
 		}
@@ -3913,7 +3953,7 @@ get_next_epoll_timeout_ms(struct worker *w)
 	worker_check_timeouts(w);
 
 	// If we new have tasks to pickup, don't wait in epoll()
-	if (!STAILQ_EMPTY(&w->notifyq)) {
+	if ((w->notifyq_head != NULL) || (w->notifyq_locked_head != NULL)) {
 		return 0;
 	}
 
@@ -4266,11 +4306,6 @@ worker_create(struct instance *i, int worker_type)
 	w->gepfd = -1;
 
 	pthread_mutex_init(&w->lock, &attr);
-	STAILQ_INIT(&w->notifyq_locked);
-	STAILQ_INIT(&w->notifyq_batches);
-	STAILQ_INIT(&w->freeq_locked);
-	STAILQ_INIT(&w->notifyq);
-	STAILQ_INIT(&w->freeq);
 
 	if (w->type == WORKER_TYPE_IO) {
 		if ((w->gepfd = epoll_create1(0)) < 0) {
@@ -4436,7 +4471,7 @@ instance_listen_balance(struct task *t)
 
 		// Add to the listeners list of the target worker
 		worker_lock(w);
-		nt->task_next = w->listeners;
+		nt->dormant->task_next = w->listeners;
 		w->listeners = nt;
 		worker_unlock(w);
 
@@ -4444,13 +4479,13 @@ instance_listen_balance(struct task *t)
 		struct ntfyq *ntq = NULL;
 
 		if (lockless_worker(w)) {
-			if ((ntq = STAILQ_FIRST(&w->freeq)) != NULL) {
-				STAILQ_REMOVE_HEAD(&w->freeq, list);
+			if ((ntq = w->freeq) != NULL) {
+				w->freeq = ntq->next;
 			}
 		} else {
 			worker_lock(w);
-			if ((ntq = STAILQ_FIRST(&w->freeq_locked)) != NULL) {
-				STAILQ_REMOVE_HEAD(&w->freeq_locked, list);
+			if ((ntq = w->freeq_locked) != NULL) {
+				w->freeq_locked = ntq->next;
 			}
 			worker_unlock(w);
 		}
@@ -4460,7 +4495,8 @@ instance_listen_balance(struct task *t)
 		}
 		ntq->tfd = nt->tfd;
 		ntq->action = FLG_LI;
-		STAILQ_INSERT_TAIL(&t->dormant->listen_children, ntq, list);
+		ntq->next = t->dormant->listen_children;
+		t->dormant->listen_children = ntq;
 	}
 } // instance_listen_balance
 
@@ -4669,7 +4705,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		struct task *t = i->tfd_pool + tfdi;
 
 		task_init(t, tfdi);
-		t->task_next = i->free_tasks;
+		t->dormant->task_next = i->free_tasks;
 		i->free_tasks = t;
 	}
 
@@ -5389,7 +5425,7 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 	// Add to listeners list of the worker
 	worker_lock(w);
-	t->task_next = w->listeners;
+	t->dormant->task_next = w->listeners;
 	w->listeners = t;
 	worker_unlock(w);
 

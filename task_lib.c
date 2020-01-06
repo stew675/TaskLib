@@ -208,7 +208,6 @@ __attribute__ ((aligned(64))) uint64_t	notifyqlen_locked;	// Number of locked no
 	uint32_t			migrations;		// Number of times the task has migrated
 	int32_t				tfd_iteration;		// The iteration on the TFD node
 	struct ntfyq			*listen_children;	// The list of child accept tasks
-	struct task			*task_next;		// List of free tasks
 	void				*close_cb_data;		//  User data to pass to the close callback
 	void				(*close_cb)(int64_t tfd, void *close_cb_data);
 	socklen_t			addrlen;		// The valid length of the data in .addr
@@ -222,24 +221,30 @@ struct task {
 
 	uint32_t			active_flags;		// Which flags are active
 	uint32_t			type:3,			// Type of task
+					io_depth:3,		// How many direct calls to allow before queueing
+					state:2,		// Operational state of the task
+
+					notifyqlen:4,		// Number of notifyq entries this task has
 					rd_state:2,		// Which read operation is in progress
 					wr_state:2,		// Which write operation is in progress
-					registered_fd:1,	// If the FD was registered by the user
-					state:2,		// Operational state of the task
+
 					rd_shut:1,		// If the read side is shutdown
 					wr_shut:1,		// If the write side is shutdown
+					registered_fd:1,	// If the FD was registered by the user
 					forward_close:1,	// Temporarily allow close action forwarding
 					listen_child:1,		// If task is a child listener
-					unused:18;
+					have_locked_flags:1,	// There are locked active flags available
+					unused:10;
+
 	int64_t				tfd;			// Task File Descriptor that identifies this task
-	struct epoll_event		ev;			// The current epoll events we're waiting on
-	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 	struct ntfyq			*freeq;			// The list of child accept tasks
 	struct worker			*worker;		// The current io worker task is bound to
+	struct epoll_event		ev;			// The current epoll events we're waiting on
+	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 	int32_t				fd;			// The actual system socket FD we're working on
+	uint32_t			tfd_index;		// The node index in the table
 	int32_t				cb_errno;		// Errno we want to propagate on callbacks
-	uint32_t			io_depth;		// How many direct calls to allow before queueing
-	uint32_t			notifyqlen;		// Number of notifyq entries this task has
+	uint32_t			committed_events;	// Events verifiably committed via epoll_ctl
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -249,8 +254,8 @@ struct task {
 
 	// Timer Task Information
 	struct task_timer		tm_tt;			// 48 bytes - Timer Information
-	int64_t				age;			// Time this task was created
-	struct locked_action		*active_flags_locked;	// Queue of locked actions
+	void				*tm_cb_data;
+	void				(*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -262,13 +267,14 @@ struct task {
 	const char			*wr_buf;
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
-	uint32_t			tfd_index;		// The node index in the table
-	uint32_t			committed_events;	// Events verifiably committed via epoll_ctl
+	int32_t				wrv_iovcnt;
+	int32_t				rdv_iovcnt;
+
 	// Data read fields
 	char				*rd_buf;
 	size_t				rd_buflen;
 	size_t				rd_bufpos;
-	struct worker			*preferred_worker;	// To initiate task io worker migration
+	int64_t				age;			// Time this task was created
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -310,10 +316,9 @@ struct task {
 	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
 	void				*connect_cb_data;
 	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
-	void				*tm_cb_data;
-	void				(*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
-	int32_t				wrv_iovcnt;
-	int32_t				rdv_iovcnt;
+	struct locked_action		*active_flags_locked;	// Queue of locked actions
+	struct worker			*preferred_worker;	// To initiate task io worker migration
+	struct task			*task_next;		// List of free tasks
 	struct task_dormant		*dormant;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
@@ -833,13 +838,13 @@ task_remove_list(register struct task **head, register struct task *t)
 		return;
 	}
 	if (*head == t) {
-		*head = t->dormant->task_next;
+		*head = t->task_next;
 		return;
 	}
-	for (scan = *head; scan->dormant->task_next != NULL; scan = scan->dormant->task_next) {
-		if (scan->dormant->task_next == t) {
-			scan->dormant->task_next = t->dormant->task_next;
-			t->dormant->task_next = NULL;
+	for (scan = *head; scan->task_next != NULL; scan = scan->task_next) {
+		if (scan->task_next == t) {
+			scan->task_next = t->task_next;
+			t->task_next = NULL;
 			return;
 		}
 	}
@@ -888,7 +893,7 @@ task_free(struct task *t)
 	task_init(t, t->tfd_index);
 
 	pthread_mutex_lock(&i->cpulock);
-	t->dormant->task_next = i->free_tasks;
+	t->task_next = i->free_tasks;
 	i->free_tasks = t;
 	pthread_mutex_unlock(&i->cpulock);
 } // task_free
@@ -959,6 +964,7 @@ task_pickup_flags(register struct task *t)
 		lalr = tmp->next;
 		task_put_locked_action(tfdi, tmp);
 	}
+	t->have_locked_flags = false;
 	tfd_unlock(tfdi);
 } // task_pickup_flags
 
@@ -978,10 +984,11 @@ task_lock(struct task *t, task_action_flag_t action)
 		lact->action = action;
 		lact->next = t->active_flags_locked;
 		t->active_flags_locked = lact;
+		t->have_locked_flags = true;
 		tfd_unlock(tfdi);
 		return;
 	} else {
-		if (t->active_flags_locked) {
+		if (t->have_locked_flags) {
 			task_pickup_flags(t);
 		}
 		t->active_flags |= action;
@@ -1005,11 +1012,12 @@ task_unlock(struct task *t, task_action_flag_t action)
 		lact->action = (action | FLG_DRP);
 		lact->next = t->active_flags_locked;
 		t->active_flags_locked = lact;
+		t->have_locked_flags = true;
 		tfd_unlock(tfdi);
 		return;
 	}
 
-	if (t->active_flags_locked) {
+	if (t->have_locked_flags) {
 		task_pickup_flags(t);
 	}
 	t->active_flags &= ~(action);
@@ -1103,6 +1111,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		lact->action = (action | FLG_DRP);
 		lact->next = t->active_flags_locked;
 		t->active_flags_locked = lact;
+		t->have_locked_flags = true;
 		tfd_unlock(tfdi);
 	} else {
 		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
@@ -1115,7 +1124,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 			return NULL;
 		}
 
-		if (t->active_flags_locked) {
+		if (t->have_locked_flags) {
 			task_pickup_flags(t);
 		}
 		t->active_flags |= action;
@@ -1164,7 +1173,7 @@ task_get_free_task(void)
 		errno = EMFILE;
 		return NULL;
 	}
-	i->free_tasks = t->dormant->task_next;
+	i->free_tasks = t->task_next;
 	assert(t->state == TASK_STATE_UNUSED);
 	assert(t->active_flags_locked == NULL);
 	t->state = TASK_STATE_ACTIVE;
@@ -3448,7 +3457,7 @@ worker_check_timeouts(struct worker *w)
 
 		assert(t->worker == w);
 
-		if (t->active_flags_locked) {
+		if (t->have_locked_flags) {
 			task_pickup_flags(t);
 		}
 
@@ -3782,7 +3791,7 @@ worker_process_notifyq(register struct worker *w)
 				worker_do_timeout_check(w);
 			}
 
-			if (t->active_flags_locked) {
+			if (t->have_locked_flags) {
 				task_pickup_flags(t);
 			}
 
@@ -3922,7 +3931,7 @@ worker_poll_listeners(register struct worker *w)
 	register struct task *t;
 	register int numfds;
 
-	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->dormant->task_next) {
+	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->task_next) {
 		w->pollfds[numfds].fd = t->fd;
 		w->pollfds[numfds].events = POLLIN;
 		w->pollfds[numfds].revents = 0;
@@ -3932,7 +3941,7 @@ worker_poll_listeners(register struct worker *w)
 		return;
 	}
 
-	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->dormant->task_next) {
+	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->task_next) {
 		if (w->pollfds[numfds].revents & EPOLLIN) {
 			task_handle_listen_event(t);	// Unlocks the task for us
 		}
@@ -4048,7 +4057,7 @@ worker_do_io_epoll(register struct worker *w)
 			continue;
 		}
 
-		if (unlikely(t->active_flags_locked != NULL)) {
+		if (unlikely(t->have_locked_flags)) {
 			task_pickup_flags(t);
 		}
 
@@ -4471,7 +4480,7 @@ instance_listen_balance(struct task *t)
 
 		// Add to the listeners list of the target worker
 		worker_lock(w);
-		nt->dormant->task_next = w->listeners;
+		nt->task_next = w->listeners;
 		w->listeners = nt;
 		worker_unlock(w);
 
@@ -4705,7 +4714,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		struct task *t = i->tfd_pool + tfdi;
 
 		task_init(t, tfdi);
-		t->dormant->task_next = i->free_tasks;
+		t->task_next = i->free_tasks;
 		i->free_tasks = t;
 	}
 
@@ -5425,7 +5434,7 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 	// Add to listeners list of the worker
 	worker_lock(w);
-	t->dormant->task_next = w->listeners;
+	t->task_next = w->listeners;
 	w->listeners = t;
 	worker_unlock(w);
 

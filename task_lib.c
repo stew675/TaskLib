@@ -176,7 +176,6 @@ typedef enum {
 } task_action_flag_t;
 
 struct ntfyq {
-//	STAILQ_ENTRY(ntfyq)		list;
 	struct ntfyq			*next;
 	uint64_t			tfd;
 	uint32_t			action;
@@ -346,11 +345,10 @@ struct instance;
 struct worker {
 	uint32_t			magic;
 #define WORKER_MAGIC	0xa3b6c9e1
-	uint32_t			notifyqlen;
-	uint32_t			notifyqlen_locked;
 	uint32_t			type;
 	void				*timer_queue;
 	int64_t				curtime_us;
+
 	struct ntfyq			*notifyq_batches;
 	struct ntfyq			*freeq;
 	struct ntfyq			*freeq_locked;
@@ -359,16 +357,6 @@ struct worker {
 	struct ntfyq			*notifyq_tail;
 	struct ntfyq			*notifyq_locked_head;
 	struct ntfyq			*notifyq_locked_tail;
-
-	/*
-	struct ntfyq_list		notifyq_batches;
-
-	struct ntfyq_list		notifyq;
-	struct ntfyq_list		freeq;
-	struct ntfyq_list		notifyq_locked;
-	struct ntfyq_list		freeq_locked;
-	*/
-
 
 	pthread_t			thr;
 	uint64_t			num_tasks;
@@ -864,7 +852,6 @@ task_init(struct task *t, uint32_t tfdi)
 	t->dormant = __thr_current_instance->tfd_dormant + tfdi;
 	t->dormant->tfd_iteration = iteration;
 	t->age = get_time_us(TASK_TIME_COARSE);		// Set the age
-//	STAILQ_INIT(&t->dormant->listen_children);
 
 	t->state = TASK_STATE_UNUSED;
 	t->tfd_index = tfdi;
@@ -1641,7 +1628,6 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 		tq->tfd = tfd;
 		tq->action = action;
 
-		w->notifyqlen++;
 		t->notifyqlen++;
 		if (w->notifyq_tail == NULL) {
 			w->notifyq_head = tq;
@@ -1670,7 +1656,6 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 		tq->tfd = tfd;
 		tq->action = action;
 
-		w->notifyqlen_locked++;
 		if (w->notifyq_locked_tail == NULL) {
 			w->notifyq_locked_head = tq;
 		} else {
@@ -3736,10 +3721,8 @@ worker_process_notifyq(register struct worker *w)
 		return;
 	}
 
-	// Start with locked list first, and then process the unlocked one
 	for (register uint32_t locked = 0; locked < 2; locked++) {
 		register struct ntfyq *notifyq = NULL, *lockedq = NULL;
-		register uint32_t num_processed = 0;
 
 		register int64_t tfd;
 		register task_action_flag_t action;
@@ -3768,10 +3751,10 @@ worker_process_notifyq(register struct worker *w)
 
 		while (likely((tq = notifyq) != NULL)) {
 			notifyq = tq->next;
-			num_processed++;
 
 			tfd = tq->tfd;
 			action = tq->action;
+
 			t = __thr_current_instance->tfd_pool + (tfd & 0xffffffff);
 			if (locked) {
 				ck_pr_dec_64(&t->dormant->notifyqlen_locked);
@@ -3896,32 +3879,16 @@ worker_process_notifyq(register struct worker *w)
 
 		// Concat any remainder back to the actual lists. Put the
 		// just processed entries at the front of the freeq
-		if (likely(num_processed > 0)) {
-			if (unlikely(locked)) {
-				worker_lock(w);
-				w->notifyqlen_locked -= num_processed;
-				while ((tq = lockedq) != NULL) {
-					lockedq = tq->next;
-					tq->next = w->freeq_locked;
-					w->freeq_locked = tq;
-				}
-				worker_unlock(w);
+		if (unlikely(locked)) {
+			worker_lock(w);
+			while ((tq = lockedq) != NULL) {
+				lockedq = tq->next;
+				tq->next = w->freeq_locked;
+				w->freeq_locked = tq;
 			}
+			worker_unlock(w);
 		}
 	}
-
-// Uncomment the following definition to turn on notifyqlen validation
-//#define VALIDATE_QLEN
-#ifdef VALIDATE_QLEN
-	uint64_t actual_len = 0;
-	STAILQ_FOREACH(tq, &w->notifyq, list) {
-		actual_len++;
-	}
-
-	if(actual_len > 0)
-		fprintf(stderr, "Actual Length = %lu\n", actual_len);
-	assert(w->notifyqlen == actual_len);
-#endif
 } // worker_process_notifyq
 
 

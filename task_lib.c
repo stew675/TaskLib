@@ -321,6 +321,9 @@ struct task {
 	struct task_dormant		*dormant;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
+	struct ntfyq			free1;
+	struct ntfyq			free2;
+
 } __attribute__ ((aligned(64)));
 
 typedef enum {
@@ -843,12 +846,28 @@ static void
 task_init(struct task *t, uint32_t tfdi)
 {
 	int32_t iteration = ((__thr_current_instance->tfd_dormant + tfdi)->tfd_iteration + 1) % 8388608;
-	struct ntfyq *freeq = t->freeq;
+	struct ntfyq *tq, *freeq = NULL;
 
+	while ((tq = t->freeq) != NULL) {
+		t->freeq = tq->next;
+		if ((tq != &t->free1) && (tq != &t->free1)) {
+			tq->next = freeq;
+			freeq = tq;
+		}
+	}
 	memset((__thr_current_instance->tfd_pool + tfdi), 0, sizeof(struct task));
 	memset((__thr_current_instance->tfd_dormant + tfdi), 0, sizeof(struct task_dormant));
 
 	t->freeq = freeq;
+
+	tq = &t->free2;
+	tq->next = t->freeq;
+	t->freeq = tq;
+
+	tq = &t->free1;
+	tq->next = t->freeq;
+	t->freeq = tq;
+
 	t->dormant = __thr_current_instance->tfd_dormant + tfdi;
 	t->dormant->tfd_iteration = iteration;
 	t->age = get_time_us(TASK_TIME_COARSE);		// Set the age

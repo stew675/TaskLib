@@ -164,6 +164,7 @@ typedef enum {
 	FLG_MG	=	0x00000200,		// A Migration Event is active
 	FLG_CL	=	0x00000400,		// A Close Event is active
 	FLG_BND	=	0x00000800,		// A Bind operation is in progress
+	FLG_CN = 	0x00001000,		// Task is connecting
 	FLG_DBG	=	0x00004000,		// Task Debug API in progress
 	FLG_CCB =	0x00008000,		// A Close CallBack API is in progress
 	FLG_TC	=	0x00010000,		// A Timer Cancel API is in progress
@@ -323,7 +324,6 @@ struct task {
 	//===================================  64 BYTE BOUNDARY    =====================================//
 	struct ntfyq			free1;
 	struct ntfyq			free2;
-
 } __attribute__ ((aligned(64)));
 
 typedef enum {
@@ -850,7 +850,7 @@ task_init(struct task *t, uint32_t tfdi)
 
 	while ((tq = t->freeq) != NULL) {
 		t->freeq = tq->next;
-		if ((tq != &t->free1) && (tq != &t->free1)) {
+		if ((tq != &t->free1) && (tq != &t->free2)) {
 			tq->next = freeq;
 			freeq = tq;
 		}
@@ -1689,7 +1689,8 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 	if (unlikely((t->active_flags & action) == 0)) {
 		// Do not lock IO timeout flags.  Their existence is
 		// already implied by their parent FLG_RD/FLG_WR flags
-		if ((action & (FLG_RT | FLG_WT)) == 0) {
+		// Don't lock for connecting events, FLG_CO already set
+		if ((action & (FLG_RT | FLG_WT | FLG_CN)) == 0) {
 			task_lock(t, action);
 		}
 	}
@@ -2997,6 +2998,39 @@ task_handle_connect_event(struct task *t)
 } // task_handle_connect_event
 
 
+static void
+task_handle_connecting_action(struct task *t)
+{
+	// Start the connect
+	while (1) {
+		t->cb_errno = 0;
+		if (connect(t->fd, (struct sockaddr *)&t->dormant->addr, t->dormant->addrlen) == 0) {
+			task_handle_connect_event(t);
+			return;
+		}
+
+		if (errno == EINTR) {
+			// Try again
+			continue;
+		}
+
+		if ((errno == EINPROGRESS) || (errno == EAGAIN)) {
+			task_lock(t, FLG_WR);
+			if (task_raise_event_flag(t, EPOLLOUT) < 0) {
+				break;
+			}
+			// We queued it, return
+			return;
+		}
+		break;
+	}
+
+	// Connect failure of some kind. Notify the caller
+	t->cb_errno = errno;
+	task_do_connect_cb(t, -1);		// Unlocks task
+} // task_handle_connecting_action
+
+
 static ssize_t
 task_read_vector(register struct task *t, register bool queued)
 {
@@ -3378,7 +3412,9 @@ task_handle_listen_event(struct task *t)
 		task_lock(t, FLG_AC);
 		t_new->accept_cb = t->accept_cb;
 		t_new->accept_cb_data = t->accept_cb_data;
-		task_do_accept_cb(t_new);	// Unlocks t_new
+
+		// We queue it, so it starts on the correct worker immediately
+		task_notify_action(t_new, FLG_AC);
 	}
 	return;
 
@@ -3805,9 +3841,9 @@ worker_process_notifyq(register struct worker *w)
 				}
 			}
 
-			// Check if the action got cancelled.  Allow close and io timeouts through though
+			// Check if the action got cancelled.  Allow close, connecting and io timeouts through though
 			if ((t->active_flags & action) == 0) {
-				if ((action & (FLG_CL | FLG_WT | FLG_RT)) == 0) {
+				if ((action & (FLG_CL | FLG_CN | FLG_WT | FLG_RT)) == 0) {
 					task_unlock(t, action);
 					continue;
 				}
@@ -3852,6 +3888,16 @@ worker_process_notifyq(register struct worker *w)
 						task_activate_rd_timeout(t);
 					}
 				}
+				continue;
+			}
+
+			if (action == FLG_AC) {
+				task_do_accept_cb(t);
+				continue;
+			}
+
+			if (action == FLG_CN) {
+				task_handle_connecting_action(t);
 				continue;
 			}
 
@@ -5450,6 +5496,8 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	t->type = TASK_TYPE_CONNECT;
 	t->connect_cb = connect_cb;
 	t->connect_cb_data = connect_cb_data;
+	memcpy(&t->dormant->addr, addr, addrlen);
+	t->dormant->addrlen = addrlen;
 	t->wr_tt.expires_in_us = expires_in_us;
 	i = t->worker->instance;
 	i->is_client = true;
@@ -5457,39 +5505,9 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 		i->all_cpus_seen = true;
 	}
 
-	// Start the connect
-	while (1) {
-		memcpy(&t->dormant->addr, addr, addrlen);
-		t->dormant->addrlen = addrlen;
-		t->cb_errno = 0;
-		if (connect(t->fd, addr, addrlen) == 0) {
-			// We connected immediately! Return 1
-			t->io_depth = TASK_MAX_IO_DEPTH;
-			task_unlock(t, FLG_CO);
-			return 1;
-		}
-
-		if (errno == EINTR) {
-			// Try again
-			continue;
-		}
-
-		if ((errno == EINPROGRESS) || (errno == EAGAIN)) {
-			task_lock(t, FLG_WR);
-			if (task_raise_event_flag(t, EPOLLOUT) < 0) {
-				break;
-			}
-			// We queued it, return 0
-			return 0;
-		}
-		break;
-	}
-
-	// Connect failure of some kind. Notify the caller
-	int err = errno;
-	task_unlock(t, FLG_CO);
-	errno = err;
-	return -1;
+	// Queue the connect so it starts on the correct worker
+	task_notify_action(t, FLG_CN);
+	return 0;
 } // TASK_socket_connect
 
 

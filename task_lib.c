@@ -80,15 +80,9 @@
 // statistics about the time spent in TFD locks with gprof using ticketlocks
 // #define USE_TICKET_LOCKS
 
-struct locked_action {
-	uint64_t		action;
-	struct locked_action	*next;
-};
-
 #ifdef USE_TICKET_LOCKS
 typedef struct {
 	ticketlock_t		lock;
-	struct locked_action	*free_actions;
 } __attribute__ ((aligned(64))) tfd_lock_t;
 
 #define	tfd_lock(tfdi)	 ticket_lock(&__thr_current_instance->tfd_locks[TFDI_TO_LOCK_INDEX(tfdi)].lock)
@@ -98,7 +92,6 @@ typedef struct {
 
 typedef struct {
 	pthread_mutex_t		lock;
-	struct locked_action	*free_actions;
 } __attribute__ ((aligned(64))) tfd_lock_t;
 
 #define	tfd_lock(tfdi)	 pthread_mutex_lock(&__thr_current_instance->tfd_locks[TFDI_TO_LOCK_INDEX(tfdi)].lock)
@@ -223,19 +216,18 @@ struct task {
 	volatile uint32_t		type:3,			// Type of task
 					io_depth:3,		// How many direct calls to allow before queueing
 					state:2,		// Operational state of the task
-
-					notifyqlen:4,		// Number of notifyq entries this task has
+#define	MAX_LOCKED_ACTIONS	(15)
+					num_locked_actions:4,	// The number of locked actions we have pending
+#define	MAX_NOTIFY_QUEUE_LEN	(7)
+					notifyqlen:3,		// Number of notifyq entries this task has
+					forward_close:1,	// Temporarily allow close action forwarding
 					rd_state:2,		// Which read operation is in progress
 					wr_state:2,		// Which write operation is in progress
-
 					rd_shut:1,		// If the read side is shutdown
 					wr_shut:1,		// If the write side is shutdown
 					registered_fd:1,	// If the FD was registered by the user
-					forward_close:1,	// Temporarily allow close action forwarding
 					listen_child:1,		// If task is a child listener
-					have_locked_flags:1,	// There are locked active flags available
-
-					unused:10;
+					unused:8;
 	int64_t				tfd;			// Task File Descriptor that identifies this task
 	struct ntfyq			*freeq;			// The list of child accept tasks
 	struct worker			*worker;		// The current io worker task is bound to
@@ -316,14 +308,13 @@ struct task {
 	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
 	void				*connect_cb_data;
 	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
-	struct locked_action		*active_flags_locked;	// Queue of locked actions
 	struct worker			*preferred_worker;	// To initiate task io worker migration
 	struct task			*task_next;		// List of free tasks
 	struct task_dormant		*dormant;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
-	struct ntfyq			free1;
-	struct ntfyq			free2;
+__attribute__ ((aligned(64))) struct ntfyq	free1;
+	struct ntfyq				free2;
 } __attribute__ ((aligned(64)));
 
 typedef enum {
@@ -431,6 +422,7 @@ struct instance {
 	int32_t				ti;
 
 	// TFD->task pool
+	task_action_flag_t		*locked_actions;
 	struct task			*tfd_pool;		// The total pool of tasks we can work with
 	struct task_dormant		*tfd_dormant;		// The "dormant" portion of the task pool
 	struct task			*free_tasks;
@@ -908,105 +900,66 @@ task_free(struct task *t)
 } // task_free
 
 
-static void
-task_pickup_locked_flags_real(register struct task *t)
-{
-	register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
-	register uint64_t lock_index = TFDI_TO_LOCK_INDEX(tfdi);
-	register struct locked_action *lalr = NULL, *lal = NULL, *tmp;
-	register struct instance *i = __thr_current_instance;
-
-	assert(lockless_worker(t->worker));
-
-	// It's not great to hold the lock for this many CPU cycles, but generally this shouldn't
-	// be called too often, and the code is (presently) such that this list never grows beyond
-	// 2 entries at most before being picked up by the correct worker thread.  The alternative
-	// is locking for all flag updates, and that's 5-6 orders of magnitude more expensive, so
-	// we'll just take the occasional long lock on the chin next to that nightmare
-	tfd_lock(tfdi);
-
-	lalr = t->active_flags_locked;
-	t->active_flags_locked = NULL;
-
-	// Now reverse the order
-	while ((tmp = lalr) != NULL) {
-		lalr = tmp->next;
-		tmp->next = lal;
-		lal = tmp;
-	}
-
-	// Now play it back and apply to the active_flags
-	while ((tmp = lal) != NULL) {
-		if (tmp->action & FLG_DRP) {
-			t->active_flags &= ~(tmp->action);
-		} else {
-			t->active_flags |= tmp->action;
-		}
-		lal = tmp->next;
-		tmp->next = lalr;
-		lalr = tmp;
-	}
-
-	// Now free the list
-	while ((tmp = lalr) != NULL) {
-		lalr = tmp->next;
-		tmp->next = i->tfd_locks[lock_index].free_actions;
-		i->tfd_locks[lock_index].free_actions = tmp;
-	}
-	t->have_locked_flags = false;
-	tfd_unlock(tfdi);
-} // task_pickup_locked_flags_real
-
-
 static inline void
 task_pickup_locked_flags(register struct task *t)
 {
-	if (unlikely(t->have_locked_flags)) {
-		task_pickup_locked_flags_real(t);
+	if (unlikely(t->num_locked_actions > 0)) {
+		register uint32_t n, r, tfdi;
+		register task_action_flag_t *actions;
+
+		assert(lockless_worker(t->worker));
+
+		tfdi = TFD_TO_INDEX(t->tfd);
+		actions = __thr_current_instance->locked_actions + (tfdi * (MAX_LOCKED_ACTIONS + 1));
+
+		tfd_lock(tfdi);
+		r = t->num_locked_actions;
+		for (n = 0; n < r; n++) {
+			if (actions[n] & FLG_DRP) {
+				t->active_flags &= ~(actions[n]);
+			} else {
+				t->active_flags |= actions[n];
+			}
+		}
+		t->num_locked_actions = 0;
+		tfd_unlock(tfdi);
 	}
 } // task_pickup_locked_flags
 
 
 static inline void
-task_add_locked_flags(struct task *t, task_action_flag_t action)
+task_add_locked_flag(struct task *t, task_action_flag_t action)
 {
-	register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
-	register uint64_t lock_index = TFDI_TO_LOCK_INDEX(tfdi);
-	register struct locked_action *lact;
-	register struct instance *i = __thr_current_instance;
+	register uint32_t n, tfdi = TFD_TO_INDEX(t->tfd);
+	register task_action_flag_t *actions;
 
-	// See task_pickup_locked_flags_real for comment about this lengthy lock hold
-	// It's easier (and faster) to lift 100kgs once, than to lift 1kg one million
-	// times, especially in what is a minimal lock-contention design like this is
+	// If you're hitting the below assert, you've done something horribly wrong.  Just like the
+	// notifyq system, locked actions are only meant to communicate state transitions pending
+	// being picked up and processed by the task's worker thread.  There can only be so many
+	// that can be active at once until the MAX_IO_DEPTH cutoff kicks in and forces the task
+	// onto the correct worker thread where the locked actions will be picked up
+	assert(t->num_locked_actions < MAX_LOCKED_ACTIONS);
+
+	// Scan the current list in reverse order.  We only need to find the last matching action
+	actions = __thr_current_instance->locked_actions + (tfdi * (MAX_LOCKED_ACTIONS + 1));
 	tfd_lock(tfdi);
-
-	// Don't add if it's already there.  Only need to find the
-	// first matching entry since it's in reverse order
-	for (lact = t->active_flags_locked; lact; lact = lact->next) {
-		if (lact->action & action) {
-			if (lact->action != action) {
-				// It's not set (the FLG_DRP's differ), so add it
+	if ((n = t->num_locked_actions) > 0) {
+		do {
+			if (actions[--n] & action) {
+				// We have a match!
+				if (actions[n] == action) {
+					// Perfect match! Just leave
+					tfd_unlock(tfdi);
+					return;
+				}
+				// It's there, but the FLG_DRP flags differ, so add it
 				break;
 			}
-			// It is set, get out of here
-			tfd_unlock(tfdi);
-			return;
-		}
+		} while (n > 0);
 	}
-
-	if ((lact = i->tfd_locks[lock_index].free_actions) != NULL) {
-		i->tfd_locks[lock_index].free_actions = lact->next;
-		lact->next = NULL;
-	} else {
-		lact = calloc(1, sizeof(struct locked_action));
-		assert(lact != NULL);
-	}
-	lact->action = action;
-	lact->next = t->active_flags_locked;
-	t->active_flags_locked = lact;
-	t->have_locked_flags = true;
+	actions[t->num_locked_actions++] = action;
 	tfd_unlock(tfdi);
-} // task_add_locked_flags
+} // task_add_locked_flag
 
 
 // Safely raises the flag on the task.
@@ -1014,7 +967,7 @@ static inline void
 task_lock(struct task *t, task_action_flag_t action)
 {
 	if (!lockless_worker(t->worker)) {
-		task_add_locked_flags(t, action);
+		task_add_locked_flag(t, action);
 	} else {
 		task_pickup_locked_flags(t);
 		t->active_flags |= action;
@@ -1030,7 +983,7 @@ task_unlock(struct task *t, task_action_flag_t action)
 	register uint32_t tfdi = t->tfd_index;
 
 	if (unlikely(!lockless_worker(t->worker))) {
-		return task_add_locked_flags(t, (action | FLG_DRP));
+		return task_add_locked_flag(t, (action | FLG_DRP));
 	}
 
 	task_pickup_locked_flags(t);
@@ -1041,7 +994,7 @@ task_unlock(struct task *t, task_action_flag_t action)
 			// Need to grab the tfd lock to check the next 2 items
 			tfd_lock(tfdi);
 			if (ck_pr_load_64(&t->dormant->notifyqlen_locked) == 0) {
-				if (t->active_flags_locked == NULL) {
+				if (t->num_locked_actions == 0) {
 					tfd_unlock(tfdi);
 					task_free(t);
 					return;
@@ -1120,7 +1073,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		}
 		tfd_unlock(tfdi);
 
-		task_add_locked_flags(t, action);
+		task_add_locked_flag(t, action);
 	} else {
 		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
 			errno = EBADF;
@@ -1182,7 +1135,6 @@ task_get_free_task(void)
 	}
 	i->free_tasks = t->task_next;
 	assert(t->state == TASK_STATE_UNUSED);
-	assert(t->active_flags_locked == NULL);
 	t->state = TASK_STATE_ACTIVE;
 	pthread_mutex_unlock(&i->cpulock);
 
@@ -1645,6 +1597,14 @@ task_notify_action(register struct task *t, register task_action_flag_t action)
 	}
 
 	if (likely(lockless_worker(w))) {
+		// If you're seeing this assert fire, you've done something very wrong.  At its
+		// most essential level, the notifyq system communicates state transitions on a
+		// task. It is not inended to be a "mass order" update system.  Transitions must
+		// be processed by the IO worker before issuing more changes.  There are certain
+		// transitions that can happen in parallel, but there is ALWAYS less than
+		// MAX_NOTIFY_QUEUE_LEN of those
+		assert(t->notifyqlen < MAX_NOTIFY_QUEUE_LEN);
+
 		t->notifyqlen++;
 
 		if (likely((tq = t->freeq) != NULL)) {
@@ -4641,14 +4601,9 @@ instance_destroy(struct instance *i)
 	}
 	if (i->tfd_pool) {
 		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
-			struct locked_action *lact;
 #ifndef USE_TICKET_LOCKS
 			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
 #endif
-			while ((lact = i->tfd_locks[n].free_actions) != NULL) {
-				i->tfd_locks[n].free_actions = lact->next;
-				free(lact);
-			}
 		}
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
@@ -4658,11 +4613,17 @@ instance_destroy(struct instance *i)
 		i->tfd_dormant = NULL;
 	}
 	if (i->tfd_locks_real) {
+		// Hack to get around compiler warning stubborness over not passing volatile
+		// pointers to free().  Hey, don't judge me!  It gets the job done!
 		union { volatile void *a; void *b;} whatevs;
 		whatevs.a = i->tfd_locks_real;
 		free(whatevs.b);
 		i->tfd_locks_real = NULL;
 		i->tfd_locks = NULL;
+	}
+	if (i->locked_actions) {
+		free(i->locked_actions);
+		i->locked_actions = NULL;
 	}
 	if (i->cpus) {
 		for(int n = 0; n < i->num_cpus; n++) {
@@ -4745,6 +4706,17 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		task_init(t, tfdi);
 		t->task_next = i->free_tasks;
 		i->free_tasks = t;
+	}
+
+	// Allocate the locked action flag storage
+	num_pages = (MAX_LOCKED_ACTIONS + 1) * sizeof(task_action_flag_t);
+	num_pages *= pool_size;
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
+
+	if ((i->locked_actions = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
+		i->locked_actions = NULL;
+		return -1;
 	}
 
 	// Allocate the lock storage now.  We 

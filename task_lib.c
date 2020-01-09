@@ -152,7 +152,6 @@ typedef enum {
 	FLG_WR	=	0x00000002,		// A write for a TFD is active
 	FLG_RT	=	0x00000004,		// A Read Timeout Update is active
 	FLG_WT	=	0x00000008,		// A Write Timeout Update is active
-	FLG_PW	=	0x00000010,		// Poll Table Entry Reference
 	FLG_LU	=	0x00000020,		// Lookup Lock
 	FLG_CO	=	0x00000040,		// A Connect Task is active
 	FLG_LI	=	0x00000080,		// A Listen Task is active
@@ -160,7 +159,7 @@ typedef enum {
 	FLG_MG	=	0x00000200,		// A Migration Event is active
 	FLG_CL	=	0x00000400,		// A Close Event is active
 	FLG_BND	=	0x00000800,		// A Bind operation is in progress
-	FLG_CN = 	0x00001000,		// Task is connecting
+	FLG_CN	= 	0x00001000,		// Task is connecting
 	FLG_CCB =	0x00002000,		// A Close CallBack API is in progress
 	FLG_TC	=	0x00004000,		// A Timer Cancel API is in progress
 	FLG_TD	=	0x00008000,		// A Timer Destroy API is in progress
@@ -172,10 +171,10 @@ typedef enum {
 } task_action_flag_t;
 
 struct ntfyq {
-	struct ntfyq			*next;
-	uint64_t			tfd;
-	uint32_t			action;
-	uint32_t			unused;
+	struct ntfyq		*next;
+	uint64_t		tfd;
+	uint32_t		action;
+	uint32_t		unused;
 };
 
 struct task_timer {
@@ -188,7 +187,7 @@ struct task_timer {
 
 // The task structure is broken into 2 parts, being the "dormant" and "active" portions. Infrequently
 // accessed fields exists within the "dormant" portion.  The sizes of these structures are also
-// broken out into 3 x 64 byte, and 7 x 64 byte sized elements, which introduces a staggered data
+// broken out into 3 x 64 byte, and 8 x 64 byte sized elements, which introduces a staggered data
 // "striding" pattern for the CPU caches for better CPU cache-set utlisation
 
 struct task_dormant {
@@ -961,7 +960,6 @@ task_add_locked_action(struct task *t, task_action_flag_t action)
 
 	// Scan the current list in reverse order.  We need to find the last matching action
 	actions = __thr_current_instance->locked_actions + (tfdi * (MAX_LOCKED_ACTIONS + 1));
-	tfd_lock(tfdi);
 	if ((n = t->num_locked_actions) > 0) {
 		do {
 			if ((actions[--n] & action) != 0) {
@@ -970,14 +968,12 @@ task_add_locked_action(struct task *t, task_action_flag_t action)
 					// It's there, but one has a FLG_DRP flag. Add it
 					break;
 				}
-				// Perfect match!  Nothing to do, just unlock and go
-				tfd_unlock(tfdi);
+				// Perfect match!  Nothing to do, just go
 				return;
 			}
 		} while (n > 0);
 	}
 	actions[t->num_locked_actions++] = action;
-	tfd_unlock(tfdi);
 } // task_add_locked_action
 
 
@@ -986,7 +982,9 @@ static inline void
 task_lock(struct task *t, task_action_flag_t action)
 {
 	if (!lockless_worker(t->worker)) {
+		tfd_lock(TFD_TO_INDEX(t->tfd));
 		task_add_locked_action(t, action);
+		tfd_unlock(TFD_TO_INDEX(t->tfd));
 	} else {
 		if (unlikely(t->num_locked_actions > 0)) {
 			task_pickup_locked_actions(t);
@@ -1004,7 +1002,10 @@ task_unlock(struct task *t, task_action_flag_t action)
 	register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
 
 	if (unlikely(!lockless_worker(t->worker))) {
-		return task_add_locked_action(t, (action | FLG_DRP));
+		tfd_lock(tfdi);
+		task_add_locked_action(t, (action | FLG_DRP));
+		tfd_unlock(tfdi);
+		return;
 	}
 
 	if (unlikely(t->num_locked_actions > 0)) {
@@ -1132,9 +1133,8 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 			errno = EINPROGRESS;
 			return NULL;
 		}
-		tfd_unlock(tfdi);
-
 		task_add_locked_action(t, action);
+		tfd_unlock(tfdi);
 	} else {
 		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
 			errno = EBADF;
@@ -1655,7 +1655,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 	}
 
 	// Do not lock IO timeout flags.  Their presence is already implied by their parent
-	// FLG_RD/FLG_WR flags. Also don't lock for connecting events, FLG_CO is already set
+	// FLG_RD/FLG_WR flags. Also don't lock for connecting events, write flags cover this
 	if ((action & (FLG_RD | FLG_WR | FLG_RT | FLG_WT | FLG_CN | FLG_TM)) == 0) {
 		// Only call task_lock() if we actually need to
 		if (unlikely((t->active_flags & action) == 0)) {
@@ -1798,13 +1798,21 @@ task_create_event_flag(register struct task *t, register struct worker *w)
 	if (likely(t->rd_shut == false)) {
 		t->ev.events |= EPOLLRDHUP;
 	}
-	task_lock(t, FLG_PW);
 
 #ifdef USE_EPOLLONESHOT
 	t->ev.events |= EPOLLONESHOT;
 #endif
 
 	register int res = epoll_ctl(w->gepfd, EPOLL_CTL_ADD, t->fd, &t->ev);
+
+	// If it's already registered, don't treat it as an error, it just
+	// means that someone beat us to adding it
+	if ((res < 0) && (errno == EEXIST)) {
+		// Just update the reference with ours now
+		res = epoll_ctl(w->gepfd, EPOLL_CTL_MOD, t->fd, &t->ev);
+	} else if (res == 0) {
+		t->in_epoll = true;
+	}
 
 #ifdef USE_EPOLLET
 	// Only turn on EPOLLET AFTER the add, or we race
@@ -1813,9 +1821,6 @@ task_create_event_flag(register struct task *t, register struct worker *w)
 		t->ev.events |= EPOLLET;
 	}
 #endif
-	if (res == 0) {
-		t->in_epoll = true;
-	}
 
 	return res;
 } // task_create_event_flag
@@ -1969,12 +1974,6 @@ task_do_close_cb(struct task *t)
 	// This is it boys, this is war! C'mon what are you waiting for?
 	t->state = TASK_STATE_DESTROY;
 
-	// If the user closes a connect socket, the FLG_CO doesn't carry though
-	// We need to catch and set it here so the task can get properly freed
-	if(t->type == TASK_TYPE_CONNECT) {
-		task_lock(t, FLG_CO);
-	}
-
 	__thr_preferred_worker = NULL;
 
 	// If it's a listener, remove it from the worker's listeners list
@@ -1997,10 +1996,9 @@ task_do_close_cb(struct task *t)
 			shutdown(t->fd, SHUT_RDWR);
 			close(t->fd);
 		}
-		task_unlock(t, FLG_PW);		// Disable All Poll Wait Flags Now
+		t->in_epoll = false;
 		t->ev.events = 0;
 		t->fd = -1;
-		t->in_epoll = false;
 		task_cancel_read(t);
 		task_cancel_write(t);
 	}
@@ -2375,7 +2373,7 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 
 		tac = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
 		task_lock(t, FLG_CL);
-		task_unlock(t, FLG_LI);
+		tac->rd_state = TASK_READ_STATE_IDLE;
 		task_do_close_cb(tac);
 	}
 } // task_shutdown_listen_children
@@ -3368,7 +3366,7 @@ task_handle_listen_event_fail:
 	// Major accept failure.  Cancel the accept task
 	// Inform user that accept is now failing/gone
 	task_lock(t, FLG_CL);
-	task_unlock(t, FLG_RD | FLG_LI);
+	t->rd_state = TASK_READ_STATE_IDLE;
 	task_do_close_cb(t);	// Unlocks task
 } // task_handle_listen_event
 
@@ -3837,8 +3835,8 @@ worker_process_notifyq(register struct worker *w)
 				if (t->type == TASK_TYPE_LISTEN) {
 					if (t->listen_child == 0) {
 						task_shutdown_listen_children(w, t);
-						task_unlock(t, FLG_LI);
 					}
+					t->rd_state = TASK_READ_STATE_IDLE;
 				}
 				task_do_close_cb(t);	// FLG_CL is always reset by task_do_close_cb
 				continue;
@@ -4016,7 +4014,6 @@ worker_do_io_epoll(register struct worker *w)
 		// If Task is in Destroy State, unlock and go
 		t = __thr_current_instance->tfd_pool + tfdi;
 		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
-			task_unlock(t, FLG_PW);
 			continue;
 		}
 
@@ -4024,9 +4021,8 @@ worker_do_io_epoll(register struct worker *w)
 			task_pickup_locked_actions(t);
 		}
 
-		// Check if the action got cancelled.
-		if (unlikely((t->active_flags & FLG_PW) == 0)) {
-			task_unlock(t, FLG_PW);
+		// Check if task still in epoll
+		if (unlikely(t->in_epoll == false)) {
 			continue;
 		}
 
@@ -4038,9 +4034,8 @@ worker_do_io_epoll(register struct worker *w)
 worker_do_io_epoll_fail:
 				t->rd_shut = true;
 				t->wr_shut = true;
-				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				epoll_ctl(t->worker->gepfd, EPOLL_CTL_DEL, t->fd, NULL);
 				t->in_epoll = false;
+				epoll_ctl(t->worker->gepfd, EPOLL_CTL_DEL, t->fd, NULL);
 				if (t->rd_state != TASK_READ_STATE_IDLE) {
 					task_handle_rd_event(t);	// Unlocks  the task
 					continue;
@@ -4049,7 +4044,6 @@ worker_do_io_epoll_fail:
 					task_handle_wr_event(t);	// Unlocks  the task
 					continue;
 				}
-				task_unlock(t, FLG_PW);
 				task_notify_action(t, FLG_CL, false);
 				continue;
 			}
@@ -4434,7 +4428,6 @@ instance_listen_balance(struct task *t)
 		nt->accept_cb_data = t->accept_cb_data;
 		nt->rd_expires_in_us = TIMER_TIME_DESTROY;
 		nt->rd_state = TASK_READ_STATE_LISTEN;
-		task_lock(nt, FLG_LI);
 		if (task_raise_event_flag(nt, EPOLLIN) < 0) {
 			perror("instance_listen_balance->task_raise_event_flag");
 			task_lower_event_flag(nt, (EPOLLIN | EPOLLOUT));
@@ -5376,6 +5369,7 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 	// Convert this task to a parent listener type and inform task to expect incoming events
 	t->type = TASK_TYPE_LISTEN;
+	t->rd_state = TASK_READ_STATE_LISTEN;
 	t->listen_child = 0;
 	t->accept_cb = accept_cb;
 	t->accept_cb_data = accept_cb_data;
@@ -5420,7 +5414,6 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 	// Listeners do not have IO timeouts.  Make sure of it
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
-	t->rd_state = TASK_READ_STATE_LISTEN;
 	if (task_raise_event_flag(t, EPOLLIN) < 0) {
 		int err = errno;
 		task_unlock(t, FLG_LI);
@@ -5436,6 +5429,9 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 	// Now apply the listener to all IO workers
 	instance_listen_balance(t);
+
+	// Release the FLG_LI flag.  The TASK_READ_STATE_LISTEN flag protects us now
+	task_unlock(t, FLG_LI);
 	return 0;
 } // TASK_socket_listen
 

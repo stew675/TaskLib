@@ -1675,9 +1675,15 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 	if (likely(lockless_worker(w))) {
 		// Try to process the action immediately if it's allowable.  We always queue
 		// closes to give other activities a chance to realise the task is finished
-		if ((action & (FLG_CN | FLG_MG | FLG_CL)) == 0) {
+		if ((action & (FLG_CN | FLG_MG | FLG_CL | FLG_WR | FLG_RD)) == 0) {
 			worker_process_one_action(w, t, action);
 			return true;
+		} else if (action & (FLG_RD | FLG_WR)) {
+			if (t->io_depth < TASK_MAX_IO_DEPTH) {
+				worker_process_one_action(w, t, action);
+			} else {
+				t->io_depth = 0;
+			}
 		}
 
 		// If you're seeing this assert fire, you've done something very wrong.  At its
@@ -1847,6 +1853,7 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 	register struct worker *w = t->worker;
 	register int res;
 
+	t->io_depth = 0;
 	t->ev.events |= flags;
 	if (likely(t->in_epoll)) {
 		res = epoll_ctl(w->gepfd, EPOLL_CTL_MOD, t->fd, &t->ev);
@@ -5038,21 +5045,18 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 
 	// Check if we can call the writev handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
-		if (likely(lockless_worker(t->worker)) || (t->io_depth == 0)) {
-			ssize_t result;
+		ssize_t result;
 
-			t->io_depth++;
-			if ((result = task_write_vector(t, false)) == 0) {
-				return 0;
-			}
-			t->wr_expires_modified = false;
-			t->wr_state = TASK_WRITE_STATE_IDLE;
-			return result;
+		t->io_depth++;
+		if ((result = task_write_vector(t, false)) == 0) {
+			return 0;
 		}
+		t->wr_expires_modified = false;
+		t->wr_state = TASK_WRITE_STATE_IDLE;
+		return result;
 	}
 
 	// Queue the writev
-	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_WR, false) == false)) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
@@ -5118,21 +5122,20 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 
 	// Check if we can call the write handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
-		if (likely(lockless_worker(t->worker)) || (t->io_depth == 0)) {
-			ssize_t result;
+		ssize_t result;
 
-			t->io_depth++;
-			if ((result = task_write_buffer(t, false)) == 0) {
-				return 0;
-			}
-			t->wr_state = TASK_WRITE_STATE_IDLE;
-			return result;
+		t->io_depth++;
+		if ((result = task_write_buffer(t, false)) == 0) {
+			return 0;
 		}
+		t->wr_expires_modified = false;
+		t->wr_state = TASK_WRITE_STATE_IDLE;
+		return result;
 	}
 
 	// Queue the write
-	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_WR, false) == false)) {
+		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
 		return -1;
 	}
@@ -5211,21 +5214,18 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 
 	// Check if we can call the readv handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
-		if (likely(lockless_worker(t->worker)) || (t->io_depth == 0)) {
-			ssize_t result;
+		ssize_t result;
 
-			t->io_depth++;
-			if ((result = task_read_vector(t, false)) == 0) {
-				return 0;
-			}
-			t->rd_expires_modified = false;
-			t->rd_state = TASK_READ_STATE_IDLE;
-			return result;
+		t->io_depth++;
+		if ((result = task_read_vector(t, false)) == 0) {
+			return 0;
 		}
+		t->rd_expires_modified = false;
+		t->rd_state = TASK_READ_STATE_IDLE;
+		return result;
 	}
 
 	// Queue the read
-	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_RD, false) == false)) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
@@ -5290,21 +5290,18 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 
 	// Check if we can call the read handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
-		if (likely(lockless_worker(t->worker)) || (t->io_depth == 0)) {
-			ssize_t result;
+		ssize_t result;
 
-			t->io_depth++;
-			if ((result = task_read_buffer(t, false)) == 0) {
-				return 0;
-			}
-			t->rd_expires_modified = false;
-			t->rd_state = TASK_READ_STATE_IDLE;
-			return result;
+		t->io_depth++;
+		if ((result = task_read_buffer(t, false)) == 0) {
+			return 0;
 		}
+		t->rd_expires_modified = false;
+		t->rd_state = TASK_READ_STATE_IDLE;
+		return result;
 	}
 
 	// Queue the read
-	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_RD, false) == false)) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;

@@ -228,7 +228,7 @@ struct task {
 	struct epoll_event		ev;			// The current epoll events we're waiting on
 	int32_t				epfd;			// The worker epoll fd the above fd is registered with
 	int32_t				fd;			// The actual system socket FD we're working on
-	int32_t				cb_errno;		// Errno we want to propagate on callbacks
+	int32_t				unused_two;
 	int64_t				unused_one;
 	int64_t				age;			// Time this task was created
 
@@ -248,7 +248,8 @@ __attribute__ ((aligned(64))) const char *wr_buf;
 	uint32_t			wr_state:2,
 					wt_attached:1,
 					wr_shut:1,
-					wr_unused:28;
+					wr_cancel:1,
+					wr_unused:27;
 	void				*wr_cb_data;
 	void				(*wr_cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data);
 
@@ -268,7 +269,8 @@ __attribute__ ((aligned(64))) char	*rd_buf;
 	uint32_t			rd_state:2,
 					rt_attached:1,
 					rd_shut:1,
-					rd_unused:28;
+					rd_cancel:1,
+					rd_unused:27;
 	void				*rd_cb_data;
 	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
 
@@ -557,8 +559,8 @@ task_dump(struct task *t)
 		fprintf(stderr, "BAD STATE\n");
 		break;
 	}
-	fprintf(stderr, "FD = %d, errno = %d, age = %ld, migrations = %d\n",
-			t->fd, t->cb_errno, t->age, t->dormant->migrations);
+	fprintf(stderr, "FD = %d, age = %ld, migrations = %d\n",
+			t->fd, t->age, t->dormant->migrations);
 	fprintf(stderr, "\n");
 } // task_dump
 
@@ -994,22 +996,48 @@ task_unlock(struct task *t, task_action_flag_t action)
 	if (unlikely(t->num_locked_actions > 0)) {
 		task_pickup_locked_actions(t);
 	}
+
 	t->active_flags &= ~(action);
 
-	if (unlikely(t->state == TASK_STATE_DESTROY)) {
-		if ((t->active_flags == 0) && (t->notifyqlen == 0)) {
-			// Need to grab the tfd lock to check the next 2 items
-			tfd_lock(tfdi);
-			if (ck_pr_load_64(&t->notifyqlen_locked) == 0) {
-				if (t->num_locked_actions == 0) {
-					tfd_unlock(tfdi);
-					task_free(t);
-					return;
-				}
-			}
-			tfd_unlock(tfdi);
-		}
+	if (t->active_flags) {
+		return;
 	}
+
+	if (likely(t->state != TASK_STATE_DESTROY)) {
+		return;
+	}
+
+	if (t->notifyqlen) {
+		return;
+	}
+
+	// Need to grab the tfd lock to check the next set of items
+	tfd_lock(tfdi);
+
+	if (t->rd_state != TASK_READ_STATE_IDLE) {
+		tfd_unlock(tfdi);
+		return;
+	}
+
+	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
+		tfd_unlock(tfdi);
+		return;
+	}
+
+	if (ck_pr_load_64(&t->notifyqlen_locked)) {
+		tfd_unlock(tfdi);
+		return;
+	}
+
+	if (t->num_locked_actions) {
+		tfd_unlock(tfdi);
+		return;
+	}
+
+	// We're all clear to release/free the task
+	tfd_unlock(tfdi);
+	task_free(t);
+	return;
 } // task_unlock
 
 
@@ -1606,6 +1634,10 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		}
 	} else if (action == FLG_CL) {
 		t->state = TASK_STATE_DESTROY;
+		t->rd_shut = true;
+		t->wr_shut = true;
+		t->rd_cancel = true;
+		t->wr_cancel = true;
 	}
 
 	// Do not lock IO timeout flags.  Their presence is already implied by their parent
@@ -1789,12 +1821,6 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 
 	if (unlikely(res < 0)) {
 		t->ev.events &= ~flags;
-		if (flags & EPOLLIN) {
-//			task_unlock(t, FLG_RD);
-		}
-		if (flags & EPOLLOUT) {
-//			task_unlock(t, FLG_WR);
-		}
 		return -1;
 	}
 
@@ -1873,47 +1899,31 @@ task_cancel_timer(struct task *t, task_action_flag_t action)
 } // task_cancel_timer
 
 
-static void
+static inline void
 task_cancel_write(struct task *t)
 {
+	t->wr_shut = true;
+	t->wr_cancel = true;
+	t->wr_state = TASK_WRITE_STATE_IDLE;
+
 	if (t->wt_attached) {
 		task_cancel_timer(t, FLG_WT);
 	}
-
-#ifdef USE_EPOLLET
- 	// Turn off EPOLLET here onwards for safety
-	t->ev.events &= ~(EPOLLET);
-#endif
-
-	task_lower_event_flag(t, EPOLLOUT);
-
-#ifdef USE_EPOLLONESHOT
-	// Ensure to call EPOLL_CTL_MOD
-	epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
-#endif
 
 	task_unlock(t, FLG_WR);
 } // task_cancel_write
 
 
-static void
+static inline void
 task_cancel_read(struct task *t)
 {
+	t->rd_shut = true;
+	t->rd_cancel = true;
+	t->rd_state = TASK_READ_STATE_IDLE;
+
 	if (t->rt_attached) {
 		task_cancel_timer(t, FLG_RT);
 	}
-
-#ifdef USE_EPOLLET
-	// Turn off EPOLLET here onwards for safety
-	t->ev.events &= ~(EPOLLET);
-#endif
-
-	task_lower_event_flag(t, EPOLLIN);
-
-#ifdef USE_EPOLLONESHOT
-	// Ensure to call EPOLL_CTL_MOD
-	epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &t->ev);
-#endif
 
 	task_unlock(t, FLG_RD);
 } // task_cancel_read
@@ -1924,7 +1934,6 @@ task_do_close_cb(struct task *t)
 {
 	void (*cb)(int64_t tfd, void *close_cb_data) = t->close_cb;
 	void *cb_data = t->close_cb_data;
-	int err = t->cb_errno;
 	int64_t tfd = t->tfd;
 
 	assert(t->active_flags & FLG_CL);
@@ -1968,6 +1977,7 @@ task_do_close_cb(struct task *t)
 			close(t->fd);
 		}
 		task_unlock(t, FLG_PW);		// Disable All Poll Wait Flags Now
+		t->ev.events = 0;
 		t->epfd = -1;
 		t->fd = -1;
 		task_cancel_read(t);
@@ -2002,21 +2012,18 @@ task_do_close_cb(struct task *t)
 	}
 
 	task_unlock(t, FLG_CL);
-	errno = err;
+	errno = 0;
 	cb(tfd, cb_data);
 } // task_do_close_cb
 
 
 static void
-task_do_readv_cb(struct task *t, ssize_t result)
+task_do_readv_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 {
 	void (*cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data) = t->rdv_cb;
 	void *cb_data = t->rd_cb_data;
 	const struct iovec *iov = t->rdv_iov;
 	int iovcnt = t->rdv_iovcnt;
-	size_t len = t->rdv_bufpos;
-	int err = t->cb_errno;
-	int64_t tfd = t->tfd;
 
 	t->rd_state = TASK_READ_STATE_IDLE;
 	if (t->rt_attached) {
@@ -2024,13 +2031,13 @@ task_do_readv_cb(struct task *t, ssize_t result)
 	}
 
 	// If we don't have a callback, just terminate the write peacefully
-	if (unlikely(cb == NULL)) {
-		return task_unlock(t, FLG_RD);
+	if (unlikely(cb == NULL) || (t->rd_cancel)) {
+		return;
 	}
 
 	// If the instance is shutting down, don't make any callbacks
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
-		return task_unlock(t, FLG_RD);
+		return;
 	}
 
 
@@ -2041,14 +2048,8 @@ task_do_readv_cb(struct task *t, ssize_t result)
 		__thr_preferred_worker = NULL;
 	}
 
-	task_unlock(t, FLG_RD);
-
-	if (likely(result >= 0)) {
-		errno = 0;
-	} else {
-		errno = err;
-	}
-	cb(tfd, iov, iovcnt, len, cb_data);
+	errno = cb_errno;
+	cb(tfd, iov, iovcnt, result, cb_data);
 	__thr_preferred_worker = NULL;
 } // task_do_readv_cb
 
@@ -2066,13 +2067,13 @@ task_do_read_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 	}
 
 	// If we don't have a callback, just terminate the read peacefully
-	if (unlikely(cb == NULL)) {
-		return task_unlock(t, FLG_RD);
+	if (unlikely(cb == NULL) || (t->rd_cancel)) {
+		return;
 	}
 
 	// If the instance is shutting down, don't make any callbacks
  	if (unlikely(__thr_current_instance->state > INSTANCE_STATE_RUNNING)) {
-		return task_unlock(t, FLG_RD);
+		return;
 	}
 
 	if (likely(t->worker == __thr_current_worker)) {
@@ -2089,17 +2090,15 @@ task_do_read_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 
 
 static void
-task_do_accept_cb(struct task *t)
+task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno)
 {
 	void (*cb)(int64_t tfd, void *accept_cb_data) = t->accept_cb;
 	void *cb_data = t->accept_cb_data;
-	int err = t->cb_errno;
-	int64_t tfd = t->tfd;
 
 	t->accept_cb = NULL;
 	t->accept_cb_data = NULL;
 
-	if (unlikely(cb == NULL)) {
+	if (unlikely(cb == NULL) || t->rd_cancel) {
 		task_notify_action(t, FLG_CL, false);
 		return;
 	}
@@ -2110,20 +2109,18 @@ task_do_accept_cb(struct task *t)
 	}
 
 	__thr_preferred_worker = NULL;
-	errno = err;
+	errno = cb_errno;
 	cb(tfd, cb_data);		// t is still locked at this point
 } // task_do_accept_cb
 
 
 static void
-task_do_writev_cb(struct task *t, ssize_t result)
+task_do_writev_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 {
 	void (*cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data) = t->wrv_cb;
 	const struct iovec *iov = t->wrv_iov;
 	void *cb_data = t->wr_cb_data;
 	int iovcnt = t->wrv_iovcnt;
-	int err = t->cb_errno;
-	int64_t tfd = t->tfd;
 
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 	if (t->wt_attached) {
@@ -2131,13 +2128,13 @@ task_do_writev_cb(struct task *t, ssize_t result)
 	}
 
 	// If we don't have a callback, just terminate the write peacefully
-	if (unlikely(cb == NULL)) {
-		return task_unlock(t, FLG_WR);
+	if (unlikely(cb == NULL) || t->wr_cancel) {
+		return;
 	}
 
 	// If the instance is shutting down, don't make any callbacks
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
-		return task_unlock(t, FLG_WR);
+		return;
 	}
 
 	if (likely(t->worker == __thr_current_worker)) {
@@ -2147,13 +2144,7 @@ task_do_writev_cb(struct task *t, ssize_t result)
 		__thr_preferred_worker = NULL;
 	}
 
-	task_unlock(t, FLG_WR);
-
-	if (likely(result >= 0)) {
-		errno = 0;
-	} else {
-		errno = err;
-	}
+	errno = cb_errno;
 	cb(tfd, iov, iovcnt, result, cb_data);
 	__thr_preferred_worker = NULL;
 } // task_do_writev_cb
@@ -2172,13 +2163,13 @@ task_do_write_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 	}
 
 	// If we don't have a callback, just terminate the write peacefully
-	if (unlikely(cb == NULL)) {
-		return task_unlock(t, FLG_WR);
+	if (unlikely(cb == NULL) || t->wr_cancel) {
+		return;
 	}
 
 	// If the instance is shutting down, don't make any callbacks
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
-		return task_unlock(t, FLG_WR);
+		return;
 	}
 
 	if (likely(t->worker == __thr_current_worker)) {
@@ -2195,43 +2186,27 @@ task_do_write_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 
 
 static void
-task_do_connect_cb(struct task *t, int result)
+task_do_connect_cb(struct task *t, int64_t tfd, int result, int cb_errno)
 {
 	void (*cb)(int64_t tfd, int result, void *connect_cb_data) = t->connect_cb;
 	void *cb_data = t->connect_cb_data;
-	int err = t->cb_errno;
-	int64_t tfd = t->tfd;
-
-	// Connect sets FLG_WR as well.  Make sure that is released
-
-	// If there's no callback for the connection, all we can do it close it
-	if (unlikely(cb == NULL)) {
-		task_lock(t, FLG_CL);
-		task_unlock(t, FLG_CO | FLG_WR);
-		task_do_close_cb(t);
-		return;
-	}
 
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 	if (likely(t->wt_attached)) {
 		task_cancel_timer(t, FLG_WT);
 	}
 
+	// If there's no callback for the connection, just terminate
+	if (unlikely(cb == NULL) || (t->wr_cancel)) {
+		return;
+	}
+
  	if (unlikely(__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN)) {
-		close(t->fd);
-		t->fd = -1;
-		result = -1;
-		errno = EOWNERDEAD;
+		return;
 	}
-
 	__thr_preferred_worker = NULL;
-	task_unlock(t, FLG_CO | FLG_WR);
 
-	if (result < 0) {
-		errno = err;
-	} else {
-		errno = 0;
-	}
+	errno = cb_errno;
 	cb(tfd, result, cb_data);
 } // task_do_connect_cb
 
@@ -2313,9 +2288,8 @@ handle_read_timeout:
 		if (t->rd_state == TASK_READ_STATE_BUFFER) {
 			return task_do_read_cb(t, tfd, -1, ETIMEDOUT);
 		}
-		t->cb_errno = ETIMEDOUT;
 		if (t->rd_state == TASK_READ_STATE_VECTOR) {
-			return task_do_readv_cb(t, -1);
+			return task_do_readv_cb(t, tfd, -1, ETIMEDOUT);
 		}
 
 		// No reads were active, just cancel the timer and go
@@ -2348,12 +2322,11 @@ handle_write_timeout:
 		if (t->wr_state == TASK_WRITE_STATE_BUFFER) {
 			return task_do_write_cb(t, tfd, -1, ETIMEDOUT);
 		}
-		t->cb_errno = ETIMEDOUT;
 		if (t->wr_state == TASK_WRITE_STATE_CONNECT) {
-			return task_do_connect_cb(t, -1);
+			return task_do_connect_cb(t, tfd, -1, ETIMEDOUT);
 		}
 		if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
-			return task_do_writev_cb(t, -1);
+			return task_do_writev_cb(t, tfd, -1, ETIMEDOUT);
 		}
 
 		// No writes were active, just cancel the timer and go
@@ -2782,46 +2755,51 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 static ssize_t
 task_write_vector(register struct task *t, register bool queued)
 {
+	size_t wrv_bufpos = t->wrv_bufpos, wrv_buflen = t->wrv_buflen;
+	const struct iovec *wrv_iov = t->wrv_iov;
+	int wrv_iovcnt = t->wrv_iovcnt;
+	int64_t tfd = t->tfd;
+
 	// Keep trying to write until we're done, or we're blocked
-	while (t->wrv_bufpos < t->wrv_buflen) {
+	while (wrv_bufpos < wrv_buflen) {
 		ssize_t written;
 
-		t->cb_errno = 0;
-		if (t->wrv_bufpos > 0) {
+		if (wrv_bufpos > 0) {
 			struct iovec iov[IOV_MAX];
 			size_t iov_pos = 0, seek_pos = 0;
 			int n = 0, iovcnt = 0;
 
 			// Seek to the current write position within the caller provided iovec
 			do {
-				if ((seek_pos + t->wrv_iov[n].iov_len) > t->wrv_bufpos) {
+				if ((seek_pos + wrv_iov[n].iov_len) > wrv_bufpos) {
 					break;
 				}
-				seek_pos += t->wrv_iov[n].iov_len;
-			} while (++n < t->wrv_iovcnt);
+				seek_pos += wrv_iov[n].iov_len;
+			} while (++n < wrv_iovcnt);
 
 			// This must be true, otherwise our value for t->wrv_buflen is wrong/corrupted
-			assert(n < t->wrv_iovcnt);
+			assert(n < wrv_iovcnt);
 
 			// Now copy across the remainder into our stack local iov
-			iov_pos = t->wrv_bufpos - seek_pos;
-			iov[0].iov_len = t->wrv_iov[n].iov_len - iov_pos;
-			iov[0].iov_base = ((char *)t->wrv_iov[n].iov_base) + iov_pos;
-			for (iovcnt++, n++; n < t->wrv_iovcnt; n++, iovcnt++) {
-				iov[iovcnt].iov_len = t->wrv_iov[n].iov_len;
-				iov[iovcnt].iov_base = t->wrv_iov[n].iov_base;
+			iov_pos = wrv_bufpos - seek_pos;
+			iov[0].iov_len = wrv_iov[n].iov_len - iov_pos;
+			iov[0].iov_base = ((char *)wrv_iov[n].iov_base) + iov_pos;
+			for (iovcnt++, n++; n < wrv_iovcnt; n++, iovcnt++) {
+				iov[iovcnt].iov_len = wrv_iov[n].iov_len;
+				iov[iovcnt].iov_base = wrv_iov[n].iov_base;
 			}
 
 			// We've now got a copy in our local iov of the remainder of what's left to write
 			written = writev(t->fd, iov, iovcnt);
 		} else {
 			// We have no offset.  Just use what was passed to us for speed
-			written = writev(t->fd, t->wrv_iov, t->wrv_iovcnt);
+			written = writev(t->fd, wrv_iov, wrv_iovcnt);
 		}
 
 		if (written < 0) {
 			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
+				t->wrv_bufpos = wrv_bufpos;	// Need to record bufpos for later
 				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
 					errno = 0;
 					return 0;
@@ -2833,41 +2811,35 @@ task_write_vector(register struct task *t, register bool queued)
 			}
 
 			// Some other write or event flag raising error.  Inform caller
-			if (t->wrv_bufpos > 0) {
+			if (wrv_bufpos > 0) {
 				// If we had written something before the error.  Inform caller of how
 				// much that was.  They'll have to catch the error on their next write
 				errno = 0;
 				if (queued) {
-					t->cb_errno = 0;
-					task_do_writev_cb(t, (ssize_t)t->wrv_bufpos);	// Unlocks task
+					task_do_writev_cb(t, tfd, (ssize_t)wrv_bufpos, 0);	// Unlocks task
 					return 0;
 				}
-				t->wr_state = TASK_WRITE_STATE_IDLE;
-				return (ssize_t)t->wrv_bufpos;
+				return (ssize_t)wrv_bufpos;
 			}
 
 			if (queued) {
-				t->cb_errno = errno;
-				task_do_writev_cb(t, -1);	// Unlocks task
+				task_do_writev_cb(t, tfd, -1, errno);	// Unlocks task
 				return 0;
 			}
-			t->wr_state = TASK_WRITE_STATE_IDLE;
 			return -1;
 		}
 
 		// We wrote something!
-		t->wrv_bufpos += written;
+		wrv_bufpos += written;
 	}
 
 	// We wrote it all.  Make the callback
 	if (queued) {
-		t->cb_errno = 0;
-		task_do_writev_cb(t, (ssize_t)t->wrv_bufpos);	// Unlocks task
+		task_do_writev_cb(t, tfd, (ssize_t)wrv_bufpos, 0);	// Unlocks task
 		return 0;
 	}
 	errno = 0;
-	t->wr_state = TASK_WRITE_STATE_IDLE;
-	return (ssize_t)t->wrv_bufpos;
+	return (ssize_t)wrv_bufpos;
 } // task_write_vector
 
 
@@ -2959,19 +2931,19 @@ task_handle_connect_event(struct task *t)
 		worker_learn_cpu_affinity(t);
 	}
 
-	// Determine result of the connect
-	if (getsockopt(t->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
-		err = errno;
-	}
-
 	// Turn task into a regular IO task and make callback
 	t->type = TASK_TYPE_IO;
-	t->cb_errno = err;
 
-	if (err != 0) {
-		task_do_connect_cb(t, -1);		// Unlocks task
+	// Determine result of the connect
+	errno = 0;
+	if (getsockopt(t->fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0) {
+		errno = err;
+	}
+
+	if (errno != 0) {
+		task_do_connect_cb(t, t->tfd, -1, errno);	// Unlocks task
 	} else {
-		task_do_connect_cb(t, 1);		// Unlocks task
+		task_do_connect_cb(t, t->tfd, 1, 0);	// Unlocks task
 	}
 } // task_handle_connect_event
 
@@ -2981,7 +2953,6 @@ task_handle_connecting_action(struct task *t)
 {
 	// Start the connect
 	while (1) {
-		t->cb_errno = 0;
 		if (connect(t->fd, (struct sockaddr *)&t->dormant->addr, t->dormant->addrlen) == 0) {
 			task_handle_connect_event(t);
 			return;
@@ -2993,7 +2964,6 @@ task_handle_connecting_action(struct task *t)
 		}
 
 		if ((errno == EINPROGRESS) || (errno == EAGAIN)) {
-			task_lock(t, FLG_WR);
 			if (task_raise_event_flag(t, EPOLLOUT) < 0) {
 				break;
 			}
@@ -3004,47 +2974,51 @@ task_handle_connecting_action(struct task *t)
 	}
 
 	// Connect failure of some kind. Notify the caller
-	t->cb_errno = errno;
-	task_do_connect_cb(t, -1);		// Unlocks task
+	task_do_connect_cb(t, t->tfd, -1, errno);	// Unlocks task
 } // task_handle_connecting_action
 
 
 static ssize_t
 task_read_vector(register struct task *t, register bool queued)
 {
+	size_t rdv_bufpos = t->rdv_bufpos, rdv_buflen = t->rdv_buflen;
+	const struct iovec *rdv_iov = t->rdv_iov;
+	int rdv_iovcnt = t->rdv_iovcnt;
+	int64_t tfd = t->tfd;
+
 	// Read what we can
-	while (t->rdv_bufpos < t->rdv_buflen) {
+	while (rdv_bufpos < rdv_buflen) {
 		ssize_t reddin;
 
-		if (t->rdv_bufpos > 0) {
+		if (rdv_bufpos > 0) {
 			struct iovec iov[IOV_MAX];
 			size_t iov_pos = 0, seek_pos = 0;
 			int n = 0, iovcnt = 0;
 
 			// Seek to the current write position within the caller provided iovec
 			do {
-				if ((seek_pos + t->rdv_iov[n].iov_len) > t->rdv_bufpos) {
+				if ((seek_pos + rdv_iov[n].iov_len) > rdv_bufpos) {
 					break;
 				}
-				seek_pos += t->rdv_iov[n].iov_len;
-			} while (++n < t->rdv_iovcnt);
+				seek_pos += rdv_iov[n].iov_len;
+			} while (++n < rdv_iovcnt);
 
 			// This must be true, otherwise our value for t->rdv_buflen is wrong/corrupted
-			assert(n < t->rdv_iovcnt);
+			assert(n < rdv_iovcnt);
 
 			// Now copy across the remainder into our stack local iov
-			iov_pos = t->rdv_bufpos - seek_pos;
-			iov[0].iov_len = t->rdv_iov[n].iov_len - iov_pos;
-			iov[0].iov_base = ((char *)t->rdv_iov[n].iov_base) + iov_pos;
-			for (iovcnt++, n++; n < t->rdv_iovcnt; n++, iovcnt++) {
-				iov[iovcnt].iov_len = t->rdv_iov[n].iov_len;
-				iov[iovcnt].iov_base = t->rdv_iov[n].iov_base;
+			iov_pos = rdv_bufpos - seek_pos;
+			iov[0].iov_len = rdv_iov[n].iov_len - iov_pos;
+			iov[0].iov_base = ((char *)rdv_iov[n].iov_base) + iov_pos;
+			for (iovcnt++, n++; n < rdv_iovcnt; n++, iovcnt++) {
+				iov[iovcnt].iov_len = rdv_iov[n].iov_len;
+				iov[iovcnt].iov_base = rdv_iov[n].iov_base;
 			}
 
 			reddin = readv(t->fd, iov, iovcnt);
 		} else {
 			// We have no offset.  Just use what was passed to us for speed
-			reddin = readv(t->fd, t->rdv_iov, t->rdv_iovcnt);
+			reddin = readv(t->fd, rdv_iov, rdv_iovcnt);
 		}
 
 		if (reddin < 0) {
@@ -3052,15 +3026,13 @@ task_read_vector(register struct task *t, register bool queued)
 			if (errno == EAGAIN) {
 				// Make a callback now if we got anything at all
 				// Do not raise EPOLLIN again until user asks us to read more
-				if (t->rdv_bufpos > 0) {
+				if (rdv_bufpos > 0) {
 					if (queued) {
-						t->cb_errno = 0;
-						task_do_readv_cb(t, (ssize_t)t->rdv_bufpos);	// Unlocks task
+						task_do_readv_cb(t, tfd, (ssize_t)t->rdv_bufpos, 0);	// Unlocks task
 						return 0;
 					}
 					errno = 0;
-					t->rd_state = TASK_READ_STATE_IDLE;
-					return (ssize_t)t->rdv_bufpos;
+					return (ssize_t)rdv_bufpos;
 				}
 
 				// We got nothing at all.  Raise EPOLLIN and wait for something
@@ -3076,11 +3048,9 @@ task_read_vector(register struct task *t, register bool queued)
 
 			// Some other read or event flag raise error.
 			if (queued) {
-				t->cb_errno = errno;
-				task_do_readv_cb(t, -1);	// Unlocks task
+				task_do_readv_cb(t, tfd, -1, errno);	// Unlocks task
 				return 0;
 			}
-			t->rd_state = TASK_READ_STATE_IDLE;
 			return -1;
 		}
 
@@ -3088,41 +3058,35 @@ task_read_vector(register struct task *t, register bool queued)
 		if (reddin == 0) {
 			// Notify first if we have anything in the buffer.  The actual EOF
 			// condition will have to get picked up on the next read attempt
-			if (t->rdv_bufpos > 0) {
+			if (rdv_bufpos > 0) {
 				if (queued) {
-					t->cb_errno = 0;
-					task_do_readv_cb(t, (ssize_t)t->rdv_bufpos);	// Unlocks task
+					task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
 					return 0;
 				}
 				errno = 0;
-				t->rd_state = TASK_READ_STATE_IDLE;
-				return (ssize_t)t->rdv_bufpos;
+				return (ssize_t)rdv_bufpos;
 			}
 
 			// We got nothing at all.
 			if (queued) {
-				t->cb_errno = EPIPE;
-				task_do_readv_cb(t, -1);	// Unlocks task
+				task_do_readv_cb(t, tfd, -1, EPIPE);	// Unlocks task
 				return 0;
 			}
 			errno = EPIPE;
-			t->rd_state = TASK_READ_STATE_IDLE;
 			return -1;
 		}
 
 		// We read something!
-		t->rdv_bufpos += reddin;
+		rdv_bufpos += reddin;
 	}
 
 	// We read it all.  Make the callback
 	if (queued) {
-		t->cb_errno = 0;
-		task_do_readv_cb(t, (ssize_t)t->rdv_bufpos);	// Unlocks task
+		task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
 		return 0;
 	}
 	errno = 0;
-	t->rd_state = TASK_READ_STATE_IDLE;
-	return (ssize_t)t->rdv_bufpos;
+	return (ssize_t)rdv_bufpos;
 } // task_read_vector
 
 
@@ -3377,7 +3341,6 @@ task_handle_listen_event(struct task *t)
 			worker_learn_cpu_affinity(t);
 		}
 
-		t_new->cb_errno = 0;
 		t_new->accept_cb = t->accept_cb;
 		t_new->accept_cb_data = t->accept_cb_data;
 
@@ -3387,7 +3350,7 @@ task_handle_listen_event(struct task *t)
 		// right now, and then move the task to the correct thread after the I/O starts
 		// Also, we don't need to grab any lock this way, because no one else knows about
 		// this new task until we make the callback, so it can't disappear on us
-		task_do_accept_cb(t_new);
+		task_do_accept_cb(t_new, t_new->tfd, 0);
 	}
 	return;
 
@@ -3403,6 +3366,11 @@ task_handle_listen_event_fail:
 static void
 task_handle_wr_event(struct task *t)
 {
+	if (t->wr_cancel) {
+		task_unlock(t, FLG_WR);
+		return;
+	}
+
 	// Write stuff out as needed
 	if (likely(t->wr_state == TASK_WRITE_STATE_BUFFER)) {
 		task_write_buffer(t, true);		// Unlocks the task for us
@@ -3412,8 +3380,6 @@ task_handle_wr_event(struct task *t)
 		task_handle_connect_event(t);		// Unlocks the task for us
 	} else {
 		// Do nothing
-assert(0);
-		task_unlock(t, FLG_WR);
 	}
 } // task_handle_wr_event
 
@@ -3421,6 +3387,11 @@ assert(0);
 static void
 task_handle_rd_event(struct task *t)
 {
+	if (t->rd_cancel) {
+		task_unlock(t, FLG_RD);
+		return;
+	}
+
 	// Read in whatever as directed
 	if (likely(t->rd_state == TASK_READ_STATE_BUFFER)) {
 		task_read_buffer(t, true);	// Unlocks the task for us
@@ -3430,8 +3401,6 @@ task_handle_rd_event(struct task *t)
 		task_handle_listen_event(t);	// Unlocks the task for us
 	} else {
 		// Do nothing
-assert(0);
-		task_unlock(t, FLG_RD);
 	}
 } // task_handle_rd_event
 
@@ -5017,6 +4986,12 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		return -1;
 	}
 
+	if (unlikely(t->wr_cancel)) {
+		task_unlock(t, FLG_WR);
+		errno = EOWNERDEAD;
+		return -1;
+	}
+
 	if (unlikely(t->fd < 0)) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
@@ -5065,6 +5040,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	t->wrv_cb = wrv_cb;
 	t->wr_cb_data = wr_cb_data;
 	t->wr_expires_in_us = expires_in_us;
+	task_unlock(t, FLG_WR);
 
 	// Check if we can call the writev handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -5075,7 +5051,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 			if ((result = task_write_vector(t, false)) == 0) {
 				return 0;
 			}
-			task_unlock(t, FLG_WR);
+			t->wr_state = TASK_WRITE_STATE_IDLE;
 			return result;
 		}
 	}
@@ -5083,10 +5059,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	// Queue the writev
 	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_WR, false) == false)) {
-		int err = errno;
-
-		task_unlock(t, FLG_WR);
-		errno = err;
+		t->wr_state = TASK_WRITE_STATE_IDLE;
 		return -1;
 	}
 
@@ -5107,6 +5080,12 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	if (unlikely(t->wr_shut)) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
+		return -1;
+	}
+
+	if (unlikely(t->wr_cancel)) {
+		task_unlock(t, FLG_WR);
+		errno = EOWNERDEAD;
 		return -1;
 	}
 
@@ -5157,10 +5136,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	// Queue the write
 	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_WR, false) == false)) {
-		int err = errno;
-
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		errno = err;
 		return -1;
 	}
 
@@ -5180,6 +5156,12 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	if (unlikely(t->rd_shut)) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
+		return -1;
+	}
+
+	if (unlikely(t->rd_cancel)) {
+		task_unlock(t, FLG_RD);
+		errno = EOWNERDEAD;
 		return -1;
 	}
 
@@ -5227,6 +5209,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	t->rdv_cb = rdv_cb;
 	t->rd_cb_data = rd_cb_data;
 	t->rd_expires_in_us = expires_in_us;
+	task_unlock(t, FLG_RD);
 
 	// Check if we can call the readv handler directly
 	if (t->io_depth < TASK_MAX_IO_DEPTH) {
@@ -5237,7 +5220,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 			if ((result = task_read_vector(t, false)) == 0) {
 				return 0;
 			}
-			task_unlock(t, FLG_RD);
+			t->rd_state = TASK_READ_STATE_IDLE;
 			return result;
 		}
 	}
@@ -5245,10 +5228,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	// Queue the read
 	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_RD, false) == false)) {
-		int err = errno;
-
-		task_unlock(t, FLG_RD);
-		errno = err;
+		t->rd_state = TASK_READ_STATE_IDLE;
 		return -1;
 	}
 
@@ -5268,6 +5248,12 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	if (unlikely(t->rd_shut)) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
+		return -1;
+	}
+
+	if (unlikely(t->rd_cancel)) {
+		task_unlock(t, FLG_RD);
+		errno = EOWNERDEAD;
 		return -1;
 	}
 
@@ -5318,10 +5304,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	// Queue the read
 	t->io_depth = 0;
 	if (unlikely(task_notify_action(t, FLG_RD, false) == false)) {
-		int err = errno;
-
 		t->rd_state = TASK_READ_STATE_IDLE;
-		errno = err;
 		return -1;
 	}
 
@@ -5506,6 +5489,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
 		i->all_cpus_seen = true;
 	}
+	task_unlock(t, FLG_CO);
 
 	// Queue the connect so it starts on the correct worker
 	task_notify_action(t, FLG_CN, false);

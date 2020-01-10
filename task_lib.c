@@ -60,10 +60,9 @@
 // (on average) 1.8s to expire before being placed into the priority queue.  All timeouts <4.5s get
 // placed onto the priority queue immediately.  This system is cheap, and cuts down on priority queue
 // use for I/O timeouts by ~98% in typical use cases
-#define TASK_MIN_COLT_TIME_US	1500000
-#define	WORKER_TIME_COLT1	4500000				// 4.5s (expressed in microseconds)
-#define	WORKER_TIME_COLT2	(WORKER_TIME_COLT1 * 1.8)	// COLT1 * 1.8 (expressed in microseconds)
-#define TASK_MAX_EPOLL_WAIT_MS	(WORKER_TIME_COLT1 / 5000)	// 1/5th that of COLT1 (expressed in millisecs)
+#define TASK_MIN_COLT_TIME_US	1500000				// Below 1.5s to go, we move a timeout entry to the paired heap
+#define	WORKER_COLT_SCAN_TIME	40000				// The time between colt scans (in microseconds)
+#define TASK_MAX_EPOLL_WAIT_MS	(1000000 / WORKER_COLT_SCAN_TIME) // 1/5th that of COLT1 (expressed in millisecs)
 
 // Number of TFD locks in an instance's lock pool.  Altering this value provides a non-intuitive
 // performance impact. While more lock entries offer less lock contention, they also are accessed
@@ -374,15 +373,16 @@ __attribute__ ((aligned(64))) uint32_t	type;
 	uint64_t			processed_tc;
 
 __attribute__ ((aligned(64))) void	*timer_queue;
-	int64_t				colt_next;
+	int64_t				colt_next_us;
+	size_t				colt_len;
 	struct task_timer		*colt;
 	struct pollfd 			*pollfds;
 	struct task			*listeners;
 	int32_t				max_pollfds;
 	int32_t				poll_listeners;
-	pthread_t			thr;
 
 	// Blocking worker call info
+__attribute__ ((aligned(64))) pthread_t	thr;
 	void				(*work_func)(void *work_data);
 	void				*work_data;
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
@@ -661,7 +661,9 @@ worker_unlock(struct worker *w)
 static inline void
 worker_timer_attach_list(struct worker *w, struct task_timer *tt)
 {
-	// Now attach it
+	assert(tt->next == NULL);
+
+	// Now attach it (at the tail)
 	if (likely(w->colt != NULL)) {
 		tt->next = w->colt;
 		tt->prev = w->colt->prev;
@@ -670,14 +672,17 @@ worker_timer_attach_list(struct worker *w, struct task_timer *tt)
 	} else {
 		tt->next = tt;
 		tt->prev = tt;
+		w->colt = tt;
 	}
-	w->colt = tt;
+	w->colt_len++;
 } // worker_timer_attach_list
 
 
 static inline void
 worker_timer_detach_list(struct worker *w, struct task_timer *tt)
 {
+	assert(tt->next != NULL);
+
 	// Need to detach from colt first
 	if (likely(tt->next != tt)) {
 		tt->next->prev = tt->prev;
@@ -692,6 +697,7 @@ worker_timer_detach_list(struct worker *w, struct task_timer *tt)
 		}
 	}
 	tt->next = NULL;
+	w->colt_len--;
 } // worker_timer_detach_list
 
 
@@ -746,30 +752,56 @@ worker_timer_update(struct worker *w, struct task_timer *tt, int64_t tfd)
 } // worker_timer_update
 
 
+// Scans 1/25th of the list at a time.  Since all new entries are added at the tail, and the list
+// is circular, this algorithm just advances the colt pointer along the list.  Eventually we will
+// just wrap and continue
 static void
 worker_timer_scan_colt(register struct worker *w) {
-	register struct task_timer *tt, *ttn;
+	register struct task_timer *first, *colt, *tt;
+	register size_t n, to_scan;
 
-	if ((ttn = w->colt) == NULL) {
-		return;
-	}
-	do {
-		tt = ttn;
-		ttn = tt->next;
-		if ((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
-			// It should go to the paired heap
-			if (tt->next != NULL) {
-				worker_timer_detach_list(w, tt);
-			}
-			worker_timer_attach_heap(w, tt, tt->tfd);
-		}
-		if (tt == ttn) {
+	first = NULL;
+	colt = w->colt;
+	w->colt = NULL;
+	to_scan = (w->colt_len / 25) + 1;	// Always scan at least 1
+	for (n = 0; n < to_scan; n++) {
+		if ((tt = colt) == NULL) {
+			break;
+		} else if (first == NULL) {
+			first = tt;
+		} else if (tt == first) {
 			break;
 		}
-	} while (w->colt != ttn);
 
-	// Scan 1/sec
-	w->colt_next = w__curtime_us + 1000000;
+		// Okay, it's detached from the list now
+		if ((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
+			// It should go to the paired heap
+
+			if (first == tt) {
+				first = NULL;
+			}
+
+			// Remove from the head
+			if (likely(tt != tt->next)) {
+				tt->next->prev = tt->prev;
+				tt->prev->next = tt->next;
+				colt = tt->next;
+			} else {
+				colt = NULL;
+			}
+			tt->next = NULL;
+			w->colt_len--;
+			worker_timer_attach_heap(w, tt, tt->tfd);
+			continue;
+		} else {
+			colt = colt->next;
+		}
+	}
+	assert(w->colt == NULL);
+	w->colt = colt;
+
+	// Scan every 40ms
+	w->colt_next_us = w__curtime_us + 40000;
 } // worker_timer_scan_colt
 
 
@@ -1923,8 +1955,6 @@ task_cancel_write(struct task *t)
 	t->wr_expires_modified = false;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 	t->wt_cancelled = true;
-
-	task_unlock(t, FLG_WR);
 } // task_cancel_write
 
 
@@ -1936,8 +1966,6 @@ task_cancel_read(struct task *t)
 	t->rd_expires_modified = false;
 	t->rd_state = TASK_READ_STATE_IDLE;
 	t->rt_cancelled = true;
-
-	task_unlock(t, FLG_RD);
 } // task_cancel_read
 
 
@@ -3300,7 +3328,6 @@ static void
 task_handle_wr_event(struct task *t)
 {
 	if (t->wr_cancel) {
-		task_unlock(t, FLG_WR);
 		return;
 	}
 
@@ -3321,7 +3348,6 @@ static void
 task_handle_rd_event(struct task *t)
 {
 	if (t->rd_cancel) {
-		task_unlock(t, FLG_RD);
 		return;
 	}
 
@@ -3343,7 +3369,7 @@ static void
 worker_check_timeouts(struct worker *w)
 {
 	// Pickup new timer heap entries from the timer cool-off lists as needed
-	if (unlikely(w__curtime_us > w->colt_next)) {
+	if (unlikely(w__curtime_us > w->colt_next_us)) {
 		worker_timer_scan_colt(w);
 	}
 
@@ -3539,11 +3565,17 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	ck_pr_inc_64(&tw->num_tasks);
 
 	// Decouple any timeout from this worker
-	worker_timer_detach_list(w, &t->tm_tt);
+	if (t->tm_tt.next) {
+		worker_timer_detach_list(w, &t->tm_tt);
+	}
+	if (t->rd_tt.next) {
+		worker_timer_detach_list(w, &t->rd_tt);
+	}
+	if (t->wr_tt.next) {
+		worker_timer_detach_list(w, &t->wr_tt);
+	}
 	worker_timer_detach_heap(w, &t->tm_tt);
-	worker_timer_detach_list(w, &t->rd_tt);
 	worker_timer_detach_heap(w, &t->rd_tt);
-	worker_timer_detach_list(w, &t->wr_tt);
 	worker_timer_detach_heap(w, &t->wr_tt);
 
 	// Cancel any epoll_wait on this worker, and move to new
@@ -3853,6 +3885,10 @@ get_next_epoll_timeout_ms(struct worker *w)
 	// Update the worker time
 	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 	worker_check_timeouts(w);
+
+	if ((w->colt_next_us - w__curtime_us) <= 0) {
+		return 0;
+	}
 
 	// If we have tasks in the notifyq's to process, don't wait in epoll()
 	if ((w->notifyq_head != NULL) || (w->notifyq_locked_head != NULL)) {
@@ -4881,6 +4917,8 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		  void (*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_WR);
+	size_t wrv_buflen = 0;
+	int n;
 
 	if (t == NULL) return -1;	// errno already set
 
@@ -4909,22 +4947,19 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	}
 
 	// Validate the iov arguments and determine total read length
-	t->wrv_bufpos = 0;
-	t->wrv_buflen = 0;
-	t->wrv_iov = iov;
-	t->wrv_iovcnt = iovcnt;
 	if ((iovcnt < 0) || (iovcnt > IOV_MAX)) {
 		task_unlock(t, FLG_WR);
 		errno = EINVAL;
 		return -1;
 	}
-	for (int n = 0; n < iovcnt; n++) {
+
+	for (n = 0; n < iovcnt; n++) {
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_WR);
 			errno = EINVAL;
 			return -1;
 		}
-		t->wrv_buflen += iov[n].iov_len;
+		wrv_buflen += iov[n].iov_len;
 	}
 
 	// Set worker migration preference if needed
@@ -4940,11 +4975,15 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		}
 	}
 
-	t->wr_state = TASK_WRITE_STATE_VECTOR;
+	t->wrv_iov = iov;
+	t->wrv_bufpos = 0;
 	t->wrv_cb = wrv_cb;
+	t->wrv_iovcnt = iovcnt;
 	t->wr_cb_data = wr_cb_data;
+	t->wrv_buflen = wrv_buflen;
 	t->wr_expires_in_us = expires_in_us;
 	t->wr_expires_modified = true;
+	t->wr_state = TASK_WRITE_STATE_VECTOR;
 	task_unlock(t, FLG_WR);
 
 	// Check if we can call the writev handler directly
@@ -5014,14 +5053,14 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		}
 	}
 
-	t->wr_state = TASK_WRITE_STATE_BUFFER;
-	t->wr_buf = wrbuf;
 	t->wr_bufpos = 0;
-	t->wr_buflen = buflen;
 	t->wr_cb = wr_cb;
+	t->wr_buf = wrbuf;
+	t->wr_buflen = buflen;
 	t->wr_cb_data = wr_cb_data;
 	t->wr_expires_in_us = expires_in_us;
 	t->wr_expires_modified = true;
+	t->wr_state = TASK_WRITE_STATE_BUFFER;
 	task_unlock(t, FLG_WR);
 
 	// Check if we can call the write handler directly
@@ -5054,6 +5093,8 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		 void (*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_RD);
+	size_t rdv_buflen = 0;
+	int n;
 
 	if (t == NULL) return -1;	// errno already set
 
@@ -5082,22 +5123,19 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	}
 
 	// Validate the iov arguments and determine total read length
-	t->rdv_bufpos = 0;
-	t->rdv_buflen = 0;
-	t->rdv_iov = iov;
-	t->rdv_iovcnt = iovcnt;
 	if ((iovcnt < 0) || (iovcnt > IOV_MAX)) {
 		task_unlock(t, FLG_RD);
 		errno = EINVAL;
 		return -1;
 	}
-	for (int n = 0; n < iovcnt; n++) {
+
+	for (n = 0; n < iovcnt; n++) {
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_RD);
 			errno = EINVAL;
 			return -1;
 		}
-		t->rdv_buflen += iov[n].iov_len;
+		rdv_buflen += iov[n].iov_len;
 	}
 
 	// Set worker migration preference if needed
@@ -5109,11 +5147,15 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		}
 	}
 
-	t->rd_state = TASK_READ_STATE_VECTOR;
+	t->rdv_iov = iov;
+	t->rdv_bufpos = 0;
 	t->rdv_cb = rdv_cb;
+	t->rdv_iovcnt = iovcnt;
+	t->rdv_buflen = rdv_buflen;
 	t->rd_cb_data = rd_cb_data;
 	t->rd_expires_in_us = expires_in_us;
 	t->rd_expires_modified = true;
+	t->rd_state = TASK_READ_STATE_VECTOR;
 	task_unlock(t, FLG_RD);
 
 	// Check if we can call the readv handler directly
@@ -5182,14 +5224,14 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		}
 	}
 
-	t->rd_state = TASK_READ_STATE_BUFFER;
-	t->rd_buf = rdbuf;
 	t->rd_bufpos = 0;
-	t->rd_buflen = buflen;
 	t->rd_cb = rd_cb;
+	t->rd_buf = rdbuf;
+	t->rd_buflen = buflen;
 	t->rd_cb_data = rd_cb_data;
 	t->rd_expires_in_us = expires_in_us;
 	t->rd_expires_modified = true;
+	t->rd_state = TASK_READ_STATE_BUFFER;
 	task_unlock(t, FLG_RD);		// t->rd_state now protects the task
 
 	// Check if we can call the read handler directly
@@ -5383,19 +5425,22 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 		return -1;
 	}
 
-	// Convert this task to connect type
-	t->type = TASK_TYPE_CONNECT;
-	t->wr_state = TASK_WRITE_STATE_CONNECT;
-	t->connect_cb = connect_cb;
-	t->connect_cb_data = connect_cb_data;
-	memcpy(&t->dormant->addr, addr, addrlen);
-	t->dormant->addrlen = addrlen;
-	t->wr_expires_in_us = expires_in_us;
+	// Handle affinity stuff
 	i = t->worker->instance;
 	i->is_client = true;
 	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
 		i->all_cpus_seen = true;
 	}
+
+	// Convert this task to connect type
+	t->connect_cb = connect_cb;
+	t->type = TASK_TYPE_CONNECT;
+	t->dormant->addrlen = addrlen;
+	t->wr_expires_in_us = expires_in_us;
+	t->wr_expires_modified = true;
+	t->connect_cb_data = connect_cb_data;
+	t->wr_state = TASK_WRITE_STATE_CONNECT;
+	memcpy(&t->dormant->addr, addr, addrlen);
 	task_unlock(t, FLG_CO);
 
 	// Queue the connect so it starts on the correct worker

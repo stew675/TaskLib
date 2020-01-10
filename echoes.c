@@ -95,7 +95,7 @@ read_done_cb(int64_t tfd, void *buf, ssize_t result, void *user_data)
 	e->received += result;
 
 	// Now just write it straight back!
-	result = TASK_socket_write(e->tfd, e->buffer, result, TASK_TIMEOUT_ONE_SEC * 10, e, write_done_cb);
+	result = TASK_socket_write(e->tfd, e->buffer, result, TASK_TIMEOUT_ONE_SEC * 15, e, write_done_cb);
 	write_done_cb(e->tfd, e->buffer, result, e);
 } // read_done_cb
 
@@ -105,7 +105,7 @@ start_read(struct echo *e)
 {
 	ssize_t result;
 
-	result = TASK_socket_read(e->tfd, e->buffer, BUFLEN, TASK_TIMEOUT_ONE_MINUTE, e, read_done_cb);
+	result = TASK_socket_read(e->tfd, e->buffer, BUFLEN, TASK_TIMEOUT_ONE_SEC * 30, e, read_done_cb);
 	read_done_cb(e->tfd, e->buffer, result, e);
 } // start_read
 
@@ -152,7 +152,6 @@ accept_close_cb(int64_t tfd, void *data)
 		TASK_instance_shutdown(task_instance, NULL, NULL);
 	} else {
 		fprintf(stderr, "Got a close on a nascent accepted connection\n");
-		ck_pr_dec_32(&num_conns);
 	}
 } // accept_close_cb
 

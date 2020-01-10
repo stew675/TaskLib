@@ -350,45 +350,42 @@ typedef enum {
 struct instance;
 
 struct worker {
-	uint32_t			magic;
-#define WORKER_MAGIC	0xa3b6c9e1
+__attribute__ ((aligned(64))) uint32_t	type;
 	int32_t				affined_cpu;
-	struct ntfyq			*notifyq_batches;
 	struct ntfyq			*freeq;
 	struct ntfyq			*freeq_locked;
-	struct ntfyq			*notifyq_locked_head;
-	struct ntfyq			*notifyq_locked_tail;
-	struct instance			*instance;
-	uint64_t			num_tasks;
-
-__attribute__ ((aligned(64))) uint32_t	type;
-	int32_t				gepfd;			// General epoll_wait fd
-	int32_t				evfd;
-	int32_t				max_events;
-	worker_state_t			state;
-	worker_state_t			old_state;
-	struct epoll_event 		*events;
 	struct ntfyq			*notifyq_head;
 	struct ntfyq			*notifyq_tail;
-	uint64_t			processed_total;
-	uint64_t			processed_tc;
+	struct ntfyq			*notifyq_batches;
+	struct ntfyq			*notifyq_locked_head;
+	struct ntfyq			*notifyq_locked_tail;
 
 __attribute__ ((aligned(64))) void	*timer_queue;
 	int64_t				colt_next_us;
 	size_t				colt_len;
 	struct task_timer		*colt;
-	struct pollfd 			*pollfds;
-	struct task			*listeners;
+	struct epoll_event 		*events;
+	int32_t				max_events;
+	int32_t				num_events;
 	int32_t				max_pollfds;
 	int32_t				poll_listeners;
+	int32_t				gepfd;			// General epoll_wait fd
+	int32_t				evfd;
+
+__attribute__ ((aligned(64))) pthread_t	thr;
+	worker_state_t			state;
+	worker_state_t			old_state;
+	struct task			*listeners;
+	struct pollfd 			*pollfds;
+	struct instance			*instance;
+	uint64_t			num_tasks;
+	TAILQ_ENTRY(worker)		list;
 
 	// Blocking worker call info
-__attribute__ ((aligned(64))) pthread_t	thr;
 	void				(*work_func)(void *work_data);
 	void				*work_data;
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
 	void				*work_cb_data;
-	TAILQ_ENTRY(worker)		list;
 
 	// Put this all by itself at the end
 __attribute__ ((aligned(64))) pthread_mutex_t lock;
@@ -3364,6 +3361,9 @@ task_handle_rd_event(struct task *t)
 static void
 worker_check_timeouts(struct worker *w)
 {
+	// Update the worker time
+	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
+
 	// Pickup new timer heap entries from the timer cool-off lists as needed
 	if (unlikely(w__curtime_us > w->colt_next_us)) {
 		worker_timer_scan_colt(w);
@@ -3377,12 +3377,21 @@ worker_check_timeouts(struct worker *w)
 
 		timer_node = pheap_get_min_node(w->timer_queue, (void **)&expiry_us, (void **)&data);
 		if (timer_node == NULL) {
+			w->num_events = w->max_events;
 			break;
 		}
 
 		if (likely(expiry_us > w__curtime_us)) {
-			// We'll assume that 1 event takes 100us to process on average
-			w->processed_tc = w->processed_total + ((expiry_us - w__curtime_us) / 100);
+			register int64_t num_events;
+
+			// XXX - These 250/5 values are total fudge values, but "work"
+			num_events = ((expiry_us - w__curtime_us) / 250);
+			if (num_events < 5) {
+				num_events = 5;
+			} else if (num_events > w->max_events) {
+				num_events = w->max_events;
+			}
+			w->num_events = num_events;
 			break;
 		}
 
@@ -3607,35 +3616,6 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 
 
 static void
-worker_do_timeout_check(register struct worker *w)
-{
-	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
-	while(true) {
-		register int64_t time_to_wait_us = 0;
-		register void *timer_node;
-		int64_t expiry_us = 0;
-
-		timer_node = (void *)pheap_get_min_node(w->timer_queue, (void **)&expiry_us, NULL);
-
-		if(unlikely(timer_node == NULL)) {
-			w->processed_tc = UINT64_MAX;
-			return;
-		}
-
-		time_to_wait_us = expiry_us - w__curtime_us;
-		if (time_to_wait_us > 0) {
-			// We'll assume that 1 event takes 100us to process on average
-			w->processed_tc = w->processed_total + (time_to_wait_us / 100);
-			return;
-		}
-
-		// A timeout has expired, let's process that now
-		worker_check_timeouts(w);
-	}
-} // worker_do_timeout_check
-
-
-static void
 worker_process_one_action(register struct worker *w, register struct task *t, register task_action_flag_t action)
 {
 	// If this worker does not match the task's worker, then that's probably because
@@ -3813,10 +3793,6 @@ worker_process_notifyq(register struct worker *w)
 				t->notifyqlen--;
 			}
 
-			if (unlikely(++w->processed_total >= w->processed_tc)) {
-				worker_do_timeout_check(w);
-			}
-
 			// Drop the notify action entirely if the tfd doesn't match.  It's likely
 			// to be a stale notification from a task that already terminated
 			if (unlikely(tfd != t->tfd)) {
@@ -3881,16 +3857,13 @@ get_next_epoll_timeout_ms(struct worker *w)
 	int time_to_wait_ms = TASK_MAX_EPOLL_WAIT_MS;
 	void *timer_node;
 
-	// Update the worker time
-	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
-	worker_check_timeouts(w);
-
-	if ((w->colt_next_us - w__curtime_us) <= 0) {
-		return 0;
-	}
+	worker_check_timeouts(w);	// Updates the worker time for us
 
 	// If we have tasks in the notifyq's to process, don't wait in epoll()
-	if ((w->notifyq_head != NULL) || (w->notifyq_locked_head != NULL)) {
+	if (w->notifyq_head != NULL) {
+		return 0;
+	}
+	if (w->notifyq_locked_head != NULL) {
 		return 0;
 	}
 
@@ -3934,7 +3907,7 @@ worker_do_io_epoll(register struct worker *w)
 	w->poll_listeners = true;
 	while (true) {
 		wait_time = get_next_epoll_timeout_ms(w);
-		nfds = epoll_wait(w->gepfd, w->events, w->max_events, wait_time);
+		nfds = epoll_wait(w->gepfd, w->events, w->num_events, wait_time);
 		if (unlikely(nfds < 0)) {
 			if (errno == EINTR) {
 				continue;
@@ -3946,10 +3919,10 @@ worker_do_io_epoll(register struct worker *w)
 		break;
 	}
 
-	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
+	// Check our timeouts again
 	worker_check_timeouts(w);
 
-	if (nfds < w->max_events) {
+	if (nfds < w->num_events) {
 		// No need to explicitly poll the listeners
 		// if we didn't cap-out for active events
 		w->poll_listeners = false;
@@ -3965,10 +3938,6 @@ worker_do_io_epoll(register struct worker *w)
 		register uint32_t tfdi = (uint32_t)TFD_TO_INDEX(tfd);
 		register uint32_t revents = w->events[n].events;
 		register struct task *t;
-
-		if (unlikely(++w->processed_total >= w->processed_tc)) {
-			worker_do_timeout_check(w);
-		}
 
 		// Handle non-IO items first
 		if (unlikely(tfd < 0)) {
@@ -4034,7 +4003,11 @@ worker_do_io_epoll_fail:
 			if (revents & EPOLLOUT) {
 				// Write is active too, just queue that
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				task_notify_action(t, FLG_WR, false, true);
+				if (do_direct) {
+					task_handle_wr_event(t);	// Unlocks the task
+				} else {
+					task_notify_action(t, FLG_WR, false, true);
+				}
 			} else {
 				task_lower_event_flag(t, EPOLLIN);
 			}
@@ -4163,8 +4136,6 @@ worker_loop_blocking(void *arg)
 static int
 worker_start(struct worker *w)
 {
-	assert(w->magic == WORKER_MAGIC);
-
 	if ((w->type != WORKER_TYPE_IO) && (w->type != WORKER_TYPE_BLOCKING)) {
 		errno = EINVAL;
 		return -1;
@@ -4224,6 +4195,7 @@ worker_create(struct instance *i, int worker_type)
 		goto worker_create_failed;
 	}
 	w->max_events = __page_size / sizeof(struct epoll_event);
+	w->num_events = w->max_events;
 
 	if ((w->pollfds = aligned_alloc(__page_size, __page_size)) == NULL) {
 		goto worker_create_failed;
@@ -4231,7 +4203,6 @@ worker_create(struct instance *i, int worker_type)
 	w->max_pollfds = __page_size / sizeof(struct pollfd);
 
 	// Now initialise the worker state
-	w->magic = WORKER_MAGIC;
 	w->state = WORKER_STATE_LIMBO;
 	w->instance = i;
 	w->type = worker_type;

@@ -199,6 +199,7 @@ struct task_dormant {
 
 	socklen_t			addrlen;		// The valid length of the data in .addr
 	uint32_t			migrations;		// Number of times the task has migrated
+	struct ntfyq			*listen_children;	// The list of child accept tasks
 	struct task			*task_next;		// List of free tasks
 } __attribute__ ((aligned(64)));
 
@@ -280,9 +281,9 @@ __attribute__ ((aligned(64))) char	*rd_buf;
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
 __attribute__ ((aligned(64))) struct ntfyq *freeq;		// The list of free ntfyq events for this task
+	struct ntfyq			*freeq_overflow;
 	struct ntfyq			free1;
 	struct ntfyq			free2;
-	struct ntfyq			*listen_children;	// The list of child accept tasks
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -482,7 +483,7 @@ struct instance {
 //		   General Macros/definitions and global/per-thread variables			//
 //----------------------------------------------------------------------------------------------//
 
-static bool task_notify_action(struct task *t, task_action_flag_t action, bool force_close_q);
+static bool task_notify_action(struct task *t, task_action_flag_t action, bool force_close_q, bool force_q);
 static void worker_process_one_action(struct worker *w, struct task *t, task_action_flag_t action);
 static void task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us);
 
@@ -874,27 +875,15 @@ task_init(struct task *t)
 {
 	uint64_t tfdi = t - __thr_current_instance->tfd_pool;
 	int64_t iteration = (TFD_TO_ITERATION(t->tfd) + 1) & TFD_ITERATION_MASK;
-	struct ntfyq *tq, *freeq = NULL;
+	struct ntfyq *freeq_overflow = t->freeq_overflow;
 
-	while ((tq = t->freeq) != NULL) {
-		t->freeq = tq->next;
-		if ((tq != &t->free1) && (tq != &t->free2)) {
-			tq->next = freeq;
-			freeq = tq;
-		}
-	}
 	memset((__thr_current_instance->tfd_pool + tfdi), 0, sizeof(struct task));
 	memset((__thr_current_instance->tfd_dormant + tfdi), 0, sizeof(struct task_dormant));
 
-	t->freeq = freeq;
-
-	tq = &t->free2;
-	tq->next = t->freeq;
-	t->freeq = tq;
-
-	tq = &t->free1;
-	tq->next = t->freeq;
-	t->freeq = tq;
+	t->free2.next = NULL;
+	t->free1.next = &t->free2;
+	t->freeq = &t->free1;
+	t->freeq_overflow = freeq_overflow;
 
 	t->dormant = __thr_current_instance->tfd_dormant + tfdi;
 	t->age = get_time_us(TASK_TIME_COARSE);		// Set the age
@@ -1017,7 +1006,7 @@ task_unlock(struct task *t, task_action_flag_t action)
 			task_add_locked_action(t, (action | FLG_DRP));
 			tfd_unlock(tfdi);
 		} else {
-			task_notify_action(t, FLG_CL, true);
+			task_notify_action(t, FLG_CL, true, true);
 		}
 		return;
 	}
@@ -1644,7 +1633,7 @@ worker_notify_get_free_ntfyq(register struct worker *w)
 
 // Must be called with the task lock held. 
 static bool
-task_notify_action(register struct task *t, register task_action_flag_t action, bool force_close_q)
+task_notify_action(register struct task *t, register task_action_flag_t action, bool force_close_q, bool force_q)
 {
 	register struct worker *w = t->worker;
 	register struct ntfyq *tq = NULL;
@@ -1680,13 +1669,19 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 	if (likely(lockless_worker(w))) {
 		// Try to process the action immediately if it's allowable.  We always queue
 		// closes to give other activities a chance to realise the task is finished
-		if ((action & (FLG_CN | FLG_MG | FLG_CL | FLG_WR | FLG_RD)) == 0) {
-			worker_process_one_action(w, t, action);
-			return true;
-		} else if (action & (FLG_RD | FLG_WR)) {
-			if (t->io_depth < TASK_MAX_IO_DEPTH) {
+		if (force_q) {
+			if (action & (FLG_RD | FLG_WR)) {
+				t->io_depth = 0;
+			}
+		} else {
+			if ((action & (FLG_CN | FLG_MG | FLG_CL | FLG_WR | FLG_RD)) == 0) {
 				worker_process_one_action(w, t, action);
-			} else {
+				return true;
+			} else if (action & (FLG_RD | FLG_WR)) {
+				if (t->io_depth < TASK_MAX_IO_DEPTH) {
+					worker_process_one_action(w, t, action);
+					return true;
+				}
 				t->io_depth = 0;
 			}
 		}
@@ -1698,11 +1693,12 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		// transitions that can happen in parallel, but there is ALWAYS less than
 		// MAX_NOTIFY_QUEUE_LEN of those
 		assert(t->notifyqlen < MAX_NOTIFY_QUEUE_LEN);
-
 		t->notifyqlen++;
 
 		if (likely((tq = t->freeq) != NULL)) {
 			t->freeq = tq->next;
+		} else if ((tq = t->freeq_overflow) != NULL) {
+			t->freeq_overflow = tq->next;
 		} else if (likely((tq = w->freeq) != NULL)) {
 			w->freeq = tq->next;
 		} else {
@@ -1885,13 +1881,13 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 	t->io_depth = 0;
 	if (flags & EPOLLIN) {
 		if (t->rd_expires_modified) {
-			task_notify_action(t, FLG_RT, false);
+			task_notify_action(t, FLG_RT, false, false);
 		}
 	}
 
 	if (flags & EPOLLOUT) {
 		if (t->wr_expires_modified) {
-			task_notify_action(t, FLG_WT, false);
+			task_notify_action(t, FLG_WT, false, false);
 		}
 	}
 
@@ -2114,7 +2110,7 @@ task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno)
 	t->accept_cb_data = NULL;
 
 	if (unlikely(cb == NULL) || (t->rd_cancel) || (t->state != TASK_STATE_ACTIVE)) {
-		task_notify_action(t, FLG_CL, false);
+		task_notify_action(t, FLG_CL, false, true);
 		return;
 	}
 
@@ -2275,11 +2271,11 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 {
 	register struct ntfyq *tq;
 
-	while ((tq = t->listen_children) != NULL) {
+	while ((tq = t->dormant->listen_children) != NULL) {
 		int64_t tfd;
 		struct task *tac;	// Accept Child
 
-		t->listen_children->next = tq;
+		t->dormant->listen_children->next = tq;
 
 		tfd = tq->tfd;
 
@@ -2598,7 +2594,7 @@ task_update_timer(struct task *t)
 
 	// If we're not on the correct worker thread, queue a notify instead
 	if (!lockless_worker(w)) {
-		task_notify_action(t, FLG_TM, false);
+		task_notify_action(t, FLG_TM, false, true);
 		return;
 	}
 
@@ -2797,7 +2793,7 @@ task_write_buffer(register struct task *t, register bool queued)
 
 		// Restrict the amount that can be written in one go for fairness
 		if (max_can_do == 0) {
-			if (task_notify_action(t, FLG_WR, false)) {
+			if (task_notify_action(t, FLG_WR, false, true)) {
 				return 0;
 			}
 			max_can_do = SIZE_MAX;
@@ -3606,7 +3602,7 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	}
 
 	// Wake up the target worker with the migration event that just happened
-	task_notify_action(t, FLG_MG, false);
+	task_notify_action(t, FLG_MG, false, true);
 } // worker_handle_task_migration
 
 
@@ -3648,7 +3644,7 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 		// Forward the action directly to the correct worker.  Pass the
 		// force_close_q flag to allow FLG_CL actions through even when
 		// the task is in DESTROY state
-		if (task_notify_action(t, action, true) == false) {
+		if (task_notify_action(t, action, true, true) == false) {
 			// It didn't get forwarded, drop the action reference
 			if ((action & (FLG_CN | FLG_WR | FLG_RD | FLG_WT | FLG_RT)) == 0) {
 				task_unlock(t, action);
@@ -3746,7 +3742,7 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 
 
 static void
-worker_process_notifyq(struct worker *w)
+worker_process_notifyq(register struct worker *w)
 {
 #ifdef TFD_POOL_DEBUG
 	// Update straggler debug list
@@ -3771,12 +3767,10 @@ worker_process_notifyq(struct worker *w)
 		return;
 	}
 
-	for (register uint32_t locked = 0; locked < 2; locked++) {
-		register struct ntfyq *tq = NULL, *notifyq = NULL, *lockedq = NULL;
+	for (uint32_t locked = 0; locked < 2; locked++) {
+		register struct ntfyq *tq = NULL, *notifyq = NULL;
+		struct ntfyq *lockedq = NULL;
 
-		int64_t tfd;
-		task_action_flag_t action;
-		struct task *t;
 
 		// Check the notifyq lists
 		if (locked) {
@@ -3800,17 +3794,22 @@ worker_process_notifyq(struct worker *w)
 		w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 
 		while (likely((tq = notifyq) != NULL)) {
+			register int64_t tfd = tq->tfd;
+			register struct task *t = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
+			register task_action_flag_t action = tq->action;
+
 			notifyq = tq->next;
-
-			tfd = tq->tfd;
-			action = tq->action;
-
-			t = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
 			if (locked) {
 				ck_pr_dec_64(&t->notifyqlen_locked);
 			} else {
-				tq->next = t->freeq;
-				t->freeq = tq;
+				// Determine if it's one of the task's private freeq entries
+				if ((tq == &t->free1) || (tq == &t->free2)) {
+					tq->next = t->freeq;
+					t->freeq = tq;
+				} else {
+					tq->next = t->freeq_overflow;
+					t->freeq_overflow = tq;
+				}
 				t->notifyqlen--;
 			}
 
@@ -4012,7 +4011,7 @@ worker_do_io_epoll_fail:
 					task_handle_wr_event(t);	// Unlocks  the task
 					continue;
 				}
-				task_notify_action(t, FLG_CL, false);
+				task_notify_action(t, FLG_CL, false, true);
 				continue;
 			}
 
@@ -4035,7 +4034,7 @@ worker_do_io_epoll_fail:
 			if (revents & EPOLLOUT) {
 				// Write is active too, just queue that
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				task_notify_action(t, FLG_WR, false);
+				task_notify_action(t, FLG_WR, false, true);
 			} else {
 				task_lower_event_flag(t, EPOLLIN);
 			}
@@ -4043,7 +4042,7 @@ worker_do_io_epoll_fail:
 			if (do_direct || (t->type == TASK_TYPE_LISTEN)) {
 				task_handle_rd_event(t);		// Unlocks the task
 			} else {
-				task_notify_action(t, FLG_RD, false);
+				task_notify_action(t, FLG_RD, false, true);
 			}
 			continue;
 		} else if (revents & EPOLLOUT) {
@@ -4051,7 +4050,7 @@ worker_do_io_epoll_fail:
 			if (do_direct) {
 				task_handle_wr_event(t);		// Unlocks the task
 			} else {
-				task_notify_action(t, FLG_WR, false);
+				task_notify_action(t, FLG_WR, false, true);
 			}
 			continue;
 		}
@@ -4430,8 +4429,8 @@ instance_listen_balance(struct task *t)
 		}
 		ntq->tfd = nt->tfd;
 		ntq->action = FLG_LI;
-		ntq->next = t->listen_children;
-		t->listen_children = ntq;
+		ntq->next = t->dormant->listen_children;
+		t->dormant->listen_children = ntq;
 	}
 } // instance_listen_balance
 
@@ -4809,7 +4808,7 @@ TASK_timeout_destroy(int64_t tfd)
 
 	t->tm_cancelled = true;
 	t->tm_tt.expiry_us = TIMER_TIME_DESTROY;
-	task_notify_action(t, FLG_TM, false);
+	task_notify_action(t, FLG_TM, false, true);
 	task_unlock(t, FLG_TD);
 	return 0;
 } // TASK_timeout_destroy
@@ -4824,7 +4823,7 @@ TASK_timeout_cancel(int64_t tfd)
 	if (t == NULL) return -1;	// errno already set
 
 	t->tm_cancelled = true;
-	task_notify_action(t, FLG_TM, false);
+	task_notify_action(t, FLG_TM, false, true);
 	task_unlock(t, FLG_TC);
 	return 0;
 } // TASK_timeout_cancel
@@ -4852,7 +4851,7 @@ TASK_timeout_set(int64_t tfd, int64_t us_from_now, void *timeout_cb_data,
 
 	t->tm_cb = timeout_cb;
 	t->tm_cb_data = timeout_cb_data;
-	task_notify_action(t, FLG_TM, false);
+	task_notify_action(t, FLG_TM, false, true);
 	task_unlock(t, FLG_TS);
 	return 0;
 } // TASK_timeout_set
@@ -4902,7 +4901,7 @@ TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
 
 	t->tm_cb = timeout_cb;
 	t->tm_cb_data = timeout_cb_data;
-	task_notify_action(t, FLG_TM, false);
+	task_notify_action(t, FLG_TM, false, true);
 	return t->tfd;
 } // TASK_timeout_create
 
@@ -4969,7 +4968,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 				if (__thr_preferred_age < t->age) {
 					// Move ourselves to the senior task worker
 					t->preferred_worker = __thr_preferred_worker;
-					task_notify_action(t, FLG_MG, false);
+					task_notify_action(t, FLG_MG, false, true);
 				}
 			}
 		}
@@ -5000,7 +4999,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	}
 
 	// Queue the writev
-	if (unlikely(task_notify_action(t, FLG_WR, false) == false)) {
+	if (unlikely(task_notify_action(t, FLG_WR, false, true) == false)) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
 		return -1;
@@ -5049,7 +5048,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->age)) {
 			// Move ourselves to the senior task worker
 			t->preferred_worker = __thr_preferred_worker;
-			task_notify_action(t, FLG_MG, false);
+			task_notify_action(t, FLG_MG, false, true);
 		}
 	}
 
@@ -5077,7 +5076,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	}
 
 	// Queue the write
-	if (unlikely(task_notify_action(t, FLG_WR, false) == false)) {
+	if (unlikely(task_notify_action(t, FLG_WR, false, true) == false)) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
 		return -1;
@@ -5143,7 +5142,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->age)) {
 			// Move ourselves to the senior task worker
 			t->preferred_worker = __thr_preferred_worker;
-			task_notify_action(t, FLG_MG, false);
+			task_notify_action(t, FLG_MG, false, true);
 		}
 	}
 
@@ -5172,7 +5171,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	}
 
 	// Queue the read
-	if (unlikely(task_notify_action(t, FLG_RD, false) == false)) {
+	if (unlikely(task_notify_action(t, FLG_RD, false, true) == false)) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
 		return -1;
@@ -5220,7 +5219,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		if ((t->preferred_worker == NULL) && (__thr_preferred_age < t->age)) {
 			// Move ourselves to the senior task worker
 			t->preferred_worker = __thr_preferred_worker;
-			task_notify_action(t, FLG_MG, false);
+			task_notify_action(t, FLG_MG, false, true);
 		}
 	}
 
@@ -5248,7 +5247,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	}
 
 	// Queue the read
-	if (unlikely(task_notify_action(t, FLG_RD, false) == false)) {
+	if (unlikely(task_notify_action(t, FLG_RD, false, true) == false)) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
 		return -1;
@@ -5291,7 +5290,7 @@ TASK_close(int64_t tfd)
 	t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
-	task_notify_action(t, FLG_CL, false);
+	task_notify_action(t, FLG_CL, false, true);
 	return 0;
 } // TASK_close
 
@@ -5444,7 +5443,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	task_unlock(t, FLG_CO);
 
 	// Queue the connect so it starts on the correct worker
-	task_notify_action(t, FLG_CN, false);
+	task_notify_action(t, FLG_CN, false, true);
 	return 0;
 } // TASK_socket_connect
 

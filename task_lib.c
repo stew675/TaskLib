@@ -60,6 +60,7 @@
 // (on average) 1.8s to expire before being placed into the priority queue.  All timeouts <4.5s get
 // placed onto the priority queue immediately.  This system is cheap, and cuts down on priority queue
 // use for I/O timeouts by ~98% in typical use cases
+#define TASK_MIN_COLT_TIME_US	1500000
 #define	WORKER_TIME_COLT1	4500000				// 4.5s (expressed in microseconds)
 #define	WORKER_TIME_COLT2	(WORKER_TIME_COLT1 * 1.8)	// COLT1 * 1.8 (expressed in microseconds)
 #define TASK_MAX_EPOLL_WAIT_MS	(WORKER_TIME_COLT1 / 5000)	// 1/5th that of COLT1 (expressed in millisecs)
@@ -219,7 +220,6 @@ struct task {
 					registered_fd:1,	// If the FD was registered by the user
 
 					listen_child:1,		// If task is a child listener
-					tm_attached:1,		// If a timer timeout is attached and active
 					tm_cancelled:1,
 					in_epoll:1,
 					rd_expires_modified:1,
@@ -228,7 +228,9 @@ struct task {
 					unused:10;
 	int64_t				tfd;			// Task File Descriptor that identifies this task
 	struct worker			*worker;		// The current io worker task is bound to
-	struct epoll_event		ev;			// The current epoll events we're waiting on
+	uint32_t			events;			// Active poll/epoll events
+	int32_t				epfd;			// The worker epoll FD we're registered with
+	uint32_t			more_unused;		// Unused
 	int32_t				fd;			// The actual system socket FD we're working on
 	int64_t				age;			// Time this task was created
 	int64_t				rd_expires_in_us;
@@ -248,7 +250,6 @@ __attribute__ ((aligned(64))) const char *wr_buf;
 	size_t				wrv_buflen;
 	int32_t				wrv_iovcnt;
 	uint32_t			wr_state:2,
-					wt_attached:1,
 					wr_shut:1,
 					wr_cancel:1,
 					wt_cancelled:1,
@@ -270,7 +271,6 @@ __attribute__ ((aligned(64))) char	*rd_buf;
 	size_t				rdv_buflen;
 	int32_t				rdv_iovcnt;
 	uint32_t			rd_state:2,
-					rt_attached:1,
 					rd_shut:1,
 					rd_cancel:1,
 					rt_cancelled:1,
@@ -375,19 +375,18 @@ __attribute__ ((aligned(64))) uint32_t	type;
 
 __attribute__ ((aligned(64))) void	*timer_queue;
 	int64_t				colt_next;
-	struct task_timer		*colt1;
-	struct task_timer		*colt2;
+	struct task_timer		*colt;
 	struct pollfd 			*pollfds;
 	struct task			*listeners;
 	int32_t				max_pollfds;
 	int32_t				poll_listeners;
+	pthread_t			thr;
 
 	// Blocking worker call info
 	void				(*work_func)(void *work_data);
 	void				*work_data;
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
 	void				*work_cb_data;
-	pthread_t			thr;
 	TAILQ_ENTRY(worker)		list;
 
 	// Put this all by itself at the end
@@ -485,6 +484,7 @@ struct instance {
 
 static bool task_notify_action(struct task *t, task_action_flag_t action, bool force_close_q);
 static void worker_process_one_action(struct worker *w, struct task *t, task_action_flag_t action);
+static void task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us);
 
 // The current IO worker.  MUST BE NULL if current thread is not an IO worker
 static __thread struct worker	*__thr_current_worker = NULL;
@@ -658,75 +658,46 @@ worker_unlock(struct worker *w)
 } // worker_lock
 
 
-static void
-worker_timer_detach(register struct worker *w, register struct task_timer *tt)
+static inline void
+worker_timer_attach_list(struct worker *w, struct task_timer *tt)
 {
-	tt->tfd = TFD_NONE;
-	if (unlikely(tt->next == NULL)) {
-		// It's in the paired heap, detach it
-		pheap_detach_node(w->timer_queue, tt->node);
-		return;
+	// Now attach it
+	if (likely(w->colt != NULL)) {
+		tt->next = w->colt;
+		tt->prev = w->colt->prev;
+		tt->prev->next = tt;
+		tt->next->prev = tt;
+	} else {
+		tt->next = tt;
+		tt->prev = tt;
 	}
+	w->colt = tt;
+} // worker_timer_attach_list
 
-	// It's on one of the cool-off lists
+
+static inline void
+worker_timer_detach_list(struct worker *w, struct task_timer *tt)
+{
+	// Need to detach from colt first
 	if (likely(tt->next != tt)) {
 		tt->next->prev = tt->prev;
 		tt->prev->next = tt->next;
 		// If it's a head node, advance the head
-		if (w->colt1 == tt) {
-			w->colt1 = tt->next;
-		} else if (w->colt2 == tt) {
-			w->colt2 = tt->next;
+		if (w->colt == tt) {
+			w->colt = tt->next;
 		}
 	} else {
-		if (w->colt1 == tt) {
-			w->colt1 = NULL;
-		} else {
-			w->colt2 = NULL;
+		if (w->colt == tt) {
+			w->colt = NULL;
 		}
 	}
 	tt->next = NULL;
-} // worker_timer_detach
+} // worker_timer_detach_list
 
 
-static void
-worker_timer_attach(register struct worker *w, register struct task_timer *tt, register int64_t tfd)
+static inline void
+worker_timer_attach_heap(struct worker *w, struct task_timer *tt, int64_t tfd)
 {
-	register int64_t expires_in_us = tt->expiry_us - w__curtime_us;
-
-	// Set the task-timer TFD
-	tt->tfd = tfd;
-
-	// Check if it needs to go on cool-off list 2
-	if (expires_in_us > WORKER_TIME_COLT2) {
-		if (likely(w->colt2 != NULL)) {
-			tt->next = w->colt2;
-			tt->prev = w->colt2->prev;
-			tt->prev->next = tt;
-			tt->next->prev = tt;
-		} else {
-			tt->next = tt;
-			tt->prev = tt;
-		}
-		w->colt2 = tt;
-		return;
-	}
-
-	// Check if it needs to go on cool-off list 1
-	if (expires_in_us > WORKER_TIME_COLT1) {
-		if (likely(w->colt1 != NULL)) {
-			tt->next = w->colt1;
-			tt->prev = w->colt1->prev;
-			tt->prev->next = tt;
-			tt->next->prev = tt;
-		} else {
-			tt->next = tt;
-			tt->prev = tt;
-		}
-		w->colt1 = tt;
-		return;
-	}
-
 	// Okay then, it needs to go into the paired heap directly
 	if (tt->node == NULL) {
 		intptr_t tfd_intptr = (intptr_t)tfd;
@@ -737,63 +708,69 @@ worker_timer_attach(register struct worker *w, register struct task_timer *tt, r
 		pheap_set_key(w->timer_queue, tt->node, (void *)tt->expiry_us);
 		pheap_attach_node(w->timer_queue, tt->node);
 	}
-} // worker_timer_attach
+} // worker_timer_attach_heap
+
+
+static inline void
+worker_timer_detach_heap(struct worker *w, struct task_timer *tt)
+{
+	if(tt->node) {
+		// Make sure it's detached from the heap
+		pheap_detach_node(w->timer_queue, tt->node);
+	}
+} // worker_timer_detach_heap
 
 
 static void
-worker_timer_switch_lists(register struct worker *w) {
-	register struct task_timer *tt;
-
-	// Drain w->colt1, and attach each entry to the pheap
-	while ((tt = w->colt1) != NULL) {
-		register intptr_t tfd_intptr = (intptr_t)tt->tfd;
-
-		if (tt->next != tt) {
-			tt->next->prev = tt->prev;
-			tt->prev->next = tt->next;
-			w->colt1 = tt->next;
-		} else {
-			w->colt1 = NULL;
-		}
-		tt->next = NULL;
-
-		if (tt->expiry_us < 0) {
-			tt->tfd = TFD_NONE;
-			continue;
-		}
-
-		if (tt->node == NULL) {
-			tt->node = pheap_insert(w->timer_queue, (void *)tt->expiry_us, (void *)tfd_intptr);
-			assert(tt->node != NULL);
-		} else {
-			pheap_set_key(w->timer_queue, tt->node, (void *)tt->expiry_us);
-			pheap_attach_node(w->timer_queue, tt->node);
-		}
-	}
-
-	// Now move w->colt2 to w->colt1, and NULL out w->colt2
-	w->colt1 = w->colt2;
-	w->colt2 = NULL;
-	w->colt_next = w__curtime_us + ((WORKER_TIME_COLT1 / 5) * 4);
-} // worker_timer_switch_lists
-
-
-static inline bool
 worker_timer_update(struct worker *w, struct task_timer *tt, int64_t tfd)
 {
-	// First detach it, if it's attached
-	if (tt->tfd != TFD_NONE) {
-		worker_timer_detach(w, tt);
+	tt->tfd = tfd;
+	if (tt->expiry_us < 0) {
+		// Nothing to do
+		return;
 	}
 
-	// If we don't need to re-add, we're done
-	if ((tt->expiry_us < 0) || (tfd < 0)) {
-		return false;
+	if ((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
+		// It should go to the paired heap
+		if (tt->next != NULL) {
+			worker_timer_detach_list(w, tt);
+		}
+		worker_timer_attach_heap(w, tt, tfd);
+	} else {
+		// It should go to the cool off list
+		if (tt->next == NULL) {
+			worker_timer_detach_heap(w, tt);
+			worker_timer_attach_list(w, tt);
+		}
 	}
-
-	worker_timer_attach(w, tt, tfd);
-	return true;
 } // worker_timer_update
+
+
+static void
+worker_timer_scan_colt(register struct worker *w) {
+	register struct task_timer *tt, *ttn;
+
+	if ((ttn = w->colt) == NULL) {
+		return;
+	}
+	do {
+		tt = ttn;
+		ttn = tt->next;
+		if ((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
+			// It should go to the paired heap
+			if (tt->next != NULL) {
+				worker_timer_detach_list(w, tt);
+			}
+			worker_timer_attach_heap(w, tt, tt->tfd);
+		}
+		if (tt == ttn) {
+			break;
+		}
+	} while (w->colt != ttn);
+
+	// Scan 1/sec
+	w->colt_next = w__curtime_us + 1000000;
+} // worker_timer_scan_colt
 
 
 static void
@@ -807,10 +784,9 @@ task_destroy_timeouts(struct task *t)
 
 	// Destroy all timeouts
 	t->tm_tt.expiry_us = TIMER_TIME_DESTROY;
-	if (t->tm_attached) {
-		worker_timer_detach(w, &t->tm_tt);
-		t->tm_attached = false;
-		t->tm_cancelled = true;
+	t->tm_cancelled = true;
+	if (t->tm_tt.next) {
+		worker_timer_detach_list(w, &t->tm_tt);
 	}
 	if (t->tm_tt.node) {
 		pheap_release_node(w->timer_queue, t->tm_tt.node);
@@ -818,10 +794,9 @@ task_destroy_timeouts(struct task *t)
 	}
 
 	t->wr_tt.expiry_us = TIMER_TIME_DESTROY;
-	if (t->wt_attached) {
-		worker_timer_detach(w, &t->wr_tt);
-		t->wt_attached = false;
-		t->wt_cancelled = true;
+	t->wt_cancelled = true;
+	if (t->wr_tt.next) {
+		worker_timer_detach_list(w, &t->wr_tt);
 	}
 	if (t->wr_tt.node) {
 		pheap_release_node(w->timer_queue, t->wr_tt.node);
@@ -829,10 +804,9 @@ task_destroy_timeouts(struct task *t)
 	}
 
 	t->rd_tt.expiry_us = TIMER_TIME_DESTROY;
-	if (t->rt_attached) {
-		worker_timer_detach(w, &t->rd_tt);
-		t->rt_attached = false;
-		t->rt_cancelled = true;
+	t->rt_cancelled = true;
+	if (t->rd_tt.next) {
+		worker_timer_detach_list(w, &t->rd_tt);
 	}
 	if (t->rd_tt.node) {
 		pheap_release_node(w->timer_queue, t->rd_tt.node);
@@ -900,7 +874,6 @@ task_init(struct task *t)
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
 	t->rd_state = TASK_READ_STATE_IDLE;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
-	t->ev.data.u64 = TFD_NONE;	// Just means it's not in epoll_wait() list yet
 	t->tfd = TFD_NONE;
 
 	// Calculate and assign the new tfd
@@ -1641,9 +1614,9 @@ worker_notify_get_free_ntfyq(register struct worker *w)
 static bool
 task_notify_action(register struct task *t, register task_action_flag_t action, bool force_close_q)
 {
-	register int64_t tfd = t->tfd;
-	register struct ntfyq *tq = NULL;
 	register struct worker *w = t->worker;
+	register struct ntfyq *tq = NULL;
+	register int64_t tfd = t->tfd;
 
 	if (unlikely(w == NULL)) {	// This can be true sometimes during shutdown
 		return false;
@@ -1777,72 +1750,81 @@ task_calculate_io_timeout(register int64_t us_from_now)
 
 
 static inline void
-task_activate_rd_timeout(register struct task *t)
+task_activate_rd_timeout(struct worker *w, struct task *t)
 {
+	t->rd_expires_modified = false;
 	if (t->rd_expires_in_us < 0) {
 		t->rt_cancelled = true;
 		return;
 	}
 	t->rd_tt.expiry_us = task_calculate_io_timeout(t->rd_expires_in_us);
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
-	if (t->rt_attached) {
-		worker_timer_detach(t->worker, &t->rd_tt);
+
+	if (w__curtime_us > t->rd_tt.expiry_us) {
+		// It's already expired.  Handle that now
+		task_do_timeout_cb(t, FLG_RT, t->rd_tt.expiry_us);
+		return;
 	}
-	worker_timer_attach(t->worker, &t->rd_tt, t->tfd);
-	t->rt_attached = true;
+
+	worker_timer_update(w, &t->rd_tt, t->tfd);
 	t->rt_cancelled = false;
 } // task_activate_rd_timeout
 
 
 static inline void
-task_activate_wr_timeout(register struct task *t)
+task_activate_wr_timeout(struct worker *w, struct task *t)
 {
+	t->wr_expires_modified = false;
 	if (t->wr_expires_in_us < 0) {
 		t->wt_cancelled = true;
 		return;
 	}
 	t->wr_tt.expiry_us = task_calculate_io_timeout(t->wr_expires_in_us);
 	t->wr_expires_in_us = TIMER_TIME_DESTROY;
-	if (t->wt_attached) {
-		worker_timer_detach(t->worker, &t->wr_tt);
+
+	if (w__curtime_us > t->wr_tt.expiry_us) {
+		// It's already expired.  Handle that now
+		task_do_timeout_cb(t, FLG_WT, t->wr_tt.expiry_us);
+		return;
 	}
-	worker_timer_attach(t->worker, &t->wr_tt, t->tfd);
-	t->wt_attached = true;
+
+	worker_timer_update(w, &t->wr_tt, t->tfd);
 	t->wt_cancelled = false;
 } // task_activate_wr_timeout
 
 
 // Creates the given event flag(s)
-static int
-task_create_event_flag(register struct task *t, register struct worker *w)
+static inline int
+task_create_event_flag(struct task *t, uint32_t flags)
 {
-	t->ev.data.u64 = (uint64_t)t->tfd;
-	t->ev.events |= EPOLLRDHUP;
-
+	int res;
 #ifdef USE_EPOLLONESHOT
-	t->ev.events |= EPOLLONESHOT;
+	struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = (EPOLLONESHOT | EPOLLRDHUP | flags) };
+#else
+	struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = (EPOLLRDHUP | flags) };
 #endif
 
-	register int res = epoll_ctl(w->gepfd, EPOLL_CTL_ADD, t->fd, &t->ev);
-
-	// If it's already registered, don't treat it as an error, it just
-	// means that someone beat us to adding it
-	if ((res < 0) && (errno == EEXIST)) {
-		// Just update the reference with ours now
-		res = epoll_ctl(w->gepfd, EPOLL_CTL_MOD, t->fd, &t->ev);
-	} else if (res == 0) {
-		t->in_epoll = true;
+	if ((res = epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev)) < 0) {
+		if (errno != EEXIST) {
+			t->in_epoll = false;
+			return -1;
+		}
+		if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) < 0) {
+			t->in_epoll = false;
+			return -1;
+		}
 	}
+	t->in_epoll = true;
 
 #ifdef USE_EPOLLET
 	// Only turn on EPOLLET AFTER the add, or we race
 	// with the kernel on the initial event notification
-	if (res == 0) {
-		t->ev.events |= EPOLLET;
-	}
+	t->events = (ev.events | EPOLLET);
+#else
+	t->events = ev.events;
 #endif
 
-	return res;
+	return 0;
 } // task_create_event_flag
 
 
@@ -1850,33 +1832,33 @@ task_create_event_flag(register struct task *t, register struct worker *w)
 static int
 task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
-	register struct worker *w = t->worker;
-	register int res;
+	int res;
 
-	t->io_depth = 0;
-	t->ev.events |= flags;
 	if (likely(t->in_epoll)) {
-		res = epoll_ctl(w->gepfd, EPOLL_CTL_MOD, t->fd, &t->ev);
+		struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = (t->events | flags) };
+
+		res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev);
+		if (res == 0) {
+			t->events = ev.events;
+		}
 	} else {
-		res = task_create_event_flag(t, w);	// We need to do EPOLL_CTL_ADD instead
+		res = task_create_event_flag(t, flags);		// We need to do EPOLL_CTL_ADD instead
 	}
 
 	if (unlikely(res < 0)) {
-		t->ev.events &= ~flags;
 		return -1;
 	}
 
 	// Activate the IO timeouts as required
+	t->io_depth = 0;
 	if (flags & EPOLLIN) {
 		if (t->rd_expires_modified) {
-			t->rd_expires_modified = false;
 			task_notify_action(t, FLG_RT, false);
 		}
 	}
 
 	if (flags & EPOLLOUT) {
 		if (t->wr_expires_modified) {
-			t->wr_expires_modified = false;
 			task_notify_action(t, FLG_WT, false);
 		}
 	}
@@ -1889,23 +1871,27 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 static int
 task_lower_event_flag(register struct task *t, register uint32_t flags)
 {
+	struct epoll_event ev = {.data.u64 = (uint64_t)t->tfd, .events = (t->events & ~(flags)) };
+	register int res;
+
 	// If we have no TFD, we nothing else to do
 	if (unlikely(t->in_epoll == false)) {
 		return 0;
 	}
 
-	// Lower the flags on the task
-	t->ev.events &= ~flags;
-
 #ifdef USE_EPOLLONESHOT
 	// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
 	// if there's no other IN/OUT flag still set
-	if ((t->ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
+	if ((ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
+		t->events = ev.events;
 		return 0;
 	}
 #endif
 
-	return epoll_ctl(t->worker->gepfd, EPOLL_CTL_MOD, t->fd, &t->ev);
+	if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
+		t->events = ev.events;
+	}
+	return res;
 } // task_lower_event_flag
 
 
@@ -1936,10 +1922,7 @@ task_cancel_write(struct task *t)
 	t->wr_cancel = true;
 	t->wr_expires_modified = false;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
-
-	if (t->wt_attached) {
-		t->wt_cancelled = true;
-	}
+	t->wt_cancelled = true;
 
 	task_unlock(t, FLG_WR);
 } // task_cancel_write
@@ -1952,10 +1935,7 @@ task_cancel_read(struct task *t)
 	t->rd_cancel = true;
 	t->rd_expires_modified = false;
 	t->rd_state = TASK_READ_STATE_IDLE;
-
-	if (t->rt_attached) {
-		t->rt_cancelled = true;
-	}
+	t->rt_cancelled = true;
 
 	task_unlock(t, FLG_RD);
 } // task_cancel_read
@@ -1990,13 +1970,13 @@ task_do_close_cb(struct task *t)
 	if (t->fd >= 0) {
 		// If it's a user registered socket, do not close it, just de-register it from epoll
 		if (unlikely(t->registered_fd)) {
-			epoll_ctl(t->worker->gepfd, EPOLL_CTL_DEL, t->fd, NULL);
+			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 		} else {
 			shutdown(t->fd, SHUT_RDWR);
 			close(t->fd);
 		}
 		t->in_epoll = false;
-		t->ev.events = 0;
+		t->events = 0;
 		t->fd = -1;
 		task_cancel_read(t);
 		task_cancel_write(t);
@@ -2203,12 +2183,7 @@ task_do_connect_cb(struct task *t, int64_t tfd, int result, int cb_errno)
 static void
 task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us)
 {
-	void (*cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data) = NULL;
-	int64_t now_us = get_time_us(TASK_TIME_PRECISE);
-	struct worker *w = t->worker;
-	int64_t lateness_us = 0;
 	int64_t tfd = t->tfd;
-	void *cb_data = NULL;
 
 	__thr_preferred_worker = NULL;
 
@@ -2229,106 +2204,39 @@ task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us
 	return;
 
 handle_timer_timeout:
-	// Check if we're just cancelling the existing timeout
-	if (t->tm_tt.expiry_us < 0) {
-		t->tm_cancelled = true;
+	t->tm_cancelled = true;
+
+	if (t->tm_cb == NULL) {
+		// Why is there a timer timeout without a callback?
+		task_unlock(t, 0);	// Forces a task release check
 		return;
-	}
-
-	// Check if the timeout actually fired
-	if (now_us >= t->tm_tt.expiry_us) {
-		cb = t->tm_cb;
-		cb_data = t->tm_cb_data;
-		lateness_us = now_us - t->tm_tt.expiry_us;
-		t->tm_cancelled = true;
-
-		if (cb == NULL) {
-			// Why is there a timer timeout without a callback?
-			task_unlock(t, 0);	// Forces a task release check
-			return;
-		}
+	} else {
+		void (*cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data) = t->tm_cb;
+		void *cb_data = t->tm_cb_data;
+		int64_t lateness_us = get_time_us(TASK_TIME_PRECISE) - timeout_us;
 
 		errno = ETIMEDOUT;
 		cb(tfd, lateness_us, cb_data);
 		errno = 0;
-		return;
 	}
-
-	// Check if need to update the existing timer node
-	if (t->tm_tt.expiry_us != timeout_us) {
-		t->tm_tt.expiry_us = timeout_us;
-		t->tm_attached = worker_timer_update(w, &t->tm_tt, t->tfd);
-		return;
-	}
-
-	// Nothing changed at all.  Just unlock and go
 	return;
 
 handle_read_timeout:
-	// Check if we're just cancelling the existing timeout
-	if (t->rd_tt.expiry_us < 0) {
-		t->rt_cancelled = true;
-		return;
+	if (t->rd_state == TASK_READ_STATE_BUFFER) {
+		task_do_read_cb(t, tfd, -1, ETIMEDOUT);
+	} else if (t->rd_state == TASK_READ_STATE_VECTOR) {
+		task_do_readv_cb(t, tfd, -1, ETIMEDOUT);
 	}
-
-	// Check if the timeout actually fired
-	if (now_us >= t->rd_tt.expiry_us) {
-		if (t->rd_state == TASK_READ_STATE_BUFFER) {
-			return task_do_read_cb(t, tfd, -1, ETIMEDOUT);
-		}
-		if (t->rd_state == TASK_READ_STATE_VECTOR) {
-			return task_do_readv_cb(t, tfd, -1, ETIMEDOUT);
-		}
-
-		// No reads were active, just cancel the timer and go
-		t->rt_cancelled = true;
-		errno = 0;
-		return;
-	}
-
-	// Check if need to update the existing timer node
-	if (t->rd_tt.expiry_us != timeout_us) {
-		t->rd_tt.expiry_us = timeout_us;
-		t->rt_attached = worker_timer_update(w, &t->rd_tt, t->tfd);
-		return;
-	}
-
-	// Nothing changed at all.  Just unlock and go
 	return;
 
 handle_write_timeout:
-	// Check if we're just cancelling the existing timeout
-	if (t->wr_tt.expiry_us < 0) {
-		t->wt_cancelled = true;
-		return;
+	if (t->wr_state == TASK_WRITE_STATE_BUFFER) {
+		task_do_write_cb(t, tfd, -1, ETIMEDOUT);
+	} else if (t->wr_state == TASK_WRITE_STATE_CONNECT) {
+		task_do_connect_cb(t, tfd, -1, ETIMEDOUT);
+	} else if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
+		task_do_writev_cb(t, tfd, -1, ETIMEDOUT);
 	}
-
-	// Check if the timeout actually fired.  Connect timeouts are also handled here
-	if (now_us >= t->wr_tt.expiry_us) {
-		if (t->wr_state == TASK_WRITE_STATE_BUFFER) {
-			return task_do_write_cb(t, tfd, -1, ETIMEDOUT);
-		}
-		if (t->wr_state == TASK_WRITE_STATE_CONNECT) {
-			return task_do_connect_cb(t, tfd, -1, ETIMEDOUT);
-		}
-		if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
-			return task_do_writev_cb(t, tfd, -1, ETIMEDOUT);
-		}
-
-		// No writes were active, just cancel the timer and go
-		t->wt_cancelled = true;
-		errno = 0;
-		return;
-	}
-
-	// Check if need to update the existing timer node
-	if (t->wr_tt.expiry_us != timeout_us) {
-		t->wr_tt.expiry_us = timeout_us;
-		t->wt_attached = worker_timer_update(w, &t->wr_tt, t->tfd);
-		return;
-	}
-
-	// Nothing changed at all.  Just unlock and go
 	return;
 } // task_do_timeout_cb
 
@@ -2672,11 +2580,6 @@ task_update_timer(struct task *t)
 		return;
 	}
 
-	if (t->tm_attached) {
-		worker_timer_detach(w, &t->tm_tt);
-		t->tm_attached = false;
-	}
-
 	// Check if it already expired
 	if (w__curtime_us > t->tm_tt.expiry_us) {
 		task_do_timeout_cb(t, FLG_TM, t->tm_tt.expiry_us);	// Releases the task lock
@@ -2684,9 +2587,8 @@ task_update_timer(struct task *t)
 	}
 
 	// Just update the timeout in the timeout system
-	worker_timer_attach(w, &t->tm_tt, t->tfd);
-	t->tm_attached = true;
 	t->tm_cancelled = false;
+	worker_timer_update(w, &t->tm_tt, t->tfd);
 } // task_update_timer
 
 
@@ -2730,11 +2632,12 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 		}
 	}
 	t->worker = w;
-	ck_pr_inc_64(&w->num_tasks);
+	t->epfd = w->gepfd;
 	t->type = type;
 	t->close_cb = close_cb;
 	t->close_cb_data = close_cb_data;
 	t->fd = fd;
+	ck_pr_inc_64(&w->num_tasks);
 
 	// task_get_free_tfd() already locked the task for us
 	return t;
@@ -3441,7 +3344,7 @@ worker_check_timeouts(struct worker *w)
 {
 	// Pickup new timer heap entries from the timer cool-off lists as needed
 	if (unlikely(w__curtime_us > w->colt_next)) {
-		worker_timer_switch_lists(w);
+		worker_timer_scan_colt(w);
 	}
 
 	while(true) {
@@ -3481,23 +3384,20 @@ worker_check_timeouts(struct worker *w)
 		}
 
 		if (t->tm_tt.node == timer_node) {
-			action = FLG_TM;
-			t->tm_attached = false;
 			if (t->tm_cancelled) {
 				continue;
 			}
+			action = FLG_TM;
 		} else if (t->rd_tt.node == timer_node) {
-			action = FLG_RT;
-			t->rt_attached = false;
 			if (t->rt_cancelled) {
 				continue;
 			}
+			action = FLG_RT;
 		} else if (t->wr_tt.node == timer_node) {
-			action = FLG_WT;
-			t->wt_attached = false;
 			if (t->wt_cancelled) {
 				continue;
 			}
+			action = FLG_WT;
 		} else {
 			// We have a dangling node with no owner?
 			assert(0);
@@ -3639,22 +3539,27 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	ck_pr_inc_64(&tw->num_tasks);
 
 	// Decouple any timeout from this worker
-	// Passing in TFD_NONE will de-couple, even though the expiry time is still set
-	t->tm_attached = worker_timer_update(w, &t->tm_tt, TFD_NONE);
-	t->rt_attached = worker_timer_update(w, &t->rd_tt, TFD_NONE);
-	t->wt_attached = worker_timer_update(w, &t->wr_tt, TFD_NONE);
+	worker_timer_detach_list(w, &t->tm_tt);
+	worker_timer_detach_heap(w, &t->tm_tt);
+	worker_timer_detach_list(w, &t->rd_tt);
+	worker_timer_detach_heap(w, &t->rd_tt);
+	worker_timer_detach_list(w, &t->wr_tt);
+	worker_timer_detach_heap(w, &t->wr_tt);
 
 	// Cancel any epoll_wait on this worker, and move to new
-	if ((t->fd >= 0) && t->in_epoll) {
-		epoll_ctl(w->gepfd, EPOLL_CTL_DEL, t->fd, &t->ev);
-		t->in_epoll = false;
 #ifdef USE_EPOLLET
-		t->ev.events &= ~(EPOLLET);		// Don't do an ADD with EPOLLET set
+	t->events &= ~(EPOLLET);		// Don't do an ADD with EPOLLET set
 #endif
-		if (epoll_ctl(tw->gepfd, EPOLL_CTL_ADD, t->fd, &t->ev) == 0) {
+	if ((t->fd >= 0) && t->in_epoll) {
+		struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = t->events };
+
+		epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, &ev);
+		t->in_epoll = false;
+		t->epfd = tw->gepfd;
+		if (epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev) == 0) {
 			t->in_epoll = true;
 #ifdef USE_EPOLLET
-			t->ev.events |= EPOLLET;	// Set EPOLLET in the task ev flags now.
+			t->events |= EPOLLET;	// Set EPOLLET in the task ev flags now.
 #endif
 		}
 	}
@@ -3705,18 +3610,6 @@ worker_do_timeout_check(register struct worker *w)
 static void
 worker_process_one_action(register struct worker *w, register struct task *t, register task_action_flag_t action)
 {
-	if (unlikely(t->num_locked_actions > 0)) {
-		task_pickup_locked_actions(t);
-	}
-
-	// Check if the action got cancelled.  If so, just ignore it
-	// Allow close, connecting and io timeouts through though
-	if ((action & (FLG_CL | FLG_RD | FLG_WR | FLG_CN | FLG_WT | FLG_RT | FLG_TM)) == 0) {
-		if ((t->active_flags & action) == 0) {
-			return;
-		}
-	}
-
 	// If this worker does not match the task's worker, then that's probably because
 	// the task recently migrated.  Send the notification to the correct worker
 	if(unlikely(t->worker != w)) {
@@ -3734,6 +3627,18 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 			}
 		}
 		return;
+	}
+
+	if (unlikely(t->num_locked_actions > 0)) {
+		task_pickup_locked_actions(t);
+	}
+
+	// Check if the action got cancelled.  If so, just ignore it
+	// Allow close, connecting and io timeouts through though
+	if ((action & (FLG_CL | FLG_RD | FLG_WR | FLG_CN | FLG_WT | FLG_RT | FLG_TM)) == 0) {
+		if ((t->active_flags & action) == 0) {
+			return;
+		}
 	}
 
 	// It's a change action from here on.  Process the action we got
@@ -3754,9 +3659,9 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 
 	if (likely(!!(action & (FLG_RT | FLG_WT)))) {
 		if (action == FLG_WT) {
-			task_activate_wr_timeout(t);
+			task_activate_wr_timeout(w, t);
 		} else {
-			task_activate_rd_timeout(t);
+			task_activate_rd_timeout(w, t);
 		}
 		return;
 	}
@@ -3794,9 +3699,9 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 				t->preferred_worker = NULL;
 
 				// Re-attach any timer nodes as needed
-				t->tm_attached = worker_timer_update(w, &t->tm_tt, t->tfd);
-				t->rt_attached = worker_timer_update(w, &t->rd_tt, t->tfd);
-				t->wt_attached = worker_timer_update(w, &t->wr_tt, t->tfd);
+				worker_timer_update(w, &t->tm_tt, t->tfd);
+				worker_timer_update(w, &t->rd_tt, t->tfd);
+				worker_timer_update(w, &t->wr_tt, t->tfd);
 			}
 		}
 		task_unlock(t, action);
@@ -4959,7 +4864,6 @@ TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
 		t->tm_tt.expiry_us = get_time_us(TASK_TIME_COARSE) + us_from_now;
 	}
 
-	t->tm_attached = false;
 	t->tm_cb = timeout_cb;
 	t->tm_cb_data = timeout_cb_data;
 	task_notify_action(t, FLG_TM, false);

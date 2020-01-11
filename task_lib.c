@@ -40,7 +40,7 @@
 // #define TFD_POOL_DEBUG
 
 // Uncomment to have the sizes of various structures printed out at startup
-// #define DEBUG_SIZES
+#define DEBUG_SIZES
 
 // General tuning/limit settings
 #define TASK_MAX_IO_DEPTH	2		// Max depth IO nested callbacks can be before queueing
@@ -186,17 +186,31 @@ struct task_timer {
 	void			*node;		// The paired heap node
 };
 
-// The task structure is broken into 2 parts, being the "dormant" and "active" portions. Infrequently
-// accessed fields exists within the "dormant" portion.  The sizes of these structures are also
+// The task structure is broken into 2 parts, being the "stride" and "active" portions. Infrequently
+// accessed fields exists within the "stride" portion.  The sizes of these structures are also
 // broken out into 3 x 64 byte, and 8 x 64 byte sized elements, which introduces a staggered data
 // "striding" pattern for the CPU caches for better CPU cache-set utlisation
 
-struct task_dormant {
+struct task_stride {
 	// For TASK_TYPE_ACCEPT tasks, addr refers to the local address we're listening on
 	// For TASK_TYPE_IO/CONNECT tasks, addr refers to the remote communication address
 	struct sockaddr_storage		addr;			// Addresses for tasks within the task pool
 
 	//===================================  128 BYTE BOUNDARY   =====================================//
+
+	//----------------------------------------------------------------------------------------------//
+	//===================================    CALLBACK FIELDS    ====================================//
+	//----------------------------------------------------------------------------------------------//
+
+__attribute__ ((aligned(64))) void	*accept_cb_data;
+	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
+	void				*connect_cb_data;
+	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
+	void				*close_cb_data;		//  User data to pass to the close callback
+	void				(*close_cb)(int64_t tfd, void *close_cb_data);
+	struct worker			*preferred_worker;	// To initiate task io worker migration
+
+	//===================================  64 BYTE BOUNDARY    =====================================//
 } __attribute__ ((aligned(64)));
 
 struct task {
@@ -229,7 +243,7 @@ struct task {
 	struct ntfyq			*listen_children;	// The list of child accept tasks
 	uint32_t			migrations;		// Number of times the task has migrated
 	uint32_t			unused_32_1;		// Unused
-	uint64_t			unused_64_1;
+	struct task_stride		*stride;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -297,21 +311,6 @@ __attribute__ ((aligned(64))) struct task_timer	wr_tt;		// 32 bytes - WR Timeout
 	size_t				wrv_buflen;
 	int32_t				wrv_iovcnt;
 	uint32_t			wrv_unused_32;
-
-	//===================================  64 BYTE BOUNDARY    =====================================//
-
-	//----------------------------------------------------------------------------------------------//
-	//===================================    CALLBACK FIELDS    ====================================//
-	//----------------------------------------------------------------------------------------------//
-
-__attribute__ ((aligned(64))) void	*accept_cb_data;
-	void				(*accept_cb)(int64_t tfd, void *accept_cb_data);
-	void				*connect_cb_data;
-	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
-	void				*close_cb_data;		//  User data to pass to the close callback
-	void				(*close_cb)(int64_t tfd, void *close_cb_data);
-	struct worker			*preferred_worker;	// To initiate task io worker migration
-	struct task_dormant		*dormant;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -428,7 +427,7 @@ struct instance {
 	// TFD->task pool
 	task_action_flag_t		*locked_actions;
 	struct task			*tfd_pool;		// The total pool of tasks we can work with
-	struct task_dormant		*tfd_dormant;		// The "dormant" portion of the task pool
+	struct task_stride		*tfd_stride;		// The "stride" portion of the task pool
 	struct task			*free_tasks;
 
 	uint64_t			tfd_pool_used;		// The total number of active tasks in the pool
@@ -884,14 +883,14 @@ task_init(struct task *t)
 	struct ntfyq *freeq_overflow = t->freeq_overflow;
 
 	memset((__thr_current_instance->tfd_pool + tfdi), 0, sizeof(struct task));
-	memset((__thr_current_instance->tfd_dormant + tfdi), 0, sizeof(struct task_dormant));
+	memset((__thr_current_instance->tfd_stride + tfdi), 0, sizeof(struct task_stride));
 
 	t->free2.next = NULL;
 	t->free1.next = &t->free2;
 	t->freeq = &t->free1;
 	t->freeq_overflow = freeq_overflow;
 
-	t->dormant = __thr_current_instance->tfd_dormant + tfdi;
+	t->stride = __thr_current_instance->tfd_stride + tfdi;
 	t->state = TASK_STATE_UNUSED;
 	t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
 	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
@@ -1455,7 +1454,7 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 	struct worker *tw;
 
 	if (i->flags & TASK_FLAGS_AFFINITY_DISABLE) {
-		t->preferred_worker = NULL;
+		t->stride->preferred_worker = NULL;
 		return;
 	}
 
@@ -1465,9 +1464,9 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 	// set when the task actually migrates
 	tw = get_affined_worker_from_direction(is_client);
 
-	t->preferred_worker = NULL;
+	t->stride->preferred_worker = NULL;
 	if (tw && (t->worker == NULL)) {
-		t->preferred_worker = tw;
+		t->stride->preferred_worker = tw;
 
 		// At least set the incoming affinity for the TCP connection
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
@@ -1478,7 +1477,7 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 	}
 
 	if (tw && (tw != t->worker)) {
-		t->preferred_worker = tw;
+		t->stride->preferred_worker = tw;
 		return;
 	}
 
@@ -1950,8 +1949,8 @@ task_cancel_read(struct task *t)
 static void
 task_do_close_cb(struct task *t)
 {
-	void (*cb)(int64_t tfd, void *close_cb_data) = t->close_cb;
-	void *cb_data = t->close_cb_data;
+	void (*cb)(int64_t tfd, void *close_cb_data) = t->stride->close_cb;
+	void *cb_data = t->stride->close_cb_data;
 	int64_t tfd = t->tfd;
 
 	assert(t->active_flags & FLG_CL);
@@ -1992,9 +1991,9 @@ task_do_close_cb(struct task *t)
 	t->rd_cb = NULL;
 	t->wrv_cb = NULL;
 	t->rdv_cb = NULL;
-	t->accept_cb = NULL;
-	t->connect_cb = NULL;
-	t->close_cb = NULL;
+	t->stride->accept_cb = NULL;
+	t->stride->connect_cb = NULL;
+	t->stride->close_cb = NULL;
 
 	// Cancel the timeouts
 	task_destroy_timeouts(t);
@@ -2067,11 +2066,11 @@ task_do_read_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 static void
 task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno)
 {
-	void (*cb)(int64_t tfd, void *accept_cb_data) = t->accept_cb;
-	void *cb_data = t->accept_cb_data;
+	void (*cb)(int64_t tfd, void *accept_cb_data) = t->stride->accept_cb;
+	void *cb_data = t->stride->accept_cb_data;
 
-	t->accept_cb = NULL;
-	t->accept_cb_data = NULL;
+	t->stride->accept_cb = NULL;
+	t->stride->accept_cb_data = NULL;
 
 	if (unlikely(cb == NULL) || (t->rd_cancel) || (t->state != TASK_STATE_ACTIVE)) {
 		task_notify_action(t, FLG_CL, false, true);
@@ -2131,8 +2130,8 @@ task_do_write_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 static void
 task_do_connect_cb(struct task *t, int64_t tfd, int result, int cb_errno)
 {
-	void (*cb)(int64_t tfd, int result, void *connect_cb_data) = t->connect_cb;
-	void *cb_data = t->connect_cb_data;
+	void (*cb)(int64_t tfd, int result, void *connect_cb_data) = t->stride->connect_cb;
+	void *cb_data = t->stride->connect_cb_data;
 
 	t->wt_cancelled = true;
 	t->wr_expires_modified = false;
@@ -2275,7 +2274,7 @@ worker_cleanup(struct worker *w)
 		if (action & (FLG_RT | FLG_WT)) {
 			continue;
 		}
-		t->close_cb = NULL;
+		t->stride->close_cb = NULL;
 		task_lock(t, FLG_CL);
 		if ((action & FLG_CL) == 0) {
 			task_unlock(t, action);
@@ -2356,8 +2355,8 @@ worker_select_io_worker(struct instance *i, struct task *t, bool outgoing)
 	// Try CPU affinity method for worker selection first
 	if (t && i->all_io_workers_affined && (t->fd >= 0)) {
 		task_set_initial_preferred_worker(t, outgoing);
-		if ((w = t->preferred_worker) != NULL) {
-			t->preferred_worker = NULL;
+		if ((w = t->stride->preferred_worker) != NULL) {
+			t->stride->preferred_worker = NULL;
 			return w;
 		}
 	}
@@ -2590,8 +2589,8 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	t->worker = w;
 	t->epfd = w->gepfd;
 	t->type = type;
-	t->close_cb = close_cb;
-	t->close_cb_data = close_cb_data;
+	t->stride->close_cb = close_cb;
+	t->stride->close_cb_data = close_cb_data;
 	t->fd = fd;
 	ck_pr_inc_64(&w->num_tasks);
 
@@ -2830,7 +2829,7 @@ task_handle_connecting_action(register struct task *t, register bool wr_expires_
 {
 	// Start the connect
 	while (1) {
-		if (connect(t->fd, (struct sockaddr *)&t->dormant->addr, t->addrlen) == 0) {
+		if (connect(t->fd, (struct sockaddr *)&t->stride->addr, t->addrlen) == 0) {
 			task_handle_connect_event(t);
 			return;
 		}
@@ -3215,7 +3214,7 @@ task_handle_listen_event(struct task *t)
 		}
 
 		//  If we get a new connection, but can't inform anyone, just close it
-		if (t->accept_cb == NULL) {
+		if (t->stride->accept_cb == NULL) {
 			close(cfd);
 			continue;
 		}
@@ -3231,13 +3230,13 @@ task_handle_listen_event(struct task *t)
 		// own.  The caller can distingish between the two by inspecting the tfd that
 		// arrives on the accept close callback.  If the tfd matches the accept tfd,
 		// then the close is on the accept task, otherwise it is for the new task
-		if ((t_new = task_create(i, TASK_TYPE_IO, cfd, NULL, t->close_cb_data,
-					 t->close_cb, false)) == NULL) {
+		if ((t_new = task_create(i, TASK_TYPE_IO, cfd, NULL, t->stride->close_cb_data,
+					 t->stride->close_cb, false)) == NULL) {
 			// We failed to create a task structure for it :(  Inform user
 			// of the failure so they're aware of us dropping connections
-			if (t->accept_cb) {
+			if (t->stride->accept_cb) {
 				// t is still locked at this point
-				t->accept_cb(-1, t->accept_cb_data);
+				t->stride->accept_cb(-1, t->stride->accept_cb_data);
 			}
 			close(cfd);
 			continue;
@@ -3247,8 +3246,8 @@ task_handle_listen_event(struct task *t)
 			worker_learn_cpu_affinity(t);
 		}
 
-		t_new->accept_cb = t->accept_cb;
-		t_new->accept_cb_data = t->accept_cb_data;
+		t_new->stride->accept_cb = t->stride->accept_cb;
+		t_new->stride->accept_cb_data = t->stride->accept_cb_data;
 
 		// Although we can queue it so that new task starts on the correct worker, there is
 		// a small delay for the correct thread to activate.  In order to keep TTFB latency
@@ -3511,10 +3510,10 @@ worker_handle_event(struct worker *w, uint32_t events)
 static void
 worker_handle_task_migration(struct worker *w, struct task *t)
 {
-	struct worker *tw = t->preferred_worker;
+	struct worker *tw = t->stride->preferred_worker;
 
 	t->migrations++;
-	t->preferred_worker = NULL;
+	t->stride->preferred_worker = NULL;
 	t->worker = tw;
 	ck_pr_dec_64(&w->num_tasks);
 	ck_pr_inc_64(&tw->num_tasks);
@@ -3648,9 +3647,9 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 
 	// Handle a migration notification
 	if (action == FLG_MG) {
-		if (t->preferred_worker != NULL) {
+		if (t->stride->preferred_worker != NULL) {
 			// We're the sender worker
-			if (t->preferred_worker != w) {
+			if (t->stride->preferred_worker != w) {
 				worker_handle_task_migration(w, t);
 			}
 			task_unlock(t, FLG_MG);
@@ -4277,7 +4276,7 @@ instance_listen_balance(struct task *t)
 		}
 		
 		// Now bind to the same address
-		if (bind(nfd, (const struct sockaddr *)&t->dormant->addr, t->addrlen) < 0) {
+		if (bind(nfd, (const struct sockaddr *)&t->stride->addr, t->addrlen) < 0) {
 			perror("instance_listen_balance->bind");
 			close(nfd);
 			continue;
@@ -4289,18 +4288,18 @@ instance_listen_balance(struct task *t)
 		}
 
 		// Create a child task to look after the socket. Ensure to specify the worker for the new task
-		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->close_cb_data,
-				      t->close_cb, false)) == NULL) {
+		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->stride->close_cb_data,
+				      t->stride->close_cb, false)) == NULL) {
 			perror("instance_listen_balance->task_create");
 			continue;
 		}
 
 		// Convert new task to an listener type and inform task to expect incoming events
-		memcpy(&nt->dormant->addr, &t->dormant->addr, t->addrlen);
+		memcpy(&nt->stride->addr, &t->stride->addr, t->addrlen);
 		nt->listen_child = 1;
 		nt->addrlen = t->addrlen;
-		nt->accept_cb = t->accept_cb;
-		nt->accept_cb_data = t->accept_cb_data;
+		nt->stride->accept_cb = t->stride->accept_cb;
+		nt->stride->accept_cb_data = t->stride->accept_cb_data;
 		nt->rd_expires_in_us = TIMER_TIME_DESTROY;
 		nt->rd_state = TASK_READ_STATE_LISTEN;
 		if (task_raise_event_flag(nt, EPOLLIN) < 0) {
@@ -4452,9 +4451,9 @@ instance_destroy(struct instance *i)
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
 	}
-	if (i->tfd_dormant) {
-		free((void *)i->tfd_dormant);
-		i->tfd_dormant = NULL;
+	if (i->tfd_stride) {
+		free((void *)i->tfd_stride);
+		i->tfd_stride = NULL;
 	}
 	if (i->tfd_locks_real) {
 		// Hack to get around compiler warning stubborness over not passing volatile
@@ -4522,16 +4521,16 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 	i->tfd_pool_used = 0;
 	i->tfd_pool_size = pool_size;
 
-	// Allocate the "dormant" task area before the "active" area
-	num_pages = pool_size * sizeof(struct task_dormant);
+	// Allocate the "stride" task area before the "active" area
+	num_pages = pool_size * sizeof(struct task_stride);
 	num_pages += (__page_size - 1);
 	num_pages /= __page_size;
 
-	if ((i->tfd_dormant = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
-		i->tfd_dormant = NULL;
+	if ((i->tfd_stride = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
+		i->tfd_stride = NULL;
 		return -1;
 	}
-	memset(i->tfd_dormant, 0, num_pages * __page_size);
+	memset(i->tfd_stride, 0, num_pages * __page_size);
 
 	// Allocate the "active" task tfd_pool space now
 	num_pages = pool_size * sizeof(struct task);
@@ -5167,7 +5166,7 @@ TASK_migrate(int64_t to_tfd, int64_t from_tfd)
 		errno = EALREADY;
 		return -1;
 	}
-	from_t->preferred_worker = tw;
+	from_t->stride->preferred_worker = tw;
 	task_notify_action(from_t, FLG_MG, false, true);
 	return 0;
 } // TASK_migrate
@@ -5240,8 +5239,8 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	t->type = TASK_TYPE_LISTEN;
 	t->rd_state = TASK_READ_STATE_LISTEN;
 	t->listen_child = 0;
-	t->accept_cb = accept_cb;
-	t->accept_cb_data = accept_cb_data;
+	t->stride->accept_cb = accept_cb;
+	t->stride->accept_cb_data = accept_cb_data;
 	i = w->instance;
 	i->is_server = true;
 	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
@@ -5249,8 +5248,8 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	}
 
 	// Retrieve the local address the listen task is bound to
-	t->addrlen = sizeof(t->dormant->addr);
-	if (getsockname(t->fd, (struct sockaddr *)&t->dormant->addr, &t->addrlen) < 0) {
+	t->addrlen = sizeof(t->stride->addr);
+	if (getsockname(t->fd, (struct sockaddr *)&t->stride->addr, &t->addrlen) < 0) {
 		int err = errno;
 		task_unlock(t, (FLG_LI));
 		errno = err;
@@ -5329,14 +5328,14 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	}
 
 	// Convert this task to connect type
-	t->connect_cb = connect_cb;
+	t->stride->connect_cb = connect_cb;
 	t->type = TASK_TYPE_CONNECT;
 	t->addrlen = addrlen;
 	t->wr_expires_in_us = expires_in_us;
 	t->wr_expires_modified = true;
-	t->connect_cb_data = connect_cb_data;
+	t->stride->connect_cb_data = connect_cb_data;
 	t->wr_state = TASK_WRITE_STATE_CONNECT;
-	memcpy(&t->dormant->addr, addr, addrlen);
+	memcpy(&t->stride->addr, addr, addrlen);
 	task_unlock(t, FLG_CO);
 
 	// Queue the connect so it starts on the correct worker
@@ -5374,8 +5373,8 @@ TASK_socket_set_close_cb(int64_t tfd, void *close_cb_data, void (*close_cb)(int6
 	}
 
 	// Set the task's close callback information
-	t->close_cb = close_cb;
-	t->close_cb_data = close_cb_data;
+	t->stride->close_cb = close_cb;
+	t->stride->close_cb_data = close_cb_data;
 	task_unlock(t, FLG_CCB);
 	return 0;
 } // TASK_socket_set_close_cb
@@ -5803,7 +5802,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 #ifdef DEBUG_SIZES
 		printf("sizeof(tfd_lock_t)=%lu\n", sizeof(tfd_lock_t));
 		printf("sizeof(struct task)=%lu\n", sizeof(struct task));
-		printf("sizeof(struct task_dormant)=%lu\n", sizeof(struct task_dormant));
+		printf("sizeof(struct task_stride)=%lu\n", sizeof(struct task_stride));
 		printf("sizeof(socklen_t)=%lu\n", sizeof(socklen_t));
 #endif
 

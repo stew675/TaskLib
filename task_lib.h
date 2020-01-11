@@ -106,6 +106,10 @@ ssize_t TASK_socket_read(int64_t tfd, void *buf, size_t buflen, int64_t expires_
 // Returns the direct UNIX socket that the tfd is operating on
 int TASK_socket_get_fd(int64_t tfd);
 
+// Forces the task designated by from_tfd onto the same worker thread as used by the to_tfd task
+// This may be beneficial in certain scenarios
+int TASK_migrate(int64_t to_tfd, int64_t from_tfd);
+
 // Closes the tfd control over the given WebOps FD.  If a close_cb() has been
 // registered against the tfd, then that will be called just prior to closing
 // If there is a timeout registered against the tfd, it will be automatically cancelled

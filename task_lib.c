@@ -40,7 +40,7 @@
 // #define TFD_POOL_DEBUG
 
 // Uncomment to have the sizes of various structures printed out at startup
-#define DEBUG_SIZES
+// #define DEBUG_SIZES
 
 // General tuning/limit settings
 #define TASK_MAX_IO_DEPTH	2		// Max depth IO nested callbacks can be before queueing

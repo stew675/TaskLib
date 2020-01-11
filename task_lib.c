@@ -170,9 +170,11 @@ typedef enum {
 	FLG_DRP = 	0x80000000,		// If this a drop of another action
 } task_action_flag_t;
 
+struct task;
+
 struct ntfyq {
 	struct ntfyq		*next;
-	uint64_t		tfd;
+	struct task		*t;
 	uint32_t		action;
 	uint32_t		unused;
 };
@@ -180,7 +182,6 @@ struct ntfyq {
 struct task_timer {
 	struct task_timer	*next;		// Next cool-off list entry
 	struct task_timer	*prev;		// Previous cool-off list entry
-	int64_t			tfd;		// TFD this timer is associated with
 	int64_t			expiry_us;	// The expiry time
 	void			*node;		// The paired heap node
 };
@@ -244,11 +245,9 @@ struct task {
 
 	// Data write fields
 __attribute__ ((aligned(64))) const char *wr_buf;
-	uint64_t			wr_unused_two;
+	uint64_t			wr_unused_64;
 	size_t				wr_buflen;
 	size_t				wr_bufpos;
-	size_t				wrv_buflen;
-	int32_t				wrv_iovcnt;
 	uint32_t			wr_state:2,
 					wr_shut:1,
 					wr_cancel:1,
@@ -256,6 +255,7 @@ __attribute__ ((aligned(64))) const char *wr_buf;
 					wr_unused:26;
 	void				*wr_cb_data;
 	void				(*wr_cb)(int64_t tfd, const void *buf, ssize_t result, void *wr_cb_data);
+	void				(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -265,11 +265,9 @@ __attribute__ ((aligned(64))) const char *wr_buf;
 
 	// Data read fields
 __attribute__ ((aligned(64))) char	*rd_buf;
-	uint64_t			rd_unused_two;
+	uint64_t			rd_unused_64;
 	size_t				rd_buflen;
 	size_t				rd_bufpos;
-	size_t				rdv_buflen;
-	int32_t				rdv_iovcnt;
 	uint32_t			rd_state:2,
 					rd_shut:1,
 					rd_cancel:1,
@@ -277,6 +275,7 @@ __attribute__ ((aligned(64))) char	*rd_buf;
 					rd_unused:26;
 	void				*rd_cb_data;
 	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
+	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -287,17 +286,21 @@ __attribute__ ((aligned(64))) struct ntfyq *freeq;		// The list of free ntfyq ev
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
-__attribute__ ((aligned(64))) struct task_timer rd_tt;		// 40 bytes - RD Timeout Information
+__attribute__ ((aligned(64))) struct task_timer rd_tt;		// 32 bytes - RD Timeout Information
 	const struct iovec		*rdv_iov;
+	size_t				rdv_buflen;
 	size_t				rdv_bufpos;
-	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
+	int32_t				rdv_iovcnt;
+	uint32_t			rdv_unused_32;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
-__attribute__ ((aligned(64))) struct task_timer	wr_tt;		// 40 bytes - WR Timeout Information
-	size_t				wrv_bufpos;
+__attribute__ ((aligned(64))) struct task_timer	wr_tt;		// 32 bytes - WR Timeout Information
 	const struct iovec		*wrv_iov;
-	void				(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data);
+	size_t				wrv_bufpos;
+	size_t				wrv_buflen;
+	int32_t				wrv_iovcnt;
+	uint32_t			wrv_unused_32;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -320,12 +323,13 @@ __attribute__ ((aligned(64))) void	*accept_cb_data;
 	//=================================    TIMER CONTROL FIELDS    =================================//
 	//----------------------------------------------------------------------------------------------//
 
-__attribute__ ((aligned(64))) void	*tm_cb_data;
+__attribute__ ((aligned(64))) struct task_timer tm_tt;		// 32 bytes - Timer Information
+	void				*tm_cb_data;
 	void				(*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
-	struct task_timer		tm_tt;			// 40 bytes - Timer Information
 	// notifyqlen_locked is updated by an atomic count operation.  We want to keep it on a CPU cache
 	// line (64 bytes width) with other infreqently accessed data.
 	uint64_t			notifyqlen_locked;	// Number of locked notifyq entries this task has
+	uint64_t			tm_unused_64;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 } __attribute__ ((aligned(64)));
@@ -700,13 +704,11 @@ worker_timer_detach_list(struct worker *w, struct task_timer *tt)
 
 
 static inline void
-worker_timer_attach_heap(struct worker *w, struct task_timer *tt, int64_t tfd)
+worker_timer_attach_heap(struct worker *w, struct task_timer *tt)
 {
 	// Okay then, it needs to go into the paired heap directly
 	if (tt->node == NULL) {
-		intptr_t tfd_intptr = (intptr_t)tfd;
-
-		tt->node = pheap_insert(w->timer_queue, (void *)tt->expiry_us, (void *)tfd_intptr);
+		tt->node = pheap_insert(w->timer_queue, (void *)tt->expiry_us, (void *)tt);
 		assert(tt->node != NULL);
 	} else {
 		pheap_set_key(w->timer_queue, tt->node, (void *)tt->expiry_us);
@@ -726,9 +728,8 @@ worker_timer_detach_heap(struct worker *w, struct task_timer *tt)
 
 
 static void
-worker_timer_update(struct worker *w, struct task_timer *tt, int64_t tfd)
+worker_timer_update(struct worker *w, struct task_timer *tt)
 {
-	tt->tfd = tfd;
 	if (tt->expiry_us < 0) {
 		// Nothing to do
 		return;
@@ -739,7 +740,7 @@ worker_timer_update(struct worker *w, struct task_timer *tt, int64_t tfd)
 		if (tt->next != NULL) {
 			worker_timer_detach_list(w, tt);
 		}
-		worker_timer_attach_heap(w, tt, tfd);
+		worker_timer_attach_heap(w, tt);
 	} else {
 		// It should go to the cool off list
 		if (tt->next == NULL) {
@@ -748,6 +749,21 @@ worker_timer_update(struct worker *w, struct task_timer *tt, int64_t tfd)
 		}
 	}
 } // worker_timer_update
+
+
+// I am both horrified, and yet morbidly proud of, the following function
+static inline struct task *
+worker_get_task_from_tt(struct task_timer *tt)
+{
+	size_t offset;
+
+	// Hacky as all get out! It only works because all our task structures are pre-allocated
+	// in a single contiguous block of memory, but it allows us to get by without needing an
+	// explicit pointer to the task within the struct task_timer
+	offset = ((char *)tt) - ((char *)__thr_current_instance->tfd_pool);
+	offset /= sizeof(struct task);
+	return __thr_current_instance->tfd_pool + offset;
+} // worker_get_task_from_tt
 
 
 // Scans 1/25th of the list at a time.  Since all new entries are added at the tail, and the list
@@ -789,7 +805,7 @@ worker_timer_scan_colt(register struct worker *w) {
 			}
 			tt->next = NULL;
 			w->colt_len--;
-			worker_timer_attach_heap(w, tt, tt->tfd);
+			worker_timer_attach_heap(w, tt);
 			continue;
 		} else {
 			colt = colt->next;
@@ -995,10 +1011,10 @@ task_lock(struct task *t, task_action_flag_t action)
 static void
 task_unlock(struct task *t, task_action_flag_t action)
 {
-	register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
-
 	if (unlikely(!lockless_worker(t->worker))) {
 		if (action) {
+			register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
+
 			tfd_lock(tfdi);
 			task_add_locked_action(t, (action | FLG_DRP));
 			tfd_unlock(tfdi);
@@ -1027,6 +1043,7 @@ task_unlock(struct task *t, task_action_flag_t action)
 	}
 
 	// Need to grab the tfd lock to check the next set of items
+	register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
 	tfd_lock(tfdi);
 
 	if (t->rd_state != TASK_READ_STATE_IDLE) {
@@ -1634,7 +1651,6 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 {
 	register struct worker *w = t->worker;
 	register struct ntfyq *tq = NULL;
-	register int64_t tfd = t->tfd;
 
 	if (unlikely(w == NULL)) {	// This can be true sometimes during shutdown
 		return false;
@@ -1706,9 +1722,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 			}
 		}
 
-		tq->tfd = tfd;
-		tq->action = action;
-		tq->next = NULL;
+		*tq = (struct ntfyq) { .t = t, .action = action, .next = NULL };
 
 		if (unlikely(w->notifyq_tail == NULL)) {
 			w->notifyq_head = tq;
@@ -1734,9 +1748,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 			worker_lock(w);
 		}
 
-		tq->tfd = tfd;
-		tq->action = action;
-		tq->next = NULL;
+		*tq = (struct ntfyq) { .t = t, .action = action, .next = NULL };
 
 		if (w->notifyq_locked_tail == NULL) {
 			w->notifyq_locked_head = tq;
@@ -1791,7 +1803,7 @@ task_activate_rd_timeout(struct worker *w, struct task *t)
 		return;
 	}
 
-	worker_timer_update(w, &t->rd_tt, t->tfd);
+	worker_timer_update(w, &t->rd_tt);
 	t->rt_cancelled = false;
 } // task_activate_rd_timeout
 
@@ -1813,7 +1825,7 @@ task_activate_wr_timeout(struct worker *w, struct task *t)
 		return;
 	}
 
-	worker_timer_update(w, &t->wr_tt, t->tfd);
+	worker_timer_update(w, &t->wr_tt);
 	t->wt_cancelled = false;
 } // task_activate_wr_timeout
 
@@ -1824,9 +1836,9 @@ task_create_event_flag(struct task *t, uint32_t flags)
 {
 	int res;
 #ifdef USE_EPOLLONESHOT
-	struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = (EPOLLONESHOT | EPOLLRDHUP | flags) };
+	struct epoll_event ev = { .data.ptr = t, .events = (EPOLLONESHOT | EPOLLRDHUP | flags) };
 #else
-	struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = (EPOLLRDHUP | flags) };
+	struct epoll_event ev = { .data.ptr = t, .events = (EPOLLRDHUP | flags) };
 #endif
 
 	if ((res = epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev)) < 0) {
@@ -1840,6 +1852,7 @@ task_create_event_flag(struct task *t, uint32_t flags)
 		}
 	}
 	t->in_epoll = true;
+	t->io_depth = 0;
 
 #ifdef USE_EPOLLET
 	// Only turn on EPOLLET AFTER the add, or we race
@@ -1857,38 +1870,17 @@ task_create_event_flag(struct task *t, uint32_t flags)
 static int
 task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
-	int res;
-
 	if (likely(t->in_epoll)) {
-		struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = (t->events | flags) };
+		struct epoll_event ev = { .data.ptr = t, .events = (t->events | flags) };
+		int res;
 
-		res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev);
-		if (res == 0) {
+		if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
 			t->events = ev.events;
+			t->io_depth = 0;
 		}
-	} else {
-		res = task_create_event_flag(t, flags);		// We need to do EPOLL_CTL_ADD instead
+		return res;
 	}
-
-	if (unlikely(res < 0)) {
-		return -1;
-	}
-
-	// Activate the IO timeouts as required
-	t->io_depth = 0;
-	if (flags & EPOLLIN) {
-		if (t->rd_expires_modified) {
-			task_notify_action(t, FLG_RT, false, false);
-		}
-	}
-
-	if (flags & EPOLLOUT) {
-		if (t->wr_expires_modified) {
-			task_notify_action(t, FLG_WT, false, false);
-		}
-	}
-
-	return 0;
+	return task_create_event_flag(t, flags);		// We need to do EPOLL_CTL_ADD instead
 } // task_raise_event_flag
 
 
@@ -1896,27 +1888,28 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 static int
 task_lower_event_flag(register struct task *t, register uint32_t flags)
 {
-	struct epoll_event ev = {.data.u64 = (uint64_t)t->tfd, .events = (t->events & ~(flags)) };
-	register int res;
 
-	// If we have no TFD, we nothing else to do
-	if (unlikely(t->in_epoll == false)) {
-		return 0;
-	}
-
+	// If we're not in epoll, we have nothing to do
+	if (likely(t->in_epoll)) {
+		register uint32_t events = t->events & ~(flags);
 #ifdef USE_EPOLLONESHOT
-	// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
-	// if there's no other IN/OUT flag still set
-	if ((ev.events & (EPOLLIN | EPOLLOUT)) == 0) {
-		t->events = ev.events;
-		return 0;
-	}
+		// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
+		// if there's no other IN/OUT flag still set
+		if ((events & (EPOLLIN | EPOLLOUT)) == 0) {
+			t->events = events;
+			return 0;
+		}
 #endif
+		{	struct epoll_event ev = {.data.ptr = t, .events = events };
+			register int res;
 
-	if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
-		t->events = ev.events;
+			if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
+				t->events = events;
+			}
+			return res;
+		}
 	}
-	return res;
+	return 0;
 } // task_lower_event_flag
 
 
@@ -2269,21 +2262,17 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 	register struct ntfyq *tq;
 
 	while ((tq = t->dormant->listen_children) != NULL) {
-		int64_t tfd;
-		struct task *tac;	// Accept Child
+		struct task *tac = tq->t;	// Accept Child
 
 		t->dormant->listen_children->next = tq;
-
-		tfd = tq->tfd;
 
 		worker_lock(w);
 		tq->next = w->freeq_locked;
 		w->freeq_locked = tq;
 		worker_unlock(w);
 
-		tac = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
-		task_lock(t, FLG_CL);
 		tac->rd_state = TASK_READ_STATE_IDLE;
+		task_lock(tac, FLG_CL);
 		task_do_close_cb(tac);
 	}
 } // task_shutdown_listen_children
@@ -2322,16 +2311,9 @@ worker_cleanup(struct worker *w)
 	worker_unlock(w);
 
 	for (tq = qhead; tq != NULL; tq = tq->next) {
-		struct task *t = NULL;
-		register int64_t tfd;
-		task_action_flag_t action;
+		struct task *t = tq->t;
+		task_action_flag_t action = tq->action;
 
-		tfd = tq->tfd;
-		action = tq->action;
-		tq->tfd = TFD_NONE;
-		tq->action = FLG_NONE;
-
-		t = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
 		if (t->state != TASK_STATE_ACTIVE) {
 			continue;
 		}
@@ -2609,7 +2591,7 @@ task_update_timer(struct task *t)
 
 	// Just update the timeout in the timeout system
 	t->tm_cancelled = false;
-	worker_timer_update(w, &t->tm_tt, t->tfd);
+	worker_timer_update(w, &t->tm_tt);
 } // task_update_timer
 
 
@@ -2666,11 +2648,11 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 
 
 static ssize_t
-task_write_vector(register struct task *t, register bool queued)
+task_write_vector(register struct task *t, register bool wr_expires_modified, register bool queued)
 {
-	size_t wrv_bufpos = t->wrv_bufpos, wrv_buflen = t->wrv_buflen;
-	const struct iovec *wrv_iov = t->wrv_iov;
-	int wrv_iovcnt = t->wrv_iovcnt;
+	register size_t wrv_bufpos = t->wrv_bufpos, wrv_buflen = t->wrv_buflen;
+	register const struct iovec *wrv_iov = t->wrv_iov;
+	register int wrv_iovcnt = t->wrv_iovcnt;
 	int64_t tfd = t->tfd;
 
 	if (unlikely(t->wr_shut)) {
@@ -2723,6 +2705,9 @@ task_write_vector(register struct task *t, register bool queued)
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
 				t->wrv_bufpos = wrv_bufpos;	// Need to record bufpos for later
 				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
+					if (wr_expires_modified) {
+						task_notify_action(t, FLG_WT, false, false);
+					}
 					errno = 0;
 					return 0;
 				}
@@ -2767,7 +2752,7 @@ task_write_vector(register struct task *t, register bool queued)
 
 // Attempt to flush out anything left in our task write buffer
 static ssize_t
-task_write_buffer(register struct task *t, register bool queued)
+task_write_buffer(register struct task *t, register bool wr_expires_modified, register bool queued)
 {
 	register size_t max_can_do = TASK_MAX_IO_UNIT;
 	register size_t wr_bufpos = t->wr_bufpos, wr_buflen = t->wr_buflen;
@@ -2806,6 +2791,9 @@ task_write_buffer(register struct task *t, register bool queued)
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
 				t->wr_bufpos = wr_bufpos;	// Need to record current position for next time
 				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
+					if (wr_expires_modified) {
+						task_notify_action(t, FLG_WT, false, false);
+					}
 					errno = 0;
 					return 0;
 				}
@@ -2885,7 +2873,7 @@ task_handle_connect_event(struct task *t)
 
 
 static void
-task_handle_connecting_action(struct task *t)
+task_handle_connecting_action(register struct task *t, register bool wr_expires_modified)
 {
 	// Start the connect
 	while (1) {
@@ -2900,11 +2888,14 @@ task_handle_connecting_action(struct task *t)
 		}
 
 		if ((errno == EINPROGRESS) || (errno == EAGAIN)) {
-			if (task_raise_event_flag(t, EPOLLOUT) < 0) {
-				break;
+			if (task_raise_event_flag(t, EPOLLOUT) == 0) {
+				// We queued it, return
+				if (wr_expires_modified) {
+					task_notify_action(t, FLG_WT, false, false);
+				}
+				errno = 0;
+				return;
 			}
-			// We queued it, return
-			return;
 		}
 		break;
 	}
@@ -2915,11 +2906,11 @@ task_handle_connecting_action(struct task *t)
 
 
 static ssize_t
-task_read_vector(register struct task *t, register bool queued)
+task_read_vector(register struct task *t, register bool rd_expires_modified, register bool queued)
 {
-	size_t rdv_bufpos = t->rdv_bufpos, rdv_buflen = t->rdv_buflen;
-	const struct iovec *rdv_iov = t->rdv_iov;
-	int rdv_iovcnt = t->rdv_iovcnt;
+	register size_t rdv_bufpos = t->rdv_bufpos, rdv_buflen = t->rdv_buflen;
+	register const struct iovec *rdv_iov = t->rdv_iov;
+	register int rdv_iovcnt = t->rdv_iovcnt;
 	int64_t tfd = t->tfd;
 
 	if (unlikely(t->rd_shut)) {
@@ -2982,7 +2973,11 @@ task_read_vector(register struct task *t, register bool queued)
 
 				// We got nothing at all.  Raise EPOLLIN and wait for something
 				if (task_raise_event_flag(t, EPOLLIN) == 0) {
-					// Read is still active, don't disable its reference yet
+					// Activate the read timeout if needed
+					if (rd_expires_modified) {
+						task_notify_action(t, FLG_RT, false, false);
+					}
+					errno = 0;
 					return 0;
 				}
 			}
@@ -3037,7 +3032,7 @@ task_read_vector(register struct task *t, register bool queued)
 
 // Attempt to flush out anything left in our task write buffer
 static ssize_t
-task_read_buffer(register struct task *t, register int queued)
+task_read_buffer(register struct task *t, register bool rd_expires_modified, register bool queued)
 {
 	register size_t max_can_do = TASK_MAX_IO_UNIT;
 	register size_t rd_bufpos = t->rd_bufpos, rd_buflen = t->rd_buflen;
@@ -3090,6 +3085,10 @@ task_read_buffer(register struct task *t, register int queued)
 
 				// We got nothing at all.  Raise EPOLLIN and wait for something
 				if (task_raise_event_flag(t, EPOLLIN) == 0) {
+					if (rd_expires_modified) {
+						task_notify_action(t, FLG_RT, false, false);
+					}
+					errno = 0;
 					return 0;
 				}
 			}
@@ -3326,11 +3325,11 @@ task_handle_wr_event(struct task *t)
 
 	// Write stuff out as needed
 	if (likely(t->wr_state == TASK_WRITE_STATE_BUFFER)) {
-		task_write_buffer(t, true);		// Unlocks the task for us
+		task_write_buffer(t, t->wr_expires_modified, true);	// Unlocks the task for us
 	} else if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
-		task_write_vector(t, true);		// Unlocks the task for us
+		task_write_vector(t, t->wr_expires_modified, true);	// Unlocks the task for us
 	} else if (t->wr_state == TASK_WRITE_STATE_CONNECT) {
-		task_handle_connect_event(t);		// Unlocks the task for us
+		task_handle_connect_event(t);				// Unlocks the task for us
 	} else {
 		// Do nothing
 	}
@@ -3346,11 +3345,11 @@ task_handle_rd_event(struct task *t)
 
 	// Read in whatever as directed
 	if (likely(t->rd_state == TASK_READ_STATE_BUFFER)) {
-		task_read_buffer(t, true);	// Unlocks the task for us
+		task_read_buffer(t, t->rd_expires_modified, true);	// Unlocks the task for us
 	} else if (t->rd_state == TASK_READ_STATE_VECTOR) {
-		task_read_vector(t, true);	// Unlocks the task for us
+		task_read_vector(t, t->rd_expires_modified, true);	// Unlocks the task for us
 	} else if (t->rd_state == TASK_READ_STATE_LISTEN) {
-		task_handle_listen_event(t);	// Unlocks the task for us
+		task_handle_listen_event(t);				// Unlocks the task for us
 	} else {
 		// Do nothing
 	}
@@ -3371,9 +3370,7 @@ worker_check_timeouts(struct worker *w)
 
 	while(true) {
 		void *data, *timer_node;
-		int64_t tfd, expiry_us;
-		task_action_flag_t action;
-		register struct task *t;
+		int64_t expiry_us;
 
 		timer_node = pheap_get_min_node(w->timer_queue, (void **)&expiry_us, (void **)&data);
 		if (timer_node == NULL) {
@@ -3401,10 +3398,8 @@ worker_check_timeouts(struct worker *w)
 		pheap_detach_node(w->timer_queue, timer_node);
 
 		// Determine which timeout fired
-		tfd = (int64_t)((intptr_t)data);
-		t = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
-
-		assert(t->worker == w);
+		register struct task_timer *tt = (struct task_timer *)data;
+		register struct task *t = worker_get_task_from_tt(tt);
 
 		if (unlikely(t->num_locked_actions > 0)) {
 			task_pickup_locked_actions(t);
@@ -3414,17 +3409,19 @@ worker_check_timeouts(struct worker *w)
 			continue;
 		}
 
-		if (t->tm_tt.node == timer_node) {
+		register task_action_flag_t action;
+
+		if (&t->tm_tt == tt) {
 			if (t->tm_cancelled) {
 				continue;
 			}
 			action = FLG_TM;
-		} else if (t->rd_tt.node == timer_node) {
+		} else if (&t->rd_tt == tt) {
 			if (t->rt_cancelled) {
 				continue;
 			}
 			action = FLG_RT;
-		} else if (t->wr_tt.node == timer_node) {
+		} else if (&t->wr_tt == tt) {
 			if (t->wt_cancelled) {
 				continue;
 			}
@@ -3588,9 +3585,9 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	t->events &= ~(EPOLLET);		// Don't do an ADD with EPOLLET set
 #endif
 	if ((t->fd >= 0) && t->in_epoll) {
-		struct epoll_event ev = { .data.u64 = (uint64_t)t->tfd, .events = t->events };
+		struct epoll_event ev = { .data.ptr = t, .events = t->events };
 
-		epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, &ev);
+		epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 		t->in_epoll = false;
 		t->epfd = tw->gepfd;
 		if (epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev) == 0) {
@@ -3675,7 +3672,7 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	}
 
 	if (action == FLG_CN) {
-		task_handle_connecting_action(t);
+		task_handle_connecting_action(t, t->wr_expires_modified);
 		return;
 	}
 
@@ -3707,9 +3704,9 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 				t->preferred_worker = NULL;
 
 				// Re-attach any timer nodes as needed
-				worker_timer_update(w, &t->tm_tt, t->tfd);
-				worker_timer_update(w, &t->rd_tt, t->tfd);
-				worker_timer_update(w, &t->wr_tt, t->tfd);
+				worker_timer_update(w, &t->tm_tt);
+				worker_timer_update(w, &t->rd_tt);
+				worker_timer_update(w, &t->wr_tt);
 			}
 		}
 		task_unlock(t, action);
@@ -3774,8 +3771,7 @@ worker_process_notifyq(register struct worker *w)
 		w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 
 		while (likely((tq = notifyq) != NULL)) {
-			register int64_t tfd = tq->tfd;
-			register struct task *t = __thr_current_instance->tfd_pool + TFD_TO_INDEX(tfd);
+			register struct task *t = tq->t;
 			register task_action_flag_t action = tq->action;
 
 			notifyq = tq->next;
@@ -3791,12 +3787,6 @@ worker_process_notifyq(register struct worker *w)
 					t->freeq_overflow = tq;
 				}
 				t->notifyqlen--;
-			}
-
-			// Drop the notify action entirely if the tfd doesn't match.  It's likely
-			// to be a stale notification from a task that already terminated
-			if (unlikely(tfd != t->tfd)) {
-				continue;
 			}
 
 			// If Task is not in the Active State, unlock and go
@@ -3934,21 +3924,16 @@ worker_do_io_epoll(register struct worker *w)
 
 	// Scan through the list of all the events we've received
 	for (int n = 0; n < nfds; n++) {
-		register int64_t tfd = (int64_t)w->events[n].data.u64;
-		register uint32_t tfdi = (uint32_t)TFD_TO_INDEX(tfd);
+		register struct task *t = (struct task *)w->events[n].data.ptr;
 		register uint32_t revents = w->events[n].events;
-		register struct task *t;
 
 		// Handle non-IO items first
-		if (unlikely(tfd < 0)) {
-			if (tfd == (int64_t)TFD_NONE) {
-				worker_handle_event(w, revents);
-			}
+		if (unlikely(t == NULL)) {
+			worker_handle_event(w, revents);
 			continue;
 		}
 
-		// If Task is in Destroy State, unlock and go
-		t = __thr_current_instance->tfd_pool + tfdi;
+		// If Task is not in Active State, unlock and go
 		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
 			continue;
 		}
@@ -3971,7 +3956,7 @@ worker_do_io_epoll_fail:
 				t->rd_shut = true;
 				t->wr_shut = true;
 				t->in_epoll = false;
-				epoll_ctl(t->worker->gepfd, EPOLL_CTL_DEL, t->fd, NULL);
+				epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 				if (t->rd_state != TASK_READ_STATE_IDLE) {
 					task_handle_rd_event(t);	// Unlocks  the task
 					continue;
@@ -4175,6 +4160,7 @@ worker_create(struct instance *i, int worker_type)
 	register struct worker *w = NULL;
 	register size_t sz;
 	pthread_mutexattr_t attr;
+	int num_pages = 3;
 
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
@@ -4191,10 +4177,10 @@ worker_create(struct instance *i, int worker_type)
 	}
 	memset(w, 0, sz);
 
-	if ((w->events = aligned_alloc(__page_size, __page_size)) == NULL) {
+	if ((w->events = aligned_alloc(__page_size, (__page_size * num_pages))) == NULL) {
 		goto worker_create_failed;
 	}
-	w->max_events = __page_size / sizeof(struct epoll_event);
+	w->max_events = (__page_size * num_pages) / sizeof(struct epoll_event);
 	w->num_events = w->max_events;
 
 	if ((w->pollfds = aligned_alloc(__page_size, __page_size)) == NULL) {
@@ -4224,11 +4210,9 @@ worker_create(struct instance *i, int worker_type)
 		} else {
 			// Register worker notification event fd against the worker epoll fd
 			// Do not use EPOLLET here since we don't do selective re-arming
-			struct epoll_event ev[1] = {0};
+			struct epoll_event ev = {.data.ptr = NULL, .events = EPOLLIN };
 
-			ev->events = EPOLLIN;
-			ev->data.u64 = TFD_NONE;
-			if (epoll_ctl(w->gepfd, EPOLL_CTL_ADD, w->evfd, ev) < 0) {
+			if (epoll_ctl(w->gepfd, EPOLL_CTL_ADD, w->evfd, &ev) < 0) {
 				// epoll_ctl will set errno
 				goto worker_create_failed;
 			}
@@ -4398,7 +4382,7 @@ instance_listen_balance(struct task *t)
 			ntq = worker_notify_get_free_ntfyq(w);
 			assert(ntq != NULL);	// Out of memory
 		}
-		ntq->tfd = nt->tfd;
+		ntq->t = nt;
 		ntq->action = FLG_LI;
 		ntq->next = t->dormant->listen_children;
 		t->dormant->listen_children = ntq;
@@ -4961,7 +4945,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		ssize_t result;
 
 		t->io_depth++;
-		if ((result = task_write_vector(t, false)) == 0) {
+		if ((result = task_write_vector(t, true, false)) == 0) {
 			return 0;
 		}
 		t->wr_expires_modified = false;
@@ -5038,7 +5022,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		ssize_t result;
 
 		t->io_depth++;
-		if ((result = task_write_buffer(t, false)) == 0) {
+		if ((result = task_write_buffer(t, true, false)) == 0) {
 			return 0;
 		}
 		t->wr_expires_modified = false;
@@ -5133,7 +5117,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		ssize_t result;
 
 		t->io_depth++;
-		if ((result = task_read_vector(t, false)) == 0) {
+		if ((result = task_read_vector(t, true, false)) == 0) {
 			return 0;
 		}
 		t->rd_expires_modified = false;
@@ -5209,7 +5193,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		ssize_t result;
 
 		t->io_depth++;
-		if ((result = task_read_buffer(t, false)) == 0) {
+		if ((result = task_read_buffer(t, true, false)) == 0) {
 			return 0;
 		}
 		t->rd_expires_modified = false;
@@ -5356,7 +5340,7 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	}
 
 	// Listeners do not have IO timeouts.  Make sure of it
-	t->rd_expires_in_us = TIMER_TIME_DESTROY;
+	t->rd_expires_modified = false;
 	if (task_raise_event_flag(t, EPOLLIN) < 0) {
 		int err = errno;
 		task_unlock(t, FLG_LI);

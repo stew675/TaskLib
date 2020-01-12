@@ -2725,6 +2725,7 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 
 		// Restrict the amount that can be written in one go for fairness
 		if (max_can_do == 0) {
+			t->wr_bufpos = wr_bufpos;	// Need to record current position for next time
 			if (task_notify_action(t, FLG_WR, false, true)) {
 				return 0;
 			}

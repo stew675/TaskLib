@@ -613,15 +613,6 @@ do_bt(void)
 }
 #endif
 
-// Branch prediction optimisation macros
-#if __GNUC__ >= 3
-#define likely(x) __builtin_expect((x), 1)
-#define unlikely(x) __builtin_expect((x), 0)
-#else
-#define likely(x) (x)
-#define unlikely(x) (x)
-#endif
-
 // Get the microsecond current time into the given int64_t pointer space
 static int64_t
 get_time_us(time_precision_t prec)
@@ -629,14 +620,14 @@ get_time_us(time_precision_t prec)
 	struct timespec ts[1];
 	int r;
 
-	if (likely(__thr_current_worker != NULL)) {
-		if (unlikely(prec == TASK_TIME_COARSE)) {
-			return w__curtime_us;
-		}
+	if ((prec == TASK_TIME_COARSE) && (w__curtime_us > 0)) {
+		return w__curtime_us;
 	}
 	r = clock_gettime(CLOCK_MONOTONIC, ts);
-	assert(likely(r == 0));
-	return (TASK_S_TO_US(ts->tv_sec) + TASK_NS_TO_US(ts->tv_nsec));
+	if (r == 0) {
+		return (TASK_S_TO_US(ts->tv_sec) + TASK_NS_TO_US(ts->tv_nsec));
+	}
+	return w__curtime_us;
 } // get_time_us
 
 
@@ -658,7 +649,7 @@ static inline void
 worker_timer_attach_list(struct worker *w, struct task_timer *tt)
 {
 	// Now attach it (at the tail)
-	if (likely(w->colt != NULL)) {
+	if (w->colt != NULL) {
 		tt->next = w->colt;
 		tt->prev = w->colt->prev;
 		tt->prev->next = tt;
@@ -676,11 +667,11 @@ static inline void
 worker_timer_detach_list(struct worker *w, struct task_timer *tt)
 {
 	// Need to detach from colt first
-	if (likely(tt->next != tt)) {
+	if (tt->next != tt) {
 		tt->next->prev = tt->prev;
 		tt->prev->next = tt->next;
 		// If it's a head node, advance the head
-		if (unlikely(w->colt == tt)) {
+		if (w->colt == tt) {
 			w->colt = tt->next;
 		}
 	} else {
@@ -725,7 +716,7 @@ worker_timer_update(struct worker *w, struct task_timer *tt)
 		return;
 	}
 
-	if (unlikely((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US)) {
+	if ((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
 		// It should go to the paired heap
 		if (tt->next != NULL) {
 			worker_timer_detach_list(w, tt);
@@ -769,17 +760,17 @@ worker_timer_scan_colt(register struct worker *w) {
 	w->colt = NULL;
 	to_scan = (w->colt_len / 25) + 1;	// Always scan at least 1
 	for (n = 0; n < to_scan; n++) {
-		if (unlikely((tt = colt) == NULL)) {
+		if ((tt = colt) == NULL) {
 			break;
 		}
 
-		if (unlikely(first == NULL)) {
+		if (first == NULL) {
 			first = tt;
-		} else if (unlikely(tt == first)) {
+		} else if (tt == first) {
 			break;
 		}
 
-		if (likely((tt->expiry_us - w__curtime_us) > TASK_MIN_COLT_TIME_US)) {
+		if ((tt->expiry_us - w__curtime_us) > TASK_MIN_COLT_TIME_US) {
 			colt = colt->next;
 			continue;
 		}
@@ -790,7 +781,7 @@ worker_timer_scan_colt(register struct worker *w) {
 		}
 
 		// Remove from the head
-		if (likely(tt != tt->next)) {
+		if (tt != tt->next) {
 			tt->next->prev = tt->prev;
 			tt->prev->next = tt->next;
 			colt = tt->next;
@@ -987,7 +978,7 @@ task_lock(struct task *t, task_action_flag_t action)
 		task_add_locked_action(t, action);
 		tfd_unlock(TFD_TO_INDEX(t->tfd));
 	} else {
-		if (unlikely(t->num_locked_actions > 0)) {
+		if (t->num_locked_actions > 0) {
 			task_pickup_locked_actions(t);
 		}
 		t->active_flags |= action;
@@ -1000,7 +991,7 @@ task_lock(struct task *t, task_action_flag_t action)
 static void
 task_unlock(struct task *t, register task_action_flag_t action)
 {
-	if (unlikely(!lockless_worker(t->worker))) {
+	if (!lockless_worker(t->worker)) {
 		if (action) {
 			register uint32_t tfdi = TFD_TO_INDEX(t->tfd);
 
@@ -1013,13 +1004,13 @@ task_unlock(struct task *t, register task_action_flag_t action)
 		return;
 	}
 
-	if (unlikely(t->num_locked_actions > 0)) {
+	if (t->num_locked_actions > 0) {
 		task_pickup_locked_actions(t);
 	}
 
 	t->active_flags &= ~(action);
 
-	if (likely(t->state != TASK_STATE_DESTROY)) {
+	if (t->state != TASK_STATE_DESTROY) {
 		return;
 	}
 
@@ -1072,71 +1063,51 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 	register struct worker *w;
 
 	// Validate the instance
-	if (unlikely(__thr_current_instance == NULL)) {
-		errno = EOWNERDEAD;
-		return NULL;
-	}
-	if (unlikely(__thr_current_instance->magic != INSTANCE_MAGIC)) {
-		errno = EINVAL;
-		return NULL;
-	}
-	if (unlikely(__thr_current_instance->state > INSTANCE_STATE_RUNNING)) {
+	if (__thr_current_instance->state > INSTANCE_STATE_RUNNING) {
 		errno = EOWNERDEAD;
 		return NULL;
 	}
 
 	// Validate the TFD
-	if (unlikely(tfd < 0)) {
+	if (tfd < 0) {
 		errno = ERANGE;
 		return NULL;
 	}
-	if (unlikely(tfdi >= __thr_current_instance->tfd_pool_size)) {
+	if (tfdi >= __thr_current_instance->tfd_pool_size) {
 		errno = ERANGE;
-		return NULL;
-	}
-
-	// Validate the flags if set
-	if (unlikely(action == FLG_NONE)) {	// Cannot have no flags set
-		errno = EINVAL;
-		return NULL;
-	}
-
-	// Can't lookup more than one flag at once.  The correct procdure is to just
-	// pick one, look that up, and then set any others when the task is returned
-	if (unlikely(__builtin_popcount((uint32_t)action) > 1)) {
-		errno = EINVAL;
 		return NULL;
 	}
 
 	t = __thr_current_instance->tfd_pool + tfdi;
-	if (unlikely((w = t->worker) == NULL)) {
+	w = t->worker;
+	if (w == NULL) {
 		errno = EBADF;
 		return NULL;
 	}
 
-	if (unlikely(!lockless_worker(w))) {
+	if (!lockless_worker(w)) {
 		tfd_lock(tfdi);
-		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+		if (t->state != TASK_STATE_ACTIVE) {
 			tfd_unlock(tfdi);
 			errno = EBADF;
 			return NULL;
 		}
 
-		if (likely(action & (FLG_RD | FLG_WR))) {
+		if (action & (FLG_RD | FLG_WR)) {
 			if (action & (FLG_RD)) {
-				if (unlikely(t->rd_state != TASK_READ_STATE_IDLE)) {
+				if (t->rd_state != TASK_READ_STATE_IDLE) {
 					tfd_unlock(tfdi);
 					errno = EINPROGRESS;
 					return NULL;
 				}
 			} else {
-				if (unlikely(t->wr_state != TASK_WRITE_STATE_IDLE)) {
+				if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 					tfd_unlock(tfdi);
 					errno = EINPROGRESS;
 					return NULL;
 				}
 			}
-		} else if (unlikely(!!(action & t->active_flags))) {
+		} else if (action & t->active_flags) {
 			tfd_unlock(tfdi);
 			errno = EINPROGRESS;
 			return NULL;
@@ -1144,29 +1115,29 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		task_add_locked_action(t, action);
 		tfd_unlock(tfdi);
 	} else {
-		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+		if (t->state != TASK_STATE_ACTIVE) {
 			errno = EBADF;
 			return NULL;
 		}
 
-		if (likely(action & (FLG_RD | FLG_WR))) {
+		if (action & (FLG_RD | FLG_WR)) {
 			if (action & (FLG_RD)) {
-				if (unlikely(t->rd_state != TASK_READ_STATE_IDLE)) {
+				if (t->rd_state != TASK_READ_STATE_IDLE) {
 					errno = EINPROGRESS;
 					return NULL;
 				}
 			} else {
-				if (unlikely(t->wr_state != TASK_WRITE_STATE_IDLE)) {
+				if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 					errno = EINPROGRESS;
 					return NULL;
 				}
 			}
-		} else if (unlikely(!!(action & t->active_flags))) {
+		} else if (action & t->active_flags) {
 			errno = EINPROGRESS;
 			return NULL;
 		}
 
-		if (unlikely(t->num_locked_actions > 0)) {
+		if (t->num_locked_actions > 0) {
 			task_pickup_locked_actions(t);
 		}
 		t->active_flags |= action;
@@ -1203,7 +1174,7 @@ task_get_free_task(void)
 	}
 
 	// Also ensure we're not at our max open tfd limit
-	if (unlikely(i->tfd_pool_used > (uint64_t)(i->tfd_pool_size * 0.8))) {
+	if (i->tfd_pool_used > (uint64_t)(i->tfd_pool_size * 0.8)) {
 		errno = EMFILE;
 		return NULL;
 	}
@@ -1545,15 +1516,15 @@ notifier_write(int fd)
 	uint64_t m = 1;
 	ssize_t r;
 
-	if (unlikely(fd < 0)) {
+	if (fd < 0) {
 		return -1;
 	}
 
 	do {
 		r = write(fd, &m, sizeof (m));
-	} while (unlikely(unlikely(r == -1) && unlikely(errno == EINTR)));
+	} while ((r == -1) && (errno == EINTR));
 
-	if (unlikely(r != sizeof (m))) {
+	if (r != sizeof (m)) {
 		return -1;
 	}
 
@@ -1566,10 +1537,10 @@ notifier_write(int fd)
 static inline int
 worker_notify(struct worker *w)
 {
-	if (unlikely(w == NULL)) {
+	if (w == NULL) {
 		return -1;
 	}
-	if (likely(w__notified)) {
+	if (w__notified) {
 		return 0;
 	}
 
@@ -1623,7 +1594,7 @@ worker_notify_get_free_ntfyq(register struct worker *w)
 	worker_lock(w);
 	tq->next = w->notifyq_batches;
 	w->notifyq_batches = tq;
-	if (likely(lockless_worker(w))) {
+	if (lockless_worker(w)) {
 		// Don't need to hold the lock if we're on the worker
 		worker_unlock(w);
 		freeq_tail->next = w->freeq;
@@ -1645,17 +1616,17 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 	register struct worker *w = t->worker;
 	register struct ntfyq *tq = NULL;
 
-	if (unlikely(w == NULL)) {	// This can be true sometimes during shutdown
+	if (w == NULL) {		// This can be true sometimes during shutdown
 		return false;
 	}
 
 	// No new actions can be queued once a task enters the DESTROY state
 	// We will queue close actions if the t->force_close_q flag is set
-	if (unlikely(t->state == TASK_STATE_DESTROY)) {
+	if (t->state == TASK_STATE_DESTROY) {
 		if ((action != FLG_CL) || (force_close_q == false)) {
 			return false;
 		}
-	} else if (unlikely(action == FLG_CL)) {
+	} else if (action == FLG_CL) {
 		t->state = TASK_STATE_DESTROY;
 		t->rd_shut = true;
 		t->wr_shut = true;
@@ -1665,22 +1636,22 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 
 	// Do not lock IO timeout flags.  Their presence is already implied by their parent
 	// FLG_RD/FLG_WR flags. Also don't lock for connecting events, write flags cover this
-	if (unlikely((action & (FLG_RD | FLG_WR | FLG_RT | FLG_WT | FLG_CN | FLG_TM)) == 0)) {
+	if ((action & (FLG_RD | FLG_WR | FLG_RT | FLG_WT | FLG_CN | FLG_TM)) == 0) {
 		// Only call task_lock() if we actually need to
-		if (unlikely((t->active_flags & action) == 0)) {
+		if ((t->active_flags & action) == 0) {
 			task_lock(t, action);
 		}
 	}
 
-	if (likely(lockless_worker(w))) {
+	if (lockless_worker(w)) {
 		// Try to process the action immediately if it's allowable.  We always queue
 		// closes to give other activities a chance to realise the task is finished
 		if (force_q == false) {
-			if (likely(((action & (FLG_CN | FLG_MG | FLG_CL | FLG_WR | FLG_RD)) == 0))) {
+			if (((action & (FLG_CN | FLG_MG | FLG_CL | FLG_WR | FLG_RD)) == 0)) {
 				worker_process_one_action(w, t, action);
 				return true;
 			}
-			if (unlikely((action & (FLG_RD | FLG_WR)) != 0)) {
+			if (action & (FLG_RD | FLG_WR)) {
 				if (t->io_depth < TASK_MAX_IO_DEPTH) {
 					worker_process_one_action(w, t, action);
 					return true;
@@ -1694,18 +1665,18 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		// be processed by the IO worker before issuing more changes.  There are certain
 		// transitions that can happen in parallel, but there is ALWAYS less than
 		// MAX_NOTIFY_QUEUE_LEN of those
-		assert(likely(t->notifyqlen < MAX_NOTIFY_QUEUE_LEN));
+		assert(t->notifyqlen < MAX_NOTIFY_QUEUE_LEN);
 		t->notifyqlen++;
 
-		if (likely((tq = t->freeq) != NULL)) {
+		if ((tq = t->freeq)) {
 			t->freeq = tq->next;
-		} else if (likely((tq = t->freeq_overflow) != NULL)) {
+		} else if ((tq = t->freeq_overflow)) {
 			t->freeq_overflow = tq->next;
-		} else if (likely((tq = w->freeq) != NULL)) {
+		} else if ((tq = w->freeq)) {
 			w->freeq = tq->next;
 		} else {
 			tq = worker_notify_get_free_ntfyq(w);
-			if (unlikely(tq == NULL)) {
+			if (tq == NULL) {
 				assert(tq != NULL);	// Out of memory
 				return false;
 			}
@@ -1713,7 +1684,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 
 		*tq = (struct ntfyq) { .t = t, .action = action, .next = NULL };
 
-		if (unlikely(w->notifyq_tail == NULL)) {
+		if (w->notifyq_tail == NULL) {
 			w->notifyq_head = tq;
 		} else {
 			w->notifyq_tail->next = tq;
@@ -1730,7 +1701,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 			// calling worker_notify_get_free_ntfyq
 			worker_unlock(w);
 			tq = worker_notify_get_free_ntfyq(w);
-			if (unlikely(tq == NULL)) {
+			if (tq == NULL) {
 				assert(tq != NULL);	// Out of memory
 				return false;
 			}
@@ -1749,7 +1720,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 	}
 
 	// Only call worker_notify() if we actually need to
-	if (unlikely(w__notified == false)) {
+	if (w__notified == false) {
 		worker_notify(w);
 	}
 	return true;
@@ -1766,7 +1737,7 @@ task_calculate_io_timeout(register int64_t us_from_now)
 		}
 		return (get_time_us(TASK_TIME_PRECISE) + us_from_now);
 	}
-	if (unlikely(us_from_now > TASK_TIMEOUT_ONE_YEAR)) {
+	if (us_from_now > TASK_TIMEOUT_ONE_YEAR) {
 		return w__curtime_us + TASK_TIMEOUT_ONE_YEAR;
 	}
 	// Set to the current worker time plus the us_from_now plus half
@@ -1779,14 +1750,14 @@ static inline void
 task_activate_rd_timeout(struct worker *w, struct task *t)
 {
 	t->rd_expires_modified = false;
-	if (unlikely(t->rd_expires_in_us < 0)) {
+	if (t->rd_expires_in_us < 0) {
 		t->rt_cancelled = true;
 		return;
 	}
 	t->rd_tt.expiry_us = task_calculate_io_timeout(t->rd_expires_in_us);
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
 
-	if (unlikely(w__curtime_us > t->rd_tt.expiry_us)) {
+	if (w__curtime_us > t->rd_tt.expiry_us) {
 		// It's already expired.  Handle that now
 		task_do_timeout_cb(t, FLG_RT, t->rd_tt.expiry_us);
 		return;
@@ -1801,14 +1772,14 @@ static inline void
 task_activate_wr_timeout(struct worker *w, struct task *t)
 {
 	t->wr_expires_modified = false;
-	if (unlikely(t->wr_expires_in_us < 0)) {
+	if (t->wr_expires_in_us < 0) {
 		t->wt_cancelled = true;
 		return;
 	}
 	t->wr_tt.expiry_us = task_calculate_io_timeout(t->wr_expires_in_us);
 	t->wr_expires_in_us = TIMER_TIME_DESTROY;
 
-	if (unlikely(w__curtime_us > t->wr_tt.expiry_us)) {
+	if (w__curtime_us > t->wr_tt.expiry_us) {
 		// It's already expired.  Handle that now
 		task_do_timeout_cb(t, FLG_WT, t->wr_tt.expiry_us);
 		return;
@@ -1859,12 +1830,12 @@ task_create_event_flag(struct task *t, uint32_t flags)
 static int
 task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
-	if (likely(t->in_epoll)) {
+	if (t->in_epoll) {
 		register uint32_t events = t->events | flags;
 		struct epoll_event ev = { .data.ptr = t, .events = events };
 		int res;
 
-		if (likely((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0)) {
+		if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
 			t->events = events;
 			t->io_depth = 0;
 		}
@@ -1880,7 +1851,7 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 {
 
 	// If we're not in epoll, we have nothing to do
-	if (likely(t->in_epoll)) {
+	if (t->in_epoll) {
 		register uint32_t events = t->events & ~(flags);
 #ifdef USE_EPOLLONESHOT
 		// If EPOLLONESHOT was set, we can bypass the call to epoll_ctl
@@ -1893,7 +1864,7 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 		{	struct epoll_event ev = {.data.ptr = t, .events = events };
 			register int res;
 
-			if (likely((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0)) {
+			if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
 				t->events = events;
 			}
 			return res;
@@ -1971,7 +1942,7 @@ task_do_close_cb(struct task *t)
 	// If it has an active fd, cancel all the activity on it and close it if we are allowed to
 	if (t->fd >= 0) {
 		// If it's a user registered socket, do not close it, just de-register it from epoll
-		if (unlikely(t->registered_fd)) {
+		if (t->registered_fd) {
 			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 		} else {
 			shutdown(t->fd, SHUT_RDWR);
@@ -2030,7 +2001,7 @@ task_do_readv_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 	t->rd_state = TASK_READ_STATE_IDLE;
 
 	// If we don't have a callback, just terminate the write peacefully
-	if (unlikely(cb == NULL) || unlikely(t->rd_cancel) || unlikely(t->state != TASK_STATE_ACTIVE)) {
+	if ((cb == NULL) || t->rd_cancel || (t->state != TASK_STATE_ACTIVE)) {
 		task_unlock(t, 0);	// Forces a task release check
 		return;
 	}
@@ -2052,7 +2023,7 @@ task_do_read_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 	t->rd_state = TASK_READ_STATE_IDLE;
 
 	// If we don't have a callback, just terminate the read peacefully
-	if (unlikely(cb == NULL) || unlikely(t->rd_cancel) || unlikely(t->state != TASK_STATE_ACTIVE)) {
+	if ((cb == NULL) || t->rd_cancel || (t->state != TASK_STATE_ACTIVE)) {
 		task_unlock(t, 0);	// Forces a task release check
 		return;
 	}
@@ -2071,7 +2042,7 @@ task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno)
 	t->stride->accept_cb = NULL;
 	t->stride->accept_cb_data = NULL;
 
-	if (unlikely(cb == NULL) || unlikely(t->rd_cancel) || unlikely(t->state != TASK_STATE_ACTIVE)) {
+	if ((cb == NULL) || t->rd_cancel || (t->state != TASK_STATE_ACTIVE)) {
 		task_notify_action(t, FLG_CL, false, true);
 		return;
 	}
@@ -2094,7 +2065,7 @@ task_do_writev_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 
 	// If we don't have a callback, just terminate the write peacefully
-	if (unlikely(cb == NULL) || unlikely(t->wr_cancel) || unlikely(t->state != TASK_STATE_ACTIVE)) {
+	if ((cb == NULL) || t->wr_cancel || (t->state != TASK_STATE_ACTIVE)) {
 		task_unlock(t, 0);	// Forces a task release check
 		return;
 	}
@@ -2116,7 +2087,7 @@ task_do_write_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 
 	// If we don't have a callback, just terminate the write peacefully
-	if (unlikely(cb == NULL) || unlikely(t->wr_cancel) || unlikely(t->state != TASK_STATE_ACTIVE)) {
+	if ((cb == NULL) || t->wr_cancel || (t->state != TASK_STATE_ACTIVE)) {
 		task_unlock(t, 0);	// Forces a task release check
 		return;
 	}
@@ -2137,7 +2108,7 @@ task_do_connect_cb(struct task *t, int64_t tfd, int result, int cb_errno)
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 
 	// If there's no callback for the connection, just terminate
-	if (unlikely(cb == NULL) || unlikely(t->wr_cancel) || unlikely(t->state != TASK_STATE_ACTIVE)) {
+	if ((cb == NULL) || t->wr_cancel || (t->state != TASK_STATE_ACTIVE)) {
 		task_unlock(t, 0);	// Forces a task release check
 		return;
 	}
@@ -2171,7 +2142,7 @@ task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us
 handle_timer_timeout:
 	t->tm_cancelled = true;
 
-	if (likely(t->tm_cb != NULL)) {
+	if (t->tm_cb != NULL) {
 		void (*cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data) = t->tm_cb;
 		void *cb_data = t->tm_cb_data;
 		int64_t lateness_us = get_time_us(TASK_TIME_PRECISE) - timeout_us;
@@ -2605,7 +2576,7 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 	register int wrv_iovcnt = t->wrv_iovcnt;
 	int64_t tfd = t->tfd;
 
-	if (unlikely(t->wr_shut)) {
+	if (t->wr_shut) {
 		if (queued) {
 			task_do_writev_cb(t, tfd, -1, EPIPE);	// Unlocks task
 			return 0;
@@ -2654,7 +2625,7 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
 				t->wrv_bufpos = wrv_bufpos;	// Need to record bufpos for later
-				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
+				if (task_raise_event_flag(t, EPOLLOUT) == 0) {
 					if (wr_expires_modified) {
 						task_notify_action(t, FLG_WT, false, false);
 					}
@@ -2709,7 +2680,7 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 	register const char *wr_buf = t->wr_buf;
 	int64_t tfd = t->tfd;
 
-	if (unlikely(t->wr_shut)) {
+	if (t->wr_shut) {
 		if (queued) {
 			task_do_write_cb(t, tfd, -1, EPIPE);	// Unlocks task
 			return 0;
@@ -2738,10 +2709,10 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 
 		written = write(t->fd, wr_buf + wr_bufpos, to_write);
 		if (written < 0) {
-			if (likely(errno == EAGAIN)) {
+			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
 				t->wr_bufpos = wr_bufpos;	// Need to record current position for next time
-				if (likely(task_raise_event_flag(t, EPOLLOUT) == 0)) {
+				if (task_raise_event_flag(t, EPOLLOUT) == 0) {
 					if (wr_expires_modified) {
 						task_notify_action(t, FLG_WT, false, false);
 					}
@@ -2797,7 +2768,7 @@ task_handle_connect_event(struct task *t)
 
 	assert(t->type == TASK_TYPE_CONNECT);
 
-	if (unlikely(t->wr_shut)) {
+	if (t->wr_shut) {
 		task_do_connect_cb(t, t->tfd, -1, EPIPE);
 		return;
 	}
@@ -2864,7 +2835,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 	register int rdv_iovcnt = t->rdv_iovcnt;
 	int64_t tfd = t->tfd;
 
-	if (unlikely(t->rd_shut)) {
+	if (t->rd_shut) {
 		if (queued) {
 			task_do_readv_cb(t, tfd, -1, EPIPE);	// Unlocks task
 			return 0;
@@ -2990,7 +2961,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 	register char *rd_buf = t->rd_buf;
 	int64_t tfd = t->tfd;
 
-	if (unlikely(t->rd_shut)) {
+	if (t->rd_shut) {
 		if (queued) {
 			task_do_read_cb(t, tfd, -1, EPIPE);		// Unlocks task
 			return 0;
@@ -3022,7 +2993,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 		reddin = read(t->fd, rd_buf + rd_bufpos, to_read);
 		if (reddin < 0) {
 			// We read until we're blocked.
-			if (likely(errno == EAGAIN)) {
+			if (errno == EAGAIN) {
 				// Make a callback now if we got anything at all
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (rd_bufpos > 0) {
@@ -3057,7 +3028,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 		}
 
 		// End of file response check
-		if (unlikely(reddin == 0)) {
+		if (reddin == 0) {
 			task_lower_event_flag(t, EPOLLIN);	// Ensure poll event flag is lowered
 			t->rd_shut = true;
 
@@ -3270,12 +3241,12 @@ task_handle_listen_event_fail:
 static void
 task_handle_wr_event(struct task *t)
 {
-	if (unlikely(t->wr_cancel)) {
+	if (t->wr_cancel) {
 		return;
 	}
 
 	// Write stuff out as needed
-	if (likely(t->wr_state == TASK_WRITE_STATE_BUFFER)) {
+	if (t->wr_state == TASK_WRITE_STATE_BUFFER) {
 		task_write_buffer(t, t->wr_expires_modified, true);	// Unlocks the task for us
 	} else if (t->wr_state == TASK_WRITE_STATE_VECTOR) {
 		task_write_vector(t, t->wr_expires_modified, true);	// Unlocks the task for us
@@ -3290,12 +3261,12 @@ task_handle_wr_event(struct task *t)
 static void
 task_handle_rd_event(struct task *t)
 {
-	if (unlikely(t->rd_cancel)) {
+	if (t->rd_cancel) {
 		return;
 	}
 
 	// Read in whatever as directed
-	if (likely(t->rd_state == TASK_READ_STATE_BUFFER)) {
+	if (t->rd_state == TASK_READ_STATE_BUFFER) {
 		task_read_buffer(t, t->rd_expires_modified, true);	// Unlocks the task for us
 	} else if (t->rd_state == TASK_READ_STATE_VECTOR) {
 		task_read_vector(t, t->rd_expires_modified, true);	// Unlocks the task for us
@@ -3315,7 +3286,7 @@ worker_check_timeouts(struct worker *w)
 	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 
 	// Pickup new timer heap entries from the timer cool-off lists as needed
-	if (unlikely(w__curtime_us > w->colt_next_us)) {
+	if (w__curtime_us > w->colt_next_us) {
 		worker_timer_scan_colt(w);
 	}
 
@@ -3329,7 +3300,7 @@ worker_check_timeouts(struct worker *w)
 			break;
 		}
 
-		if (likely(expiry_us > w__curtime_us)) {
+		if (expiry_us > w__curtime_us) {
 			register int64_t num_events;
 
 			// XXX - These 250/5 values are total fudge values, but "work"
@@ -3352,11 +3323,11 @@ worker_check_timeouts(struct worker *w)
 		register struct task_timer *tt = (struct task_timer *)data;
 		register struct task *t = worker_get_task_from_tt(tt);
 
-		if (unlikely(t->num_locked_actions > 0)) {
+		if (t->num_locked_actions > 0) {
 			task_pickup_locked_actions(t);
 		}
 
-		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+		if (t->state != TASK_STATE_ACTIVE) {
 			continue;
 		}
 
@@ -3568,7 +3539,7 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 {
 	// If this worker does not match the task's worker, then that's probably because
 	// the task recently migrated.  Send the notification to the correct worker
-	if(unlikely(t->worker != w)) {
+	if(t->worker != w) {
 		// Forward the action directly to the correct worker.  Pass the
 		// force_close_q flag to allow FLG_CL actions through even when
 		// the task is in DESTROY state
@@ -3585,13 +3556,13 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 		return;
 	}
 
-	if (unlikely(t->num_locked_actions > 0)) {
+	if (t->num_locked_actions > 0) {
 		task_pickup_locked_actions(t);
 	}
 
 	// Check if the action got cancelled.  If so, just ignore it
 	// Allow close, connecting and io timeouts through though
-	if (unlikely((action & (FLG_CL | FLG_RD | FLG_WR | FLG_CN | FLG_WT | FLG_RT | FLG_TM)) == 0)) {
+	if ((action & (FLG_CL | FLG_RD | FLG_WR | FLG_CN | FLG_WT | FLG_RT | FLG_TM)) == 0) {
 		if ((t->active_flags & action) == 0) {
 			return;
 		}
@@ -3600,20 +3571,20 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	// It's a change action from here on.  Process the action we got
 
 	// IO actions are usually the most common. Test for them first
-	if (likely(!!(action & (FLG_RD | FLG_WR)))) {
+	if (action & (FLG_RD | FLG_WR)) {
 		if (action == FLG_WR) {
-			if (likely(t->wr_state != TASK_WRITE_STATE_IDLE)) {
+			if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 				task_handle_wr_event(t);	// Releases the task lock
 			}
 		} else {
-			if (likely(t->rd_state != TASK_READ_STATE_IDLE)) {
+			if (t->rd_state != TASK_READ_STATE_IDLE) {
 				task_handle_rd_event(t);	// Releases the task lock
 			}
 		}
 		return;
 	}
 
-	if (likely(!!(action & (FLG_RT | FLG_WT)))) {
+	if (action & (FLG_RT | FLG_WT)) {
 		if (action == FLG_WT) {
 			task_activate_wr_timeout(w, t);
 		} else {
@@ -3721,16 +3692,16 @@ worker_process_notifyq(register struct worker *w)
 
 		w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 
-		while (likely((tq = notifyq) != NULL)) {
+		while ((tq = notifyq)) {
 			register struct task *t = tq->t;
 			register task_action_flag_t action = tq->action;
 
 			notifyq = tq->next;
-			if (unlikely(locked)) {
+			if (locked) {
 				ck_pr_dec_64(&t->notifyqlen_locked);
 			} else {
 				// Determine if it's one of the task's private freeq entries
-				if (likely((tq == &t->free1) || (tq == &t->free2))) {
+				if ((tq == &t->free1) || (tq == &t->free2)) {
 					tq->next = t->freeq;
 					t->freeq = tq;
 				} else {
@@ -3741,7 +3712,7 @@ worker_process_notifyq(register struct worker *w)
 			}
 
 			// If Task is not in the Active State, unlock and go
-			if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+			if (t->state != TASK_STATE_ACTIVE) {
 				if (action != FLG_CL) {
 					task_unlock(t, action);
 					continue;
@@ -3753,7 +3724,7 @@ worker_process_notifyq(register struct worker *w)
 
 		// Concat any remainder back to the actual lists. Put the
 		// just processed entries at the front of the freeq
-		if (unlikely(locked)) {
+		if (locked) {
 			worker_lock(w);
 			while ((tq = lockedq) != NULL) {
 				lockedq = tq->next;
@@ -3804,7 +3775,7 @@ get_next_epoll_timeout_ms(struct worker *w)
 	if (w->notifyq_head != NULL) {
 		return 0;
 	}
-	if (unlikely(w->notifyq_locked_head != NULL)) {
+	if (w->notifyq_locked_head != NULL) {
 		return 0;
 	}
 
@@ -3814,7 +3785,7 @@ get_next_epoll_timeout_ms(struct worker *w)
 	// the worker state "warm" in the CPU caches
 	timer_node = (void *)pheap_get_min_node(w->timer_queue, (void **)&expiry_us, NULL);
 
-	if(likely(timer_node != NULL)) {
+	if(timer_node) {
 		// The 333 and 667 below respectively represent 1/3 and
 		// 2/3 of a millisecond, expressed in microseconds
 		time_to_wait_us = expiry_us - w__curtime_us;
@@ -3849,7 +3820,7 @@ worker_do_io_epoll(register struct worker *w)
 	while (true) {
 		wait_time = get_next_epoll_timeout_ms(w);
 		nfds = epoll_wait(w->gepfd, w->events, w->num_events, wait_time);
-		if (unlikely(nfds < 0)) {
+		if (nfds < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
@@ -3879,27 +3850,27 @@ worker_do_io_epoll(register struct worker *w)
 		register uint32_t revents = w->events[n].events;
 
 		// Handle non-IO items first
-		if (unlikely(t == NULL)) {
+		if (t == NULL) {
 			worker_handle_event(w, revents);
 			continue;
 		}
 
 		// If Task is not in Active State, unlock and go
-		if (unlikely(t->state != TASK_STATE_ACTIVE)) {
+		if (t->state != TASK_STATE_ACTIVE) {
 			continue;
 		}
 
-		if (unlikely(t->num_locked_actions > 0)) {
+		if (t->num_locked_actions > 0) {
 			task_pickup_locked_actions(t);
 		}
 
 		// Check if task still in epoll
-		if (unlikely(t->in_epoll == false)) {
+		if (t->in_epoll == false) {
 			continue;
 		}
 
 		// Handle ERROR/HUP events first
-		if (unlikely(!!(revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)))) {
+		if (revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
 			// Shutdown both connection sides and force an IO event
 			// which should make a system call to detect what happened
 			if (revents & (EPOLLERR | EPOLLHUP)) {
@@ -4827,25 +4798,25 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 
 	if (t == NULL) return -1;	// errno already set
 
-	if (unlikely(t->wr_shut)) {
+	if (t->wr_shut) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
 		return -1;
 	}
 
-	if (unlikely(t->wr_cancel)) {
+	if (t->wr_cancel) {
 		task_unlock(t, FLG_WR);
 		errno = EOWNERDEAD;
 		return -1;
 	}
 
-	if (unlikely(t->fd < 0)) {
+	if (t->fd < 0) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
 		return -1;
 	}
 
-	if (unlikely(t->wr_state != TASK_WRITE_STATE_IDLE)) {
+	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 		task_unlock(t, FLG_WR);
 		errno = EBUSY;
 		return -1;
@@ -4894,7 +4865,7 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	}
 
 	// Queue the writev
-	if (unlikely(task_notify_action(t, FLG_WR, false, true) == false)) {
+	if (task_notify_action(t, FLG_WR, false, true) == false) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
 		return -1;
@@ -4912,27 +4883,27 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 {
 	register struct task *t = task_lookup(tfd, FLG_WR);
 
-	if (unlikely(t == NULL)) return -1;	// errno already set
+	if (t == NULL) return -1;	// errno already set
 
-	if (unlikely(t->wr_shut)) {
+	if (t->wr_shut) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
 		return -1;
 	}
 
-	if (unlikely(t->wr_cancel)) {
+	if (t->wr_cancel) {
 		task_unlock(t, FLG_WR);
 		errno = EOWNERDEAD;
 		return -1;
 	}
 
-	if (unlikely(t->fd < 0)) {
+	if (t->fd < 0) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
 		return -1;
 	}
 
-	if (unlikely(t->wr_state != TASK_WRITE_STATE_IDLE)) {
+	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 		task_unlock(t, FLG_WR);
 		errno = EBUSY;
 		return -1;
@@ -4964,7 +4935,7 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	}
 
 	// Queue the write
-	if (unlikely(task_notify_action(t, FLG_WR, false, true) == false)) {
+	if (task_notify_action(t, FLG_WR, false, true) == false) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
 		return -1;
@@ -4985,25 +4956,25 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 
 	if (t == NULL) return -1;	// errno already set
 
-	if (unlikely(t->rd_shut)) {
+	if (t->rd_shut) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
 		return -1;
 	}
 
-	if (unlikely(t->rd_cancel)) {
+	if (t->rd_cancel) {
 		task_unlock(t, FLG_RD);
 		errno = EOWNERDEAD;
 		return -1;
 	}
 
-	if (unlikely(t->fd < 0)) {
+	if (t->fd < 0) {
 		task_unlock(t, FLG_RD);
 		errno = EBADF;
 		return -1;
 	}
 
-	if (unlikely(t->rd_state != TASK_READ_STATE_IDLE)) {
+	if (t->rd_state != TASK_READ_STATE_IDLE) {
 		task_unlock(t, FLG_RD);
 		errno = EBUSY;
 		return -1;
@@ -5052,7 +5023,7 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	}
 
 	// Queue the read
-	if (unlikely(task_notify_action(t, FLG_RD, false, true) == false)) {
+	if (task_notify_action(t, FLG_RD, false, true) == false) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
 		return -1;
@@ -5069,27 +5040,27 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 {
 	register struct task *t = task_lookup(tfd, FLG_RD);
 
-	if (unlikely(t == NULL)) return -1;	// errno already set
+	if (t == NULL) return -1;	// errno already set
 
-	if (unlikely(t->rd_shut)) {
+	if (t->rd_shut) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
 		return -1;
 	}
 
-	if (unlikely(t->rd_cancel)) {
+	if (t->rd_cancel) {
 		task_unlock(t, FLG_RD);
 		errno = EOWNERDEAD;
 		return -1;
 	}
 
-	if (unlikely(t->fd < 0)) {
+	if (t->fd < 0) {
 		task_unlock(t, FLG_RD);
 		errno = EBADF;
 		return -1;
 	}
 
-	if (unlikely(t->rd_state != TASK_READ_STATE_IDLE)) {
+	if (t->rd_state != TASK_READ_STATE_IDLE) {
 		task_unlock(t, FLG_RD);
 		errno = EBUSY;
 		return -1;
@@ -5121,7 +5092,7 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	}
 
 	// Queue the read
-	if (unlikely(task_notify_action(t, FLG_RD, false, true) == false)) {
+	if (task_notify_action(t, FLG_RD, false, true) == false) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
 		return -1;
@@ -5321,7 +5292,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 
 	if ((t = task_lookup(tfd, FLG_CO)) == NULL) return -1;		// errno already set
 
-	if (unlikely(t->fd < 0)) {
+	if (t->fd < 0) {
 		task_unlock(t, FLG_CO);
 		errno = EBADF;
 		return -1;

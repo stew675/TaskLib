@@ -1156,6 +1156,14 @@ task_nuke(uint32_t tfdi)
 	register struct task *t = __thr_current_instance->tfd_pool + tfdi;
 
 	task_destroy_timeouts(t);
+	if ((t->fd >= 0) && (t->registered_fd == false)) {
+		int flags[1] = {0};
+
+		ioctl(t->fd, FIONBIO, flags);
+		shutdown(t->fd, SHUT_RDWR);
+		close(t->fd);
+		t->fd = -1;
+	}
 	task_init(t);
 	ck_pr_dec_64(&__thr_current_instance->tfd_pool_used);
 } // task_nuke
@@ -4350,12 +4358,22 @@ instance_shutdown_tasks(struct instance *i, int force)
 		num_open = 0;
 		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
 			struct task *t = i->tfd_pool + n;
-			if (force) {
+			if ((t->state == TASK_STATE_ACTIVE) && force) {
 				task_nuke(n);
 				num_open++;
 				continue;
 			}
 			if (t->state == TASK_STATE_ACTIVE) {
+				if ((t->fd >= 0) && (t->registered_fd == false)) {
+					int flags[1] = {0};
+
+					// Set socket back to blocking, which allows shutdown
+					// and close calls to return only when cleanly shutdown
+					ioctl(t->fd, FIONBIO, flags);
+					shutdown(t->fd, SHUT_RDWR);
+					close(t->fd);
+					t->fd = -1;
+				}
 				task_destroy_timeouts(t);
 				t->state = TASK_STATE_DESTROY;
 				worker_notify(t->worker);
@@ -4414,13 +4432,15 @@ instance_destroy(struct instance *i)
 	}
 	if (i->tfd_pool) {
 		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
-#ifndef USE_TICKET_LOCKS
-			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
-#endif
 		}
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
 	}
+#if 0
+#ifndef USE_TICKET_LOCKS
+			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
+#endif
+#endif
 	if (i->tfd_stride) {
 		free((void *)i->tfd_stride);
 		i->tfd_stride = NULL;
@@ -5720,9 +5740,8 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 	i->state = INSTANCE_STATE_SHUTTING_DOWN;
 	i->shutdown_cb = shutdown_cb;
 	i->shutdown_data = shutdown_data;
-	instance_shutdown_workers(i);
-	usleep(500000);			// Sleep for half a second to give workers a chance to clean up
 	instance_shutdown_tasks(i, 0);
+	instance_shutdown_workers(i);
 	instance_notify(i);
 	return 0;
 } // TASK_instance_shutdown

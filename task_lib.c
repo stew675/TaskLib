@@ -4371,8 +4371,12 @@ instance_shutdown_tasks(struct instance *i, int force)
 					// and close calls to return only when cleanly shutdown
 					ioctl(t->fd, FIONBIO, flags);
 					shutdown(t->fd, SHUT_RDWR);
-					close(t->fd);
-					t->fd = -1;
+
+					// Don't close listener sockets on the first pass
+					if (t->type != TASK_TYPE_LISTEN) {
+						close(t->fd);
+						t->fd = -1;
+					}
 				}
 				task_destroy_timeouts(t);
 				t->state = TASK_STATE_DESTROY;
@@ -4380,9 +4384,7 @@ instance_shutdown_tasks(struct instance *i, int force)
 				num_open++;
 			}
 		}
-		if (force) {
-			usleep(1000);
-		}
+		usleep(100000);
 	} while (force && (num_open > 0));
 } // instance_shutdown_tasks
 
@@ -4431,22 +4433,20 @@ instance_destroy(struct instance *i)
 		i->io_workers = NULL;
 	}
 	if (i->tfd_pool) {
-		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
-		}
 		free((void *)i->tfd_pool);
 		i->tfd_pool = NULL;
 	}
-#if 0
-#ifndef USE_TICKET_LOCKS
-			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
-#endif
-#endif
 	if (i->tfd_stride) {
 		free((void *)i->tfd_stride);
 		i->tfd_stride = NULL;
 	}
+#ifndef USE_TICKET_LOCKS
+	for (uint32_t n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
+		pthread_mutex_destroy(&(i->tfd_locks[n].lock));
+	}
+#endif
 	if (i->tfd_locks_real) {
-		// Hack to get around compiler warning stubborness over not passing volatile
+		// Hack to get around compiler warning stubborness over passing volatile
 		// pointers to free().  Hey, don't judge me!  It gets the job done!
 		union { volatile void *a; void *b;} whatevs;
 		whatevs.a = i->tfd_locks_real;

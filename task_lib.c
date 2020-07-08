@@ -152,21 +152,21 @@ typedef enum {
 	FLG_WR	=	0x00000002,		// A write for a TFD is active
 	FLG_RT	=	0x00000004,		// A Read Timeout Update is active
 	FLG_WT	=	0x00000008,		// A Write Timeout Update is active
-	FLG_LU	=	0x00000020,		// Lookup Lock
-	FLG_CO	=	0x00000040,		// A Connect Task is active
-	FLG_LI	=	0x00000080,		// A Listen Task is active
-	FLG_TM	=	0x00000100,		// A Timer Task is active
-	FLG_MG	=	0x00000200,		// A Migration Event is active
-	FLG_CL	=	0x00000400,		// A Close Event is active
-	FLG_BND	=	0x00000800,		// A Bind operation is in progress
-	FLG_CN	= 	0x00001000,		// Task is connecting
-	FLG_CCB =	0x00002000,		// A Close CallBack API is in progress
-	FLG_TC	=	0x00004000,		// A Timer Cancel API is in progress
-	FLG_TD	=	0x00008000,		// A Timer Destroy API is in progress
-	FLG_TS	=	0x00010000,		// A Timer Set API is in progress
-	FLG_GFD	=	0x00020000,		// A Get FD operation is already in progress
-	FLG_SD	=	0x00040000,		// A Shutdown operation is in progress
-	FLG_DBG	=	0x00080000,		// Task Debug API in progress
+	FLG_LU	=	0x00000010,		// Lookup Lock
+	FLG_CO	=	0x00000020,		// A Connect Task is active
+	FLG_LI	=	0x00000040,		// A Listen Task is active
+	FLG_TM	=	0x00000080,		// A Timer Task is active
+	FLG_MG	=	0x00000100,		// A Migration Event is active
+	FLG_CL	=	0x00000200,		// A Close Event is active
+	FLG_BND	=	0x00000400,		// A Bind operation is in progress
+	FLG_CN	= 	0x00000800,		// Task is connecting
+	FLG_CCB =	0x00001000,		// A Close CallBack API is in progress
+	FLG_TC	=	0x00002000,		// A Timer Cancel API is in progress
+	FLG_TD	=	0x00004000,		// A Timer Destroy API is in progress
+	FLG_TS	=	0x00008000,		// A Timer Set API is in progress
+	FLG_GFD	=	0x00010000,		// A Get FD operation is already in progress
+	FLG_SD	=	0x00020000,		// A Shutdown operation is in progress
+	FLG_DBG	=	0x00040000,		// Task Debug API in progress
 	FLG_DRP = 	0x80000000,		// If this a drop of another action
 } task_action_flag_t;
 
@@ -888,7 +888,6 @@ task_init(struct task *t)
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
 	t->rd_state = TASK_READ_STATE_IDLE;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
-	t->tfd = TFD_NONE;
 
 	// Calculate and assign the new tfd
 	t->tfd = (iteration << 32) | (TFD_TO_INDEX(tfdi));
@@ -1345,7 +1344,7 @@ set_one_workers_affinity(int cpu)
 {
 	struct instance *i = __thr_current_instance;
 	struct worker *w = NULL;
-	int row, tcpu;
+	int row = 0, tcpu = 0;
 	bool outgoing;
 
 	// Not ideal that we're holding a mutex for this amount of time
@@ -1452,7 +1451,9 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 		// At least set the incoming affinity for the TCP connection
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
 		if (__thr_current_instance->flags & TASK_FLAGS_AFFINITY_NET) {
-			setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu));
+			if (setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu)) < 0) {
+				return;
+			}
 		}
 		return;
 	}
@@ -1468,7 +1469,9 @@ task_set_initial_preferred_worker(struct task *t, bool is_client)
 		// At least set the incoming affinity for the TCP connection
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
 		if (__thr_current_instance->flags & TASK_FLAGS_AFFINITY_NET) {
-			setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &w->affined_cpu, sizeof(w->affined_cpu));
+			if (setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &w->affined_cpu, sizeof(w->affined_cpu)) < 0) {
+				return;
+			}
 		}
 		return;
 	}
@@ -1887,22 +1890,6 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 // ---------------------------------------------------------------------------------------------//
 
 static inline void
-task_cancel_timer(struct task *t, task_action_flag_t action)
-{
-	if (action & FLG_RT) {
-		t->rt_cancelled = true;
-	} else if (action & FLG_WT) {
-		t->wt_cancelled = true;
-	} else if (action & FLG_TM) {
-		t->tm_cancelled = true;
-	} else {
-		// Bad timer type
-		assert(0);
-	}
-} // task_cancel_timer
-
-
-static inline void
 task_cancel_write(struct task *t)
 {
 	t->wr_shut = true;
@@ -1946,6 +1933,9 @@ task_do_close_cb(struct task *t)
 			worker_unlock(w);
 		}
 	}
+
+	// Cancel any existing timeout timer
+	t->tm_cancelled = true;
 
 	// If it has an active fd, cancel all the activity on it and close it if we are allowed to
 	if (t->fd >= 0) {
@@ -2010,7 +2000,7 @@ task_do_readv_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 
 	// If we don't have a callback, just terminate the write peacefully
 	if ((cb == NULL) || t->rd_cancel || (t->state != TASK_STATE_ACTIVE)) {
-		task_unlock(t, 0);	// Forces a task release check
+		task_unlock(t, FLG_NONE);	// Forces a task release check
 		return;
 	}
 
@@ -2032,7 +2022,7 @@ task_do_read_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 
 	// If we don't have a callback, just terminate the read peacefully
 	if ((cb == NULL) || t->rd_cancel || (t->state != TASK_STATE_ACTIVE)) {
-		task_unlock(t, 0);	// Forces a task release check
+		task_unlock(t, FLG_NONE);	// Forces a task release check
 		return;
 	}
 
@@ -2074,7 +2064,7 @@ task_do_writev_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 
 	// If we don't have a callback, just terminate the write peacefully
 	if ((cb == NULL) || t->wr_cancel || (t->state != TASK_STATE_ACTIVE)) {
-		task_unlock(t, 0);	// Forces a task release check
+		task_unlock(t, FLG_NONE);	// Forces a task release check
 		return;
 	}
 
@@ -2096,7 +2086,7 @@ task_do_write_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
 
 	// If we don't have a callback, just terminate the write peacefully
 	if ((cb == NULL) || t->wr_cancel || (t->state != TASK_STATE_ACTIVE)) {
-		task_unlock(t, 0);	// Forces a task release check
+		task_unlock(t, FLG_NONE);	// Forces a task release check
 		return;
 	}
 
@@ -2117,7 +2107,7 @@ task_do_connect_cb(struct task *t, int64_t tfd, int result, int cb_errno)
 
 	// If there's no callback for the connection, just terminate
 	if ((cb == NULL) || t->wr_cancel || (t->state != TASK_STATE_ACTIVE)) {
-		task_unlock(t, 0);	// Forces a task release check
+		task_unlock(t, FLG_NONE);	// Forces a task release check
 		return;
 	}
 
@@ -2161,7 +2151,7 @@ handle_timer_timeout:
 		return;
 	}
 	// Why is there a timer timeout without a callback?
-	task_unlock(t, 0);	// Forces a task release check
+	task_unlock(t, FLG_NONE);	// Forces a task release check
 	return;
 
 handle_read_timeout:
@@ -2273,11 +2263,10 @@ worker_cleanup(struct worker *w)
 static void
 worker_destroy(struct worker *w)
 {
-	struct instance *i = w->instance;
+	struct instance *i;
 
-	if (w == NULL) {
-		return;
-	}
+	if (w == NULL) return;
+	i = w->instance;
 
 	// Remove from instance's list of IO workers
 	if (w->type == WORKER_TYPE_IO) {
@@ -3086,16 +3075,6 @@ sock_set_nonblocking(int sock)
 
 
 static int
-sock_set_nodelay(int sock)
-{
-	int flags[1] = {1};
-
-	return ioctl(sock, FIONBIO, flags);
-	return setsockopt(sock, SOL_SOCKET, TCP_NODELAY, flags, sizeof(*flags));
-} // sock_set_nonblocking
-
-
-static int
 sock_set_sndbuf(int sock)
 {
 	int sndbuf_size = __thr_current_instance->per_task_sndbuf;
@@ -3198,11 +3177,20 @@ task_handle_listen_event(struct task *t)
 		}
 
 		// We've got a new connection!
-		sock_set_nonblocking(cfd);
-		sock_set_nodelay(cfd);
-		sock_set_sndbuf(cfd);
-		sock_set_rcvbuf(cfd);
-		sock_set_linger(cfd, 0);
+		if (sock_set_nonblocking(cfd) < 0) {
+			close(cfd);
+			t->stride->accept_cb(-1, t->stride->accept_cb_data);
+			continue;
+		}
+		if (sock_set_sndbuf(cfd) < 0) {
+			perror("sock_set_sndbuf");
+		}
+		if (sock_set_rcvbuf(cfd) < 0) {
+			perror("sock_set_rcvbuf");
+		}
+		if (sock_set_linger(cfd, 0) < 0) {
+			perror("sock_set_linger");
+		}
 
 		// Inherit the close callback from the accept task until the user sets their
 		// own.  The caller can distingish between the two by inspecting the tfd that
@@ -3533,7 +3521,10 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	if (tw->affined_cpu >= 0) {
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
 		if (__thr_current_instance->flags & TASK_FLAGS_AFFINITY_NET) {
-			setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu));
+			if (setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu)) < 0) {
+				task_notify_action(t, FLG_MG, false, true);
+				return;
+			}
 		}
 	}
 
@@ -3797,16 +3788,13 @@ get_next_epoll_timeout_ms(struct worker *w)
 		// The 333 and 667 below respectively represent 1/3 and
 		// 2/3 of a millisecond, expressed in microseconds
 		time_to_wait_us = expiry_us - w__curtime_us;
-		if (time_to_wait_us <= 0) {
+		if (time_to_wait_us <= 333) {
 			time_to_wait_ms = 0;
 		} else if (TASK_US_TO_MS(time_to_wait_us - 667) > TASK_MAX_EPOLL_WAIT_MS) {
 			time_to_wait_ms = TASK_MAX_EPOLL_WAIT_MS;
 		} else {
 			time_to_wait_ms = (int)TASK_US_TO_MS(time_to_wait_us - 333);
-			if (time_to_wait_ms < 0) {
-				time_to_wait_ms = 0;
-			}
-			if ((time_to_wait_ms == 0) && (time_to_wait_us > 667)) {
+			if ((time_to_wait_ms == 0) && (time_to_wait_us >= 667)) {
 				time_to_wait_ms = 1;
 			}
 		}
@@ -3820,7 +3808,6 @@ static void
 worker_do_io_epoll(register struct worker *w)
 {
 	register int wait_time = 0, nfds;
-	register bool do_direct = true;
 
 	// Determine the initial time we want to be waiting in epoll for
 	// Wait for something to happen!
@@ -3918,28 +3905,15 @@ worker_do_io_epoll_fail:
 			if (revents & EPOLLOUT) {
 				// Write is active too, just queue that
 				task_lower_event_flag(t, EPOLLIN | EPOLLOUT);
-				if (do_direct) {
-					task_handle_wr_event(t);	// Unlocks the task
-				} else {
-					task_notify_action(t, FLG_WR, false, true);
-				}
+				task_handle_wr_event(t);	// Unlocks the task
 			} else {
 				task_lower_event_flag(t, EPOLLIN);
 			}
-			// Handle accepts directly, no queueing
-			if (do_direct || (t->type == TASK_TYPE_LISTEN)) {
-				task_handle_rd_event(t);		// Unlocks the task
-			} else {
-				task_notify_action(t, FLG_RD, false, true);
-			}
+			task_handle_rd_event(t);		// Unlocks the task
 			continue;
 		} else if (revents & EPOLLOUT) {
 			task_lower_event_flag(t, EPOLLOUT);
-			if (do_direct) {
-				task_handle_wr_event(t);		// Unlocks the task
-			} else {
-				task_notify_action(t, FLG_WR, false, true);
-			}
+			task_handle_wr_event(t);		// Unlocks the task
 			continue;
 		}
 
@@ -4325,7 +4299,7 @@ static void
 instance_reap_workers(struct instance *i)
 {
 	struct worker_list workers_to_destroy;
-	struct worker *w;
+	struct worker *w, *wn;
 
 	TAILQ_INIT(&workers_to_destroy);
 
@@ -4338,9 +4312,11 @@ instance_reap_workers(struct instance *i)
 
 	// Move workers that are still alive back to the worker list
 	// Destroy anything that's dead
-	while ((w = TAILQ_FIRST(&workers_to_destroy))) {
-		TAILQ_REMOVE(&workers_to_destroy, w, list);
+	w = TAILQ_FIRST(&workers_to_destroy);
+	while (w != NULL) {
+		wn = TAILQ_NEXT(w, list);
 		worker_destroy(w);
+		w = wn;
 	}
 } // instance_reap_workers
 
@@ -4473,14 +4449,12 @@ instance_destroy(struct instance *i)
 	memset(i, 0, sizeof(struct instance));
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
-	pthread_mutex_lock(&creation_lock);
 	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
 		if (instances[ti] == i) {
 			instances[ti] = NULL;
 			break;
 		}
 	}
-	pthread_mutex_unlock(&creation_lock);
 	free(i);
 } // instance_destroy
 
@@ -4580,14 +4554,13 @@ static struct instance *
 instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks)
 {
 	uint32_t ti;
-	struct instance *i, *oldi;
+	struct instance *i = NULL, *oldi = NULL;
 	pthread_mutexattr_t attr;
 
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
 
 	oldi = __thr_current_instance;
-	pthread_mutex_lock(&creation_lock);
 
 	// Find an unused instance
 	for (ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
@@ -4662,12 +4635,10 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	}
 
 	instances[ti] = i;
-	pthread_mutex_unlock(&creation_lock);
 
 	return i;
 
 instance_creation_fail:
-	pthread_mutex_unlock(&creation_lock);
 	__thr_current_instance = oldi;
 	instance_destroy(i);
 	return NULL;
@@ -5228,10 +5199,11 @@ int
 TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t tfd, void *accept_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_LI);
-	register struct worker *w = t->worker;
+	register struct worker *w;
 	register struct instance *i;
 
 	if (t == NULL) return -1;	// errno already set
+	w = t->worker;
 
 	// Convert this task to a parent listener type and inform task to expect incoming events
 	t->type = TASK_TYPE_LISTEN;
@@ -5407,10 +5379,15 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 		return -1;
 	}
 
-	sock_set_nonblocking(sock);
-	sock_set_nodelay(sock);
-	sock_set_sndbuf(sock);
-	sock_set_rcvbuf(sock);
+	if (sock_set_nonblocking(sock) < 0) {
+		return -1;
+	}
+	if (sock_set_sndbuf(sock) < 0) {
+		perror("sock_set_sndbuf");
+	}
+	if (sock_set_rcvbuf(sock) < 0) {
+		perror("sock_set_rcvbuf");
+	}
 
 	// task_create() will return the task as already locked
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, false)) == NULL) {
@@ -5467,12 +5444,19 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 		return -1;
 	}
 
-	sock_set_nonblocking(sock);
-	sock_set_nodelay(sock);
-	sock_set_sndbuf(sock);
-	sock_set_rcvbuf(sock);
+	if (sock_set_nonblocking(sock) < 0) {
+		close(sock);
+		return -1;
+	}
+	if (sock_set_sndbuf(sock) < 0) {
+		perror("sock_set_sndbuf");
+	}
+	if (sock_set_rcvbuf(sock) < 0) {
+		perror("sock_set_rcvbuf");
+	}
 
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, true)) == NULL) {
+		close(sock);
 		return -1;
 	}
 	tfd = t->tfd;
@@ -5622,15 +5606,30 @@ TASK_instance_destroy(int32_t ti)
 {
 	struct instance *i;
 
+	pthread_mutex_lock(&creation_lock);
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
+		pthread_mutex_unlock(&creation_lock);
 		return -1;
 	}
 
 	i = instances[ti];
 
+	if (i == NULL) {
+		errno = EBADF;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
 	if (i->magic != INSTANCE_MAGIC) {
 		errno = EBADF;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
+	if ((i->state != INSTANCE_STATE_CREATED) && (i->state != INSTANCE_STATE_RUNNING)) {
+		errno = EBADF;
+		pthread_mutex_unlock(&creation_lock);
 		return -1;
 	}
 
@@ -5643,6 +5642,9 @@ TASK_instance_destroy(int32_t ti)
 	instance_shutdown_tasks(i, 1);
 
 	instance_destroy(i);
+
+	instances[ti] = NULL;
+	pthread_mutex_unlock(&creation_lock);
 	return 0;
 } // TASK_instance_destroy
 
@@ -5671,7 +5673,11 @@ TASK_instance_wait(int32_t ti)
 		worker_handle_instance(i);
 
 		if (i->evfd < 0) {
-			poll(NULL, 0, 1000);
+			if (poll(NULL, 0, 1000) < 0) {
+				if (errno != EINTR) {
+					break;
+				}
+			}
 		} else {
 			int len;
 			uint64_t c;
@@ -5726,6 +5732,11 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 	}
 
 	i = instances[ti];
+
+	if (i == NULL) {
+		errno = EBADF;
+		return -1;
+	}
 
 	if (i->magic != INSTANCE_MAGIC) {
 		errno = EBADF;
@@ -5806,14 +5817,15 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		__page_size = sysconf(_SC_PAGESIZE);
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
-		sigaction(SIGPIPE, sa, NULL);
+		if (sigaction(SIGPIPE, sa, NULL) < 0) {
+			goto TASK_instance_create_error;
+		}
 
 		for(ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
 			instances[ti] = NULL;
 		}
 		initialised = true;
 	}
-	pthread_mutex_unlock(&creation_lock);
 
 	// If we're not asked to spawn any io workers then
 	// we need to auto-detect how many threads to start
@@ -5856,11 +5868,13 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		goto TASK_instance_create_error;
 	}
 
+	pthread_mutex_unlock(&creation_lock);
 	return i->ti;
 
 TASK_instance_create_error:
 	if (i) {
 		instance_destroy(i);
 	}
+	pthread_mutex_unlock(&creation_lock);
 	return -1;
 } // TASK_instance_create

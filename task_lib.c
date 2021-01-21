@@ -28,7 +28,7 @@
 
 #include "ph.h"
 #include "task_lib.h"
-#include "ticketlock.h"
+#include "stewticket_thr.h"
 
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
@@ -78,7 +78,7 @@
 // than the adaptive pthread mutexes, but performance is terrible if the worker threads ever get
 // context switched by the Linux scheduler. It is slightly easier however to gather profiling
 // statistics about the time spent in TFD locks with gprof using ticketlocks
-// #define USE_TICKET_LOCKS
+#define USE_TICKET_LOCKS
 
 #ifdef USE_TICKET_LOCKS
 typedef struct {

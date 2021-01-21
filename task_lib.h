@@ -3,8 +3,13 @@
 // Author: Stew Forster (stew675@gmail.com)
 //
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef __USE_GNU
 #define __USE_GNU
+#endif
+
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +65,7 @@
 //-------------------------------------------------------------------------------------------
 
 // Retrieves the current system microsecond time 
-int64_t TASK_get_us_time(int64_t *time_us);
+int64_t TASK_get_us_time(int64_t *time_us, bool precise);
 
 // Destroys a timeout task's state, however if the task is also registered against a socket,
 // then this call just behaves identically to TASK_timeout_cancel()

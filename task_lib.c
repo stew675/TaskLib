@@ -4654,10 +4654,14 @@ instance_creation_fail:
 // ---------------------------------------------------------------------------------------------//
 
 int64_t
-TASK_get_us_time(int64_t *time_us)
+TASK_get_us_time(int64_t *time_us, bool precise)
 {
 	int64_t now_us;
-	now_us = get_time_us(TASK_TIME_PRECISE);
+	if (precise) {
+		now_us = get_time_us(TASK_TIME_PRECISE);
+	} else {
+		now_us = get_time_us(TASK_TIME_COARSE);
+	}
 	if (time_us) {
 		*time_us = now_us;
 	}

@@ -91,22 +91,29 @@ int64_t TASK_timeout_create(int32_t ti, int64_t expires_in_us, void *user_data,
 //-------------------------------------------------------------------------------------------
 
 // Will write the entire contents of the supplied buffers to the given tfd, or expire trying
-ssize_t TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *user_data,
+void TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *user_data,
 			  void (*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *user_data));
 
 // Will write the entire contents of the supplied buffer to the given tfd, or expire trying
-ssize_t TASK_socket_write(int64_t tfd, const void *buf, size_t buflen, int64_t expires_in_us, void *user_data,
+void TASK_socket_write(int64_t tfd, const void *buf, size_t buflen, int64_t expires_in_us, void *user_data,
 			 void (*write_cb)(int64_t tfd, const void *buf, ssize_t result, void *user_data));
 
-ssize_t TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *user_data,
+void TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *user_data,
 			 void (*readv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *user_data));
 
-ssize_t TASK_socket_read(int64_t tfd, void *buf, size_t buflen, int64_t expires_in_us, void *user_data,
+void TASK_socket_read(int64_t tfd, void *buf, size_t buflen, int64_t expires_in_us, void *user_data,
 			void (*read_cb)(int64_t tfd, void *buf, ssize_t result, void *user_data));
+
+// Connect to given destination address. If src_addr is NULL, it will just use the default interface IP and choose any local source port
+void TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64_t expires_in_us,
+		       void *user_data, void (*connect_cb)(int64_t tfd, int result, void *user_data));
 
 //-------------------------------------------------------------------------------------------
 // Task Library Socket API
 //-------------------------------------------------------------------------------------------
+
+// Listen for and accept new connections on a given addr
+int TASK_socket_listen(int64_t tfd, void *user_data, void (*accept_cb)(int64_t tfd, void *user_data));
 
 // Returns the direct UNIX socket that the tfd is operating on
 int TASK_socket_get_fd(int64_t tfd);
@@ -121,13 +128,6 @@ int TASK_migrate(int64_t to_tfd, int64_t from_tfd);
 // If called against a timeout-only task, it just calls TASK_timeout_destroy(tfd);
 int TASK_close(int64_t tfd);
 int TASK_socket_shutdown(int64_t tfd, int how);
-
-// Listen for and accept new connections on a given addr
-int TASK_socket_listen(int64_t tfd, void *user_data, void (*accept_cb)(int64_t tfd, void *user_data));
-
-// Connect to given destination address. If src_addr is NULL, it will just use the default interface IP and choose any local source port
-int TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64_t expires_in_us,
-		       void *user_data, void (*connect_cb)(int64_t tfd, int result, void *user_data));
 
 int TASK_socket_bind(int64_t tfd, struct sockaddr *addr, socklen_t addrlen);
 

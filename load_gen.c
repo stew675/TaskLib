@@ -100,11 +100,8 @@ loadgen_read_cb(int64_t tfd, void *buf, ssize_t result, void *user_data)
 static void
 loadgen_start_rd(struct loadgen *lg)
 {
-	ssize_t result;
-
 	lg->num_rd_calls++;
-	result = TASK_socket_read(lg->tfd, lg->rd_buf, BUFLEN, TASK_TIMEOUT_ONE_SEC * 15, lg, loadgen_read_cb);
-	loadgen_read_cb(lg->tfd, lg->rd_buf, result, lg);
+	TASK_socket_read(lg->tfd, lg->rd_buf, BUFLEN, TASK_TIMEOUT_ONE_SEC * 15, lg, loadgen_read_cb);
 } // loadgen_start_rd
 
 
@@ -148,7 +145,6 @@ loadgen_write_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 static void
 loadgen_start_wr(struct loadgen *lg)
 {
-	ssize_t result;
 	size_t wr_size = 0;
 
 	wr_size = deliver_size - lg->delivered;
@@ -160,8 +156,7 @@ loadgen_start_wr(struct loadgen *lg)
 	}
 
 	lg->num_wr_calls++;
-	result = TASK_socket_write(lg->tfd, lg->wr_buf, wr_size, TASK_TIMEOUT_ONE_SEC * 15, lg, loadgen_write_cb);
-	loadgen_write_cb(lg->tfd, lg->wr_buf, result, lg);
+	TASK_socket_write(lg->tfd, lg->wr_buf, wr_size, TASK_TIMEOUT_ONE_SEC * 15, lg, loadgen_write_cb);
 } // loadgen_start_wr
 
 
@@ -190,7 +185,6 @@ static void
 loadgen_connect(struct loadgen *lg)
 {
 	struct sockaddr_in lca;
-	int res;
 
 	lca.sin_family = AF_INET;
 	lca.sin_addr.s_addr = INADDR_ANY;
@@ -213,8 +207,7 @@ loadgen_connect(struct loadgen *lg)
 		return;
 	}
 
-	res = TASK_socket_connect(lg->tfd, (struct sockaddr *)lg->addr, sizeof(struct sockaddr_in), TASK_TIMEOUT_ONE_SEC * 15, (void *)lg, connect_complete_cb);
-	connect_complete_cb(lg->tfd, res, lg);
+	TASK_socket_connect(lg->tfd, (struct sockaddr *)lg->addr, sizeof(struct sockaddr_in), TASK_TIMEOUT_ONE_SEC * 15, (void *)lg, connect_complete_cb);
 }
 
 

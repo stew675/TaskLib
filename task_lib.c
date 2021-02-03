@@ -4783,7 +4783,7 @@ TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
 //----------------------------------------------------------------------------------------------//
 
 // Will write the entire contents of the supplied buffers to the given tfd, or die trying
-ssize_t
+void
 TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *wr_cb_data,
 		  void (*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data))
 {
@@ -4791,44 +4791,46 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	size_t wrv_buflen = 0;
 	int n;
 
-	if (t == NULL) return -1;	// errno already set
+	if (t == NULL) {
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+	}
 
 	if (t->wr_shut) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
-		return -1;
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 	}
 
 	if (t->wr_cancel) {
 		task_unlock(t, FLG_WR);
 		errno = EOWNERDEAD;
-		return -1;
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
-		return -1;
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 	}
 
 	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 		task_unlock(t, FLG_WR);
 		errno = EBUSY;
-		return -1;
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 	}
 
 	// Validate the iov arguments and determine total read length
 	if ((iovcnt < 0) || (iovcnt > IOV_MAX)) {
 		task_unlock(t, FLG_WR);
 		errno = EINVAL;
-		return -1;
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 	}
 
 	for (n = 0; n < iovcnt; n++) {
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_WR);
 			errno = EINVAL;
-			return -1;
+			return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 		}
 		wrv_buflen += iov[n].iov_len;
 	}
@@ -4850,11 +4852,11 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 
 		t->io_depth++;
 		if ((result = task_write_vector(t, true, false)) == 0) {
-			return 0;
+			return;
 		}
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return result;
+		return wrv_cb(tfd, iov, iovcnt, result, wr_cb_data);
 	} else {
 		t->io_depth = 0;
 	}
@@ -4863,45 +4865,46 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	if (task_notify_action(t, FLG_WR, false, true) == false) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return -1;
+		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
 	}
 
-	// The operation is queued.
-	return 0;
+	// The operation is queued.  Just return
 } // TASK_socket_writev
 
 
 // Will write the entire contents of the supplied buffer to the given tfd, or die trying
-ssize_t
+void
 TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires_in_us, void *wr_cb_data,
 		 void (*wr_cb)(int64_t tfd, const void *wrbuf, ssize_t result, void *wr_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_WR);
 
-	if (t == NULL) return -1;	// errno already set
+	if (t == NULL) {
+		return wr_cb(tfd, wrbuf, -1, wr_cb_data);	// errno already set
+	}
 
 	if (t->wr_shut) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
-		return -1;
+		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
 	}
 
 	if (t->wr_cancel) {
 		task_unlock(t, FLG_WR);
 		errno = EOWNERDEAD;
-		return -1;
+		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
-		return -1;
+		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
 	}
 
 	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 		task_unlock(t, FLG_WR);
 		errno = EBUSY;
-		return -1;
+		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
 	}
 
 	t->wr_bufpos = 0;
@@ -4920,11 +4923,11 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 
 		t->io_depth++;
 		if ((result = task_write_buffer(t, true, false)) == 0) {
-			return 0;
+			return;		// Operation is queued, just return
 		}
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return result;
+		return wr_cb(tfd, wrbuf, result, wr_cb_data);
 	} else {
 		t->io_depth = 0;
 	}
@@ -4933,15 +4936,14 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	if (task_notify_action(t, FLG_WR, false, true) == false) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return -1;
+		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
 	}
 
-	// The operation is queued
-	return 0;
+	// The operation is queued.  Just return
 } // TASK_socket_write
 
 
-ssize_t
+void
 TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *rd_cb_data,
 		 void (*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data))
 {
@@ -4949,44 +4951,46 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	size_t rdv_buflen = 0;
 	int n;
 
-	if (t == NULL) return -1;	// errno already set
+	if (t == NULL) {
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);	// errno already set
+	}
 
 	if (t->rd_shut) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
-		return -1;
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 	}
 
 	if (t->rd_cancel) {
 		task_unlock(t, FLG_RD);
 		errno = EOWNERDEAD;
-		return -1;
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_RD);
 		errno = EBADF;
-		return -1;
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 	}
 
 	if (t->rd_state != TASK_READ_STATE_IDLE) {
 		task_unlock(t, FLG_RD);
 		errno = EBUSY;
-		return -1;
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 	}
 
 	// Validate the iov arguments and determine total read length
 	if ((iovcnt < 0) || (iovcnt > IOV_MAX)) {
 		task_unlock(t, FLG_RD);
 		errno = EINVAL;
-		return -1;
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 	}
 
 	for (n = 0; n < iovcnt; n++) {
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_RD);
 			errno = EINVAL;
-			return -1;
+			return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 		}
 		rdv_buflen += iov[n].iov_len;
 	}
@@ -5008,11 +5012,11 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 
 		t->io_depth++;
 		if ((result = task_read_vector(t, true, false)) == 0) {
-			return 0;
+			return;
 		}
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return result;
+		return rdv_cb(tfd, iov, iovcnt, result, rd_cb_data);
 	} else {
 		t->io_depth = 0;
 	}
@@ -5021,44 +5025,45 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	if (task_notify_action(t, FLG_RD, false, true) == false) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return -1;
+		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 	}
 
-	// The operation is queued
-	return 0;
+	// The operation is queued.  Just return
 } // TASK_socket_readv
 
 
-ssize_t
+void
 TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us, void *rd_cb_data,
 		void (*rd_cb)(int64_t tfd, void *rdbuf, ssize_t result, void *rd_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_RD);
 
-	if (t == NULL) return -1;	// errno already set
+	if (t == NULL) {
+		return rd_cb(tfd, rdbuf, -1, rd_cb_data);	// errno already set
+	}
 
 	if (t->rd_shut) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
-		return -1;
+		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
 	}
 
 	if (t->rd_cancel) {
 		task_unlock(t, FLG_RD);
 		errno = EOWNERDEAD;
-		return -1;
+		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_RD);
 		errno = EBADF;
-		return -1;
+		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
 	}
 
 	if (t->rd_state != TASK_READ_STATE_IDLE) {
 		task_unlock(t, FLG_RD);
 		errno = EBUSY;
-		return -1;
+		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
 	}
 
 	t->rd_bufpos = 0;
@@ -5077,11 +5082,11 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 
 		t->io_depth++;
 		if ((result = task_read_buffer(t, true, false)) == 0) {
-			return 0;
+			return;
 		}
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return result;
+		return rd_cb(tfd, rdbuf, result, rd_cb_data);
 	} else {
 		t->io_depth = 0;
 	}
@@ -5090,11 +5095,10 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	if (task_notify_action(t, FLG_RD, false, true) == false) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return -1;
+		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
 	}
 
-	// The operation is queued
-	return 0;
+	// The operation is queued.  Just return
 } // TASK_socket_read
 
 
@@ -5279,19 +5283,21 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 
 
 // Connect to given destination address. If src_addr is NULL, it will just use the default interface IP and choose any local source port
-int
+void
 TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64_t expires_in_us,
 		   void *connect_cb_data, void (*connect_cb)(int64_t tfd, int result, void *connect_cb_data))
 {
 	register struct task *t;
 	register struct instance *i;
 
-	if ((t = task_lookup(tfd, FLG_CO)) == NULL) return -1;		// errno already set
+	if ((t = task_lookup(tfd, FLG_CO)) == NULL) {
+		return connect_cb(tfd, -1, connect_cb_data);		// errno already set
+	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_CO);
 		errno = EBADF;
-		return -1;
+		return connect_cb(tfd, -1, connect_cb_data);
 	}
 
 	// Handle affinity stuff
@@ -5314,7 +5320,7 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 
 	// Queue the connect so it starts on the correct worker
 	task_notify_action(t, FLG_CN, false, true);
-	return 0;
+	return;
 } // TASK_socket_connect
 
 

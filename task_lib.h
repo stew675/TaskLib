@@ -145,6 +145,16 @@ int64_t TASK_socket_create(int32_t ti, int domain, int type, int protocol, void 
 			  void (*close_cb)(int64_t tfd, void *user_data));
 
 //-------------------------------------------------------------------------------------------
+// Task Library SSL API
+//-------------------------------------------------------------------------------------------
+
+void TASK_init_ssl_system(void);
+int TASK_enable_ssl_server(int tfd, void *user_data,
+			void (*ssl_cb)(int64_t tfd, void *user_data));
+int TASK_enable_ssl_client(int tfd, void *user_data,
+			void (*ssl_cb)(int64_t tfd, void *user_data));
+
+//-------------------------------------------------------------------------------------------
 // Task Library Blocking Work API
 //-------------------------------------------------------------------------------------------
 

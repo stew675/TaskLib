@@ -29,6 +29,8 @@
 #include "ph.h"
 #include "task_lib.h"
 #include "stewticket_thr.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 // Uncomment to turn on either EPOLLET/EPOLLONESHOT style epolling (doesn't apply to poll() mode)
 #define USE_EPOLLET
@@ -127,7 +129,9 @@ typedef enum {
 	TASK_READ_STATE_IDLE = 0,
 	TASK_READ_STATE_VECTOR = 1,
 	TASK_READ_STATE_BUFFER = 2,
-	TASK_READ_STATE_LISTEN = 3
+	TASK_READ_STATE_LISTEN = 3,
+	TASK_READ_STATE_SSL_CONNECT = 4,
+	TASK_READ_STATE_SSL_ACCEPT = 5
 } task_rd_state_t;
 
 typedef enum {
@@ -208,7 +212,10 @@ __attribute__ ((aligned(64))) void	*accept_cb_data;
 	void				(*connect_cb)(int64_t tfd, int result, void *connect_cb_data);
 	void				*close_cb_data;		//  User data to pass to the close callback
 	void				(*close_cb)(int64_t tfd, void *close_cb_data);
-	struct worker			*preferred_worker;	// To initiate task io worker migration
+	void				(*ssl_cb)(int64_t tfd, void *ssl_cb_data);
+	void				*ssl_cb_data;
+	SSL*				ssl;
+	struct worker		*preferred_worker;	// To initiate task io worker migration
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 } __attribute__ ((aligned(64)));
@@ -278,12 +285,12 @@ __attribute__ ((aligned(64))) const char *wr_buf;
 __attribute__ ((aligned(64))) char	*rd_buf;
 	size_t				rd_buflen;
 	size_t				rd_bufpos;
-	uint32_t			rd_state:2,
+	uint64_t			rd_state:3,
 					rd_shut:1,
 					rd_cancel:1,
 					rt_cancelled:1,
 					rd_expires_modified:1,
-					rd_unused:26;
+					rd_unused:57;
 	void				*rd_cb_data;
 	int64_t				rd_expires_in_us;
 	void				(*rd_cb)(int64_t tfd, void *buf, ssize_t result, void *rd_cb_data);
@@ -2049,6 +2056,24 @@ task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno)
 	cb(tfd, cb_data);		// t is still locked at this point
 } // task_do_accept_cb
 
+static void
+task_do_ssl_cb(struct task *t, int64_t tfd, int cb_errno)
+{
+	void (*cb)(int64_t tfd, void *ssl_cb_data) = t->stride->ssl_cb;
+	void *cb_data = t->stride->ssl_cb_data;
+
+	t->stride->ssl_cb = NULL;
+	t->stride->ssl_cb_data = NULL;
+
+	// TODO
+	// if ((cb == NULL) || t->rd_cancel || (t->state != TASK_STATE_ACTIVE)) {
+	// 	task_notify_action(t, FLG_CL, false, true);
+	// 	return;
+	// }
+
+	errno = cb_errno;
+	cb(tfd, cb_data);		// t is still locked at this point
+}
 
 static void
 task_do_writev_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno)
@@ -2564,6 +2589,49 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	return t;
 } // task_create
 
+static ssize_t
+SSL_writev (SSL *ssl, const struct iovec *vector, int count)
+{
+  char *buffer;
+  register char *bp;
+  size_t bytes, to_copy;
+  int i;
+
+  /* Find the total number of bytes to be written.  */
+  bytes = 0;
+  for (i = 0; i < count; ++i)
+    bytes += vector[i].iov_len;
+
+  /* Allocate a temporary buffer to hold the data.  */
+  buffer = (char *) alloca (bytes);
+
+  /* Copy the data into BUFFER.  */
+  to_copy = bytes;
+  bp = buffer;
+  for (i = 0; i < count; ++i)
+    {
+#     define min(a, b)		((a) > (b) ? (b) : (a))
+      size_t copy = min (vector[i].iov_len, to_copy);
+
+      memcpy ((void *) bp, (void *) vector[i].iov_base, copy);
+      bp += copy;
+
+      to_copy -= copy;
+      if (to_copy == 0)
+        break;
+    }
+
+	int ssl_ret = 0;
+	int ret = 0;
+	do {
+		ssl_ret = 0;
+		ret = SSL_write(ssl, buffer, bytes);
+		if (ret <= 0) {
+			ssl_ret = SSL_get_error(ssl, ret);
+		}
+	} while (ssl_ret == SSL_ERROR_WANT_WRITE);
+	return ret;
+}
 
 static ssize_t
 task_write_vector(register struct task *t, register bool wr_expires_modified, register bool queued)
@@ -2612,10 +2680,18 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 			}
 
 			// We've now got a copy in our local iov of the remainder of what's left to write
-			written = writev(t->fd, iov, iovcnt);
+			if (t->stride->ssl) {
+				written = SSL_writev(t->stride->ssl, iov, iovcnt);
+			} else {
+				written = writev(t->fd, iov, iovcnt);
+			}
 		} else {
 			// We have no offset.  Just use what was passed to us for speed
-			written = writev(t->fd, wrv_iov, wrv_iovcnt);
+			if (t->stride->ssl) {
+				written = SSL_writev(t->stride->ssl, wrv_iov, wrv_iovcnt);
+			} else {
+				written = writev(t->fd, wrv_iov, wrv_iovcnt);
+			}
 		}
 
 		if (written < 0) {
@@ -2704,7 +2780,10 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 			to_write = max_can_do;
 		}
 
-		written = write(t->fd, wr_buf + wr_bufpos, to_write);
+		if (t->stride->ssl)
+			written = SSL_write(t->stride->ssl, wr_buf + wr_bufpos, to_write);
+		else
+			written = write(t->fd, wr_buf + wr_bufpos, to_write);
 		if (written < 0) {
 			if (errno == EAGAIN) {
 				// Write blocked for now, raise EPOLLOUT and wait to be unblocked
@@ -2987,7 +3066,10 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 			to_read = max_can_do;
 		}
 
-		reddin = read(t->fd, rd_buf + rd_bufpos, to_read);
+		if (t->stride->ssl)
+			reddin = SSL_read(t->stride->ssl, rd_buf + rd_bufpos, to_read);
+		else
+			reddin = read(t->fd, rd_buf + rd_bufpos, to_read);
 		if (reddin < 0) {
 			// We read until we're blocked.
 			if (errno == EAGAIN) {
@@ -3233,6 +3315,47 @@ task_handle_listen_event_fail:
 	task_do_close_cb(t);	// Unlocks task
 } // task_handle_listen_event
 
+static void
+task_handle_ssl_connect_event(struct task *t)
+{
+	SSL* ssl = t->stride->ssl;
+
+	int ret = SSL_connect(ssl);
+	if (ret != 1) {
+		ret = SSL_get_error(ssl,ret);
+		if (ret != SSL_ERROR_WANT_READ)
+		{
+			t->rd_state = TASK_READ_STATE_IDLE;
+			char msg[1024];
+			ERR_error_string_n(ERR_get_error(), msg, sizeof(msg));
+			printf("task_handle_ssl_connect_event error: %d %s %s %s %s\n", ret, msg, ERR_lib_error_string(0), ERR_func_error_string(0), ERR_reason_error_string(0));
+		}
+	} else {
+		t->rd_state = TASK_READ_STATE_IDLE;
+		task_do_ssl_cb(t, t->tfd, 0);
+	}
+}
+
+static void
+task_handle_ssl_accept_event(struct task *t)
+{
+	SSL* ssl = t->stride->ssl;
+
+	int ret = SSL_accept(ssl);
+	if (ret <= 0) {
+		ret = SSL_get_error(ssl,ret);
+		if (ret != SSL_ERROR_WANT_READ)
+		{
+			t->rd_state = TASK_READ_STATE_IDLE;
+			char msg[1024];
+			ERR_error_string_n(ERR_get_error(), msg, sizeof(msg));
+			printf("task_handle_ssl_accept_event error: %d %s %s %s %s\n", ret, msg, ERR_lib_error_string(0), ERR_func_error_string(0), ERR_reason_error_string(0));
+		}
+	} else {
+		t->rd_state = TASK_READ_STATE_IDLE;
+		task_do_ssl_cb(t, t->tfd, 0);
+	}
+}
 
 static void
 task_handle_wr_event(struct task *t)
@@ -3268,6 +3391,10 @@ task_handle_rd_event(struct task *t)
 		task_read_vector(t, t->rd_expires_modified, true);	// Unlocks the task for us
 	} else if (t->rd_state == TASK_READ_STATE_LISTEN) {
 		task_handle_listen_event(t);				// Unlocks the task for us
+	} else if (t->rd_state == TASK_READ_STATE_SSL_CONNECT) {
+		task_handle_ssl_connect_event(t);
+	} else if (t->rd_state == TASK_READ_STATE_SSL_ACCEPT) {
+		task_handle_ssl_accept_event(t);
 	} else {
 		// Do nothing
 	}
@@ -5473,6 +5600,175 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 	return tfd;
 } // TASK_socket_create
 
+//----------------------------------------------------------------------------------------------//
+// 			     Task Library SSL API					//
+//----------------------------------------------------------------------------------------------//
+
+static int
+password_cb(char *buf, int size, int rwflag, void *password)
+{
+	(void)rwflag;
+    strncpy(buf, (char *)(password), size);
+    buf[size - 1] = '\0';
+    return strlen(buf);
+}
+
+static EVP_PKEY*
+generatePrivateKey(void)
+{
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    EVP_PKEY_keygen_init(pctx);
+    EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048);
+    EVP_PKEY_keygen(pctx, &pkey);
+    return pkey;
+}
+
+static X509*
+generateCertificate(EVP_PKEY *pkey)
+{
+    X509 *x509 = X509_new();
+    X509_set_version(x509, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 0);
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), (long)60*60*24*365);
+    X509_set_pubkey(x509, pkey);
+
+    X509_NAME *name = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (const unsigned char*)"US", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)"YourCN", -1, -1, 0);
+    X509_set_issuer_name(x509, name);
+    X509_sign(x509, pkey, EVP_md5());
+    return x509;
+}
+
+static SSL*
+start_ssl(bool server)
+{
+	SSL_CTX* ctx;
+
+	if (server) {
+		ctx = SSL_CTX_new(SSLv23_server_method());
+	} else {
+		ctx = SSL_CTX_new(SSLv23_client_method());
+	}
+	if (ctx == NULL) {
+		printf("errored; unable to load context.\n");
+		ERR_print_errors_fp(stderr);
+		return NULL;
+	}
+
+	if (server) {
+		EVP_PKEY *pkey = generatePrivateKey();
+		X509 *x509 = generateCertificate(pkey);
+		SSL_CTX_use_certificate(ctx, x509);
+		SSL_CTX_set_default_passwd_cb(ctx, password_cb);
+		SSL_CTX_use_PrivateKey(ctx, pkey);
+		RSA *rsa=RSA_generate_key(512, RSA_F4, NULL, NULL);
+		SSL_CTX_set_tmp_rsa(ctx, rsa);
+		RSA_free(rsa);
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0);
+	}
+
+	SSL *ssl = SSL_new(ctx);
+	if (server) {
+		SSL_set_accept_state(ssl);
+	} else {
+		SSL_set_connect_state(ssl);
+	}
+	return ssl;
+}
+
+void TASK_init_ssl_system(void)
+{
+	SSL_load_error_strings();
+	ERR_load_crypto_strings();
+	ERR_load_BIO_strings();
+	OpenSSL_add_all_algorithms();
+	SSL_library_init();
+}
+
+int TASK_enable_ssl_server(int tfd, void *user_data, void (*ssl_cb)(int64_t tfd, void *user_data))
+{
+	register struct task *t = task_lookup(tfd, FLG_LU);
+	if (t == NULL) return -1;
+
+	SSL *ssl = start_ssl(true);
+	if (ssl == NULL) return -1;
+
+	t->type = TASK_TYPE_IO;
+	t->rd_state = TASK_READ_STATE_SSL_ACCEPT;
+	t->stride->ssl_cb = ssl_cb;
+	t->stride->ssl_cb_data = user_data;
+	t->stride->ssl = ssl;
+
+	int ret = SSL_set_fd(ssl, t->fd);
+	if (ret == 0)
+	{
+		return -1;
+	}
+
+	int client = SSL_accept(ssl);
+
+	if (client <= 0) {
+		ret = SSL_get_error(ssl,client);
+		if (ret != SSL_ERROR_WANT_READ && ret != SSL_ERROR_WANT_WRITE) {
+			char msg[1024];
+			ERR_error_string_n(ERR_get_error(), msg, sizeof(msg));
+			printf("TASK_enable_ssl_server: %s %s %s %s\n", msg, ERR_lib_error_string(0), ERR_func_error_string(0), ERR_reason_error_string(0));
+			return -1;
+		} else {
+			task_raise_event_flag(t,EPOLLIN);
+			return 1;
+		}
+	}
+	return 1;
+
+} // TASK_enable_ssl_server
+
+int TASK_enable_ssl_client(int tfd, void* user_data, void (*ssl_cb)(int64_t tfd, void *user_data))
+{
+	register struct task *t = task_lookup(tfd, FLG_LU);
+	if (t == NULL) return -1;
+
+	SSL *ssl = start_ssl(false);
+	if (ssl == NULL) return -1;
+
+	int ret = SSL_set_fd(ssl, t->fd);
+	if (ret == 0) return -1;
+
+	t->type = TASK_TYPE_IO;
+	t->rd_state = TASK_READ_STATE_SSL_CONNECT;
+	t->stride->ssl_cb = ssl_cb;
+	t->stride->ssl_cb_data = user_data;
+	t->stride->ssl = ssl;
+	task_raise_event_flag(t,EPOLLIN);
+
+	ret = SSL_do_handshake(ssl);
+	if (ret != SSL_ERROR_NONE) {
+		ret = SSL_get_error(ssl,ret);
+		if (ret != SSL_ERROR_WANT_READ) {
+			char msg[1024];
+			ERR_error_string_n(ERR_get_error(), msg, sizeof(msg));
+			printf("TASK_enable_ssl_client: %s %s %s %s\n", msg, ERR_lib_error_string(0), ERR_func_error_string(0), ERR_reason_error_string(0));
+			return -1;
+		} else {
+			if (ret == SSL_ERROR_WANT_READ) {
+				// TODO
+				// struct pollfd pfd;
+				// pfd.fd = t->fd;
+				// pfd.events = POLLIN | POLLERR;
+				// do {
+				// 	ret = poll(&pfd, 1, 1000);
+				// } while (ret == 0);
+				// printf("poll returned %d\n", ret);
+			}
+		}
+	}
+
+	return 1;
+
+} // TASK_enable_ssl_client
 
 //----------------------------------------------------------------------------------------------//
 // 			     Task Library Blocking Work API					//

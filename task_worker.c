@@ -42,6 +42,10 @@ worker_handle_instance(struct instance *i)
 				// Place the worker on the idle queue, but don't
 				// notify it. It doesn't have anything to do yet.
 				// Keep old_state/counters consistent with the list move.
+				if (TAILQ_EMPTY(&i->workers_idle)) {
+					i->worker_idle_empty_reaped = 0;
+					i->worker_idle_empty_time_us = get_time_us(TASK_TIME_PRECISE);
+				}
 				w->old_state = w->state;
 				task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_IDLE));
 				i->num_blocking_idle++;
@@ -52,43 +56,47 @@ worker_handle_instance(struct instance *i)
 	}
 
 	// Start reaping workers from the idle queue if it hasn't been
-	// empty for 5 minutes. After that, reap 1 thread every 5s
-	instance_lock(i);
-	bool idle_empty = TAILQ_EMPTY(&i->workers_idle);
-	if (idle_empty) {
-		i->worker_idle_empty_reaped = 0;
-		i->worker_idle_empty_time_us = get_time_us(TASK_TIME_COARSE);
-	}
-	instance_unlock(i);
-	if (idle_empty) {
-		// Nothing to reap
-	} else {
+	// empty for 5 minutes. After that, reap 1 thread every 5s.  All counter
+	// reads and writes happen under the instance lock because
+	// TASK_instance_wait() may call this concurrently with the instance IO
+	// worker.
+	for (;;) {
+		struct worker *w = NULL;
 		int64_t idle_reap_expiry_us;
+		int64_t now_us;
 
+		instance_lock(i);
+		if (TAILQ_EMPTY(&i->workers_idle)) {
+			i->worker_idle_empty_reaped = 0;
+			i->worker_idle_empty_time_us = task_atomic_load(&i->curtime_us);
+			instance_unlock(i);
+			break;
+		}
+
+		if (i->worker_idle_empty_time_us == 0) {
+			i->worker_idle_empty_time_us = task_atomic_load(&i->curtime_us);
+		}
 		idle_reap_expiry_us = i->worker_idle_empty_time_us;
 		idle_reap_expiry_us += TASK_S_TO_US(300);
 		idle_reap_expiry_us += (i->worker_idle_empty_reaped * TASK_S_TO_US(5));
-
-		// Loop to catch up in case it's been a while
-		int64_t now_us = task_atomic_load(&i->curtime_us);
-		while (now_us >= idle_reap_expiry_us) {
-			struct worker *w;
-
-			// Reap an idle worker
-			instance_lock(i);
-			if ((w = TAILQ_FIRST(&i->workers_idle))) {
-				w->old_state = w->state;
-				task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_SHUTTING_DOWN));
-				i->num_blocking_idle--;
-				TAILQ_REMOVE(&i->workers_idle, w, list);
-				TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
-			}
+		now_us = task_atomic_load(&i->curtime_us);
+		if (now_us < idle_reap_expiry_us) {
 			instance_unlock(i);
-			if (w) {
-				worker_notify(w);
-			}
-			i->worker_idle_empty_reaped++;
-			idle_reap_expiry_us += TASK_S_TO_US(5);
+			break;
+		}
+
+		if ((w = TAILQ_FIRST(&i->workers_idle))) {
+			w->old_state = w->state;
+			task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_SHUTTING_DOWN));
+			i->num_blocking_idle--;
+			TAILQ_REMOVE(&i->workers_idle, w, list);
+			TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
+		}
+		i->worker_idle_empty_reaped++;
+		instance_unlock(i);
+
+		if (w) {
+			worker_notify(w);
 		}
 	}
 } // worker_handle_instance
@@ -148,10 +156,21 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 {
 	struct instance *i = w->instance;
 	struct worker *tw = t->stride->preferred_worker;
+	struct ntfyq *tq;
+
+	// Reserve the completion notification before committing ownership.  If
+	// this fails, abort the migration with the task still entirely owned by
+	// this worker rather than leaving timers detached on an unreachable
+	// target.
+	if ((tq = worker_notify_reserve_locked(tw)) == NULL) {
+		t->stride->preferred_worker = NULL;
+		task_action_done(t, FLG_MG);
+		return;
+	}
 
 	t->migrations++;
 	t->stride->preferred_worker = NULL;
-	t->worker = tw;
+	task_atomic_store(&t->worker, tw);
 	task_atomic_dec(&w->num_tasks);
 	task_atomic_inc(&tw->num_tasks);
 
@@ -176,16 +195,16 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	// Always update epfd, even if the task is not currently armed.  Otherwise
 	// a later task_raise_event_flag() would arm the fd in the old worker's
 	// epoll set while t->worker points at the new worker.
-	if (t->fd >= 0) {
+	if (task_atomic_load(&t->fd) >= 0) {
 		int was_in_epoll = task_atomic_load(&t->in_epoll);
 		struct epoll_event ev = { .data.ptr = t, .events = t->events };
 
 		if (was_in_epoll) {
-			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
+			epoll_ctl(t->epfd, EPOLL_CTL_DEL, task_atomic_load(&t->fd), NULL);
 			task_atomic_store(&t->in_epoll, 0);
 		}
 		t->epfd = tw->gepfd;
-		if (was_in_epoll && (epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev) == 0)) {
+		if (was_in_epoll && (epoll_ctl(t->epfd, EPOLL_CTL_ADD, task_atomic_load(&t->fd), &ev) == 0)) {
 			task_atomic_store(&t->in_epoll, 1);
 #ifdef USE_EPOLLET
 			t->events |= EPOLLET;	// Set EPOLLET in the task ev flags now.
@@ -196,7 +215,7 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	// Move a listener's list entry to the new worker.  The list is shared
 	// with poll() and with child-listener creation, so serialise it with the
 	// per-instance listeners lock.
-	if (t->type == TASK_TYPE_LISTEN) {
+	if (task_atomic_load(&t->type) == TASK_TYPE_LISTEN) {
 		pthread_mutex_lock(&i->listeners_lock);
 		task_remove_list(&w->listeners, t);
 		t->task_next = tw->listeners;
@@ -206,18 +225,14 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 
 	// All queued notifications automatically get forwarded to the new task worker
 
-	if (tw->affined_cpu >= 0) {
+	if ((tw->affined_cpu >= 0) && (i->flags & TASK_FLAGS_AFFINITY_NET)) {
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
-		if (i->flags & TASK_FLAGS_AFFINITY_NET) {
-			if (setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu)) < 0) {
-				task_notify_action(t, FLG_MG, false, true);
-				return;
-			}
-		}
+		(void)setsockopt(task_atomic_load(&t->fd), SOL_SOCKET, SO_INCOMING_CPU,
+				 &tw->affined_cpu, sizeof(tw->affined_cpu));
 	}
 
-	// Wake up the target worker with the migration event that just happened
-	task_notify_action(t, FLG_MG, false, true);
+	// Wake up the target worker with the receiver side of the migration.
+	worker_notify_queue_locked(tw, tq, t, FLG_MG);
 } // worker_handle_task_migration
 
 
@@ -245,7 +260,7 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	// Check if the action got cancelled.  If so, just ignore it
 	// Allow close, connecting and io timeouts through though
 	if ((action & (FLG_CL | FLG_RD | FLG_WR | FLG_CN | FLG_WT | FLG_RT | FLG_TM)) == 0) {
-		if ((t->active_flags & action) == 0) {
+		if ((task_atomic_load(&t->active_flags) & action) == 0) {
 			return;
 		}
 	}
@@ -322,7 +337,7 @@ worker_process_notifyq(register struct worker *w)
 {
 #ifdef TFD_POOL_DEBUG
 	// Update straggler debug list
-	if (w == w->instance->instance_worker) {
+	if (w == (struct worker *)task_atomic_load(&w->instance->instance_worker)) {
 		register uint32_t n, k;
 		register struct instance *i = w->instance;
 
@@ -501,16 +516,16 @@ get_next_epoll_timeout_ms(struct worker *w)
 void
 worker_handle_task_event(struct task *t, uint32_t revents)
 {
+	bool handled = false;
+
 	// Handle ERROR/HUP events first
 	if (revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
 		// Shutdown both connection sides and force an IO event
 		// which should make a system call to detect what happened
 		if (revents & (EPOLLERR | EPOLLHUP)) {
-			bool handled = false;
-
 worker_do_io_epoll_fail:
-			t->rd_shut = 1;
-			t->wr_shut = 1;
+			task_atomic_store(&t->rd_shut, 1);
+			task_atomic_store(&t->wr_shut, 1);
 			task_atomic_store(&t->in_epoll, 0);
 			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 			if (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) {
@@ -531,7 +546,7 @@ worker_do_io_epoll_fail:
 		}
 
 		// Must be a RDHUP then
-		t->rd_shut = 1;
+		task_atomic_store(&t->rd_shut, 1);
 		if (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) {
 			task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
 			task_handle_rd_event(t);

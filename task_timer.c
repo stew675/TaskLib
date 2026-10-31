@@ -514,10 +514,14 @@ TASK_timeout_destroy(int64_t tfd)
 		// Standalone timer tasks have no fd or other owner, so destroy the
 		// task itself.  For socket-backed tasks this behaves as a cancel.
 		task_atomic_store(&t->state, TASK_STATE_DESTROY);
-		t->closed = 0;
+		task_atomic_store(&t->closed, 0);
 		queued = task_notify_action(t, FLG_CL, true, true);
 		task_unlock(t, FLG_TD);
 		if (!queued) {
+			if (!lockless_worker(task_atomic_load(&t->worker))) {
+				errno = ENOMEM;
+				return -1;
+			}
 			task_lock(t, FLG_CL);
 			task_do_close_cb(t);
 		}
@@ -628,13 +632,15 @@ TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data,
 
 	if (!task_notify_action(t, FLG_TM, false, true)) {
 		task_atomic_store(&t->state, TASK_STATE_DESTROY);
-		t->closed = 0;
-		task_lock(t, FLG_CL);
-		task_do_close_cb(t);
+		task_atomic_store(&t->closed, 0);
+		if (!task_queue_close(t)) {
+			errno = ENOMEM;
+			return -1;
+		}
 		errno = EOWNERDEAD;
 		return -1;
 	}
-	return t->tfd;
+	return task_atomic_load(&t->tfd);
 } // TASK_timeout_create
 
 

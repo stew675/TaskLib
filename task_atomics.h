@@ -28,7 +28,7 @@
 
 #include <stdint.h>
 
-/* Relaxed atomic load/store.  Works with any integer or pointer type. */
+/* Acquire/release atomic load/store.  Works with any integer or pointer type. */
 #define	task_atomic_load(p)		__atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define	task_atomic_store(p, v)		__atomic_store_n((p), (v), __ATOMIC_RELEASE)
 

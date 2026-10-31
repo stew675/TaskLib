@@ -268,7 +268,7 @@ task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno)
 	t->stride->accept_cb_data = NULL;
 
 	if ((cb == NULL) || t->rd_cancel || (task_atomic_load(&t->state) != TASK_STATE_ACTIVE)) {
-		task_notify_action(t, FLG_CL, false, true);
+		(void)task_queue_close(t);
 		return;
 	}
 
@@ -364,7 +364,6 @@ task_shutdown_listen_children(struct task *parent)
 
 	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
 		struct task *c = i->tfd_pool + n;
-		bool queued;
 
 		if (c == parent) {
 			continue;
@@ -376,17 +375,11 @@ task_shutdown_listen_children(struct task *parent)
 			continue;
 		}
 
-		queued = task_notify_action(c, FLG_CL, true, true);
+		// task_queue_close() only runs teardown inline when this is the
+		// child's owning worker.  If the notification pool is exhausted and
+		// we are not the owner, shutdown's nuke pass is responsible for it.
+		(void)task_queue_close(c);
 		task_unref(c);
-		if (!queued) {
-			// No notification node available.  Shutdown will nuke the task;
-			// during normal operation close it inline so it stops accepting.
-			if (task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN) {
-				continue;
-			}
-			task_lock(c, FLG_CL);
-			task_do_close_cb(c);
-		}
 	}
 } // task_shutdown_listen_children
 
@@ -426,7 +419,7 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	// Assign a worker
 	if (w == NULL) {
 		if ((w = worker_select_io_worker(i, t, outgoing)) == NULL) {
-			task_free(i, t);
+			task_free(i, t, false);
 			errno = ECHILD;
 			return NULL;
 		}
@@ -1296,7 +1289,7 @@ instance_listen_balance(struct task *t)
 			perror("instance_listen_balance->task_raise_event_flag");
 			task_lower_event_flag(nt, (EPOLLIN | EPOLLOUT));
 			// Let the owning worker close the fd and free the task
-			task_notify_action(nt, FLG_CL, false, true);
+			(void)task_queue_close(nt);
 			continue;
 		}
 
@@ -1403,7 +1396,9 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		}
 		return;
 	}
-	t->io_depth = 0;
+	if (lockless_worker(task_atomic_load(&t->worker))) {
+		t->io_depth = 0;
+	}
 
 	queued = task_notify_action(t, FLG_WR, false, true);
 	if (!queued) {
@@ -1483,7 +1478,9 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		}
 		return;
 	}
-	t->io_depth = 0;
+	if (lockless_worker(task_atomic_load(&t->worker))) {
+		t->io_depth = 0;
+	}
 
 	queued = task_notify_action(t, FLG_WR, false, true);
 	if (!queued) {
@@ -1584,7 +1581,9 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		}
 		return;
 	}
-	t->io_depth = 0;
+	if (lockless_worker(task_atomic_load(&t->worker))) {
+		t->io_depth = 0;
+	}
 
 	queued = task_notify_action(t, FLG_RD, false, true);
 	if (!queued) {
@@ -1664,7 +1663,9 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		}
 		return;
 	}
-	t->io_depth = 0;
+	if (lockless_worker(task_atomic_load(&t->worker))) {
+		t->io_depth = 0;
+	}
 
 	queued = task_notify_action(t, FLG_RD, false, true);
 	if (!queued) {
@@ -1781,8 +1782,14 @@ TASK_close(int64_t tfd)
 	task_unlock(t, FLG_CL);
 
 	if (!queued) {
-		// Out of notification nodes: fall back to closing inline.  This is
-		// the only path where a close callback may run on a non-owner.
+		// Out of notification nodes.  Inline teardown is only legal on the
+		// owning worker; a foreign caller reports ENOMEM and leaves the task
+		// in DESTROY for shutdown to reap rather than corrupting the owner's
+		// timer/epoll state.
+		if (!lockless_worker(task_atomic_load(&t->worker))) {
+			errno = ENOMEM;
+			return -1;
+		}
 		task_lock(t, FLG_CL);
 		task_do_close_cb(t);
 	}
@@ -1839,27 +1846,18 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	i = w->instance;
 
 	// A listener must be a fresh socket: no IO may already be in flight.
-	if (t->in_epoll || (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) ||
-	    (task_atomic_load(&t->wr_state) != TASK_WRITE_STATE_IDLE) || (t->fd < 0)) {
+	if (task_atomic_load(&t->in_epoll) || (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) ||
+	    (task_atomic_load(&t->wr_state) != TASK_WRITE_STATE_IDLE) || (task_atomic_load(&t->fd) < 0)) {
 		task_unlock(t, FLG_LI);
 		errno = EBUSY;
 		return -1;
 	}
 
-	// Convert this task to a parent listener type and inform task to expect incoming events
-	t->type = TASK_TYPE_LISTEN;
-	task_atomic_store(&t->rd_state, TASK_READ_STATE_LISTEN);
-	t->listen_child = 0;
-	t->stride->accept_cb = accept_cb;
-	t->stride->accept_cb_data = accept_cb_data;
-	i->is_server = true;
-	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
-		i->all_cpus_seen = true;
-	}
-
-	// Retrieve the local address the listen task is bound to
-	t->addrlen = sizeof(t->stride->addr);
-	if (getsockname(t->fd, (struct sockaddr *)&t->stride->addr, &t->addrlen) < 0) {
+	// Retrieve the local address before mutating any listener state, so a
+	// failure here leaves the task exactly as it was.
+	struct sockaddr_storage addr;
+	socklen_t addrlen = sizeof(addr);
+	if (getsockname(task_atomic_load(&t->fd), (struct sockaddr *)&addr, &addrlen) < 0) {
 		int err = errno;
 		task_unlock(t, FLG_LI);
 		errno = err;
@@ -1871,20 +1869,33 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	// sockets, but do not fail the listen if a family doesn't support them
 	// (e.g. AF_UNIX).
 	int val = 1;
-	(void)setsockopt(t->fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-	(void)setsockopt(t->fd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
+	(void)setsockopt(task_atomic_load(&t->fd), SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+	(void)setsockopt(task_atomic_load(&t->fd), SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
 
-	// Start the listen
-	if (listen(t->fd, TASK_LISTEN_BACKLOG) < 0) {
+	// Start the listen before publishing listener state.  If this fails the
+	// task remains a normal IO task and can be retried or closed cleanly.
+	if (listen(task_atomic_load(&t->fd), TASK_LISTEN_BACKLOG) < 0) {
 		int err = errno;
 		task_unlock(t, FLG_LI);
 		errno = err;
 		return -1;
 	}
 
+	// Commit the listener state only after all fallible setup succeeded.
+	task_atomic_store(&t->type, TASK_TYPE_LISTEN);
+	task_atomic_store(&t->rd_state, TASK_READ_STATE_LISTEN);
+	t->listen_child = 0;
+	t->stride->accept_cb = accept_cb;
+	t->stride->accept_cb_data = accept_cb_data;
+	i->is_server = true;
+	if (i->flags & TASK_FLAGS_AFFINITY_FORCE) {
+		i->all_cpus_seen = true;
+	}
+	t->addrlen = addrlen;
+	memcpy(&t->stride->addr, &addr, addrlen);
+
 	// Listeners do not have IO timeouts.  Make sure of it
 	t->rd_expires_modified = 0;
-	task_atomic_store(&t->rd_state, TASK_READ_STATE_LISTEN);
 
 	// Add to the listeners list before the fd is armed.  Any worker polling
 	// the list will then find a fully initialised listener.
@@ -1904,10 +1915,20 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 		pthread_mutex_lock(&i->listeners_lock);
 		task_remove_list(&w->listeners, t);
 		pthread_mutex_unlock(&i->listeners_lock);
-		task_shutdown_listen_children(t);
-		t->type = TASK_TYPE_IO;
+
+		// Roll the parent back to a plain IO task before dropping FLG_LI.
+		task_atomic_store(&t->type, TASK_TYPE_IO);
 		task_atomic_store(&t->rd_state, TASK_READ_STATE_IDLE);
+		t->stride->accept_cb = NULL;
+		t->stride->accept_cb_data = NULL;
+
+		// Keep a reference across task_unlock() and close the children after
+		// releasing the parent TFD lock: child TFD locks may hash to the same
+		// lock index as the parent's and ticket locks are not recursive.
+		task_ref(t);
 		task_unlock(t, FLG_LI);
+		task_shutdown_listen_children(t);
+		task_unref(t);
 		errno = err;
 		return -1;
 	}

@@ -67,6 +67,8 @@ library unchanged. Do not construct or modify it.
 A `tfd` is valid from creation until the task is closed or destroyed. Stale
 handles are rejected with `EBADF` or `EOWNERDEAD`. The same value is passed to
 callbacks, so it can be compared against the value stored by the application.
+The generation field is 27 bits, so a handle that is retained across more than
+134 million reuses of the same pool slot can eventually alias a new task.
 
 ### Return values and errors
 
@@ -111,7 +113,10 @@ When a timeout fires, the callback receives `result == -1` and `errno` is set to
 ### Threading model
 
 - Task APIs that take a `tfd` can be called from any thread. The library
-  resolves the owning instance from the `tfd`.
+  resolves the owning instance from the `tfd`. Asynchronous IO actions are
+  routed to the owning worker; `bind`, `listen`, `shutdown`, `get_fd` and the
+  timer-control calls execute synchronously on the caller while holding the
+  task's TFD lock.
 - Instance lifecycle calls (`TASK_instance_create()`,
   `TASK_instance_start()`, `TASK_instance_shutdown()`,
   `TASK_instance_wait()`, `TASK_instance_destroy()`) must not race with each

@@ -92,7 +92,8 @@ typedef enum {
 typedef enum {
 	TASK_STATE_UNUSED = 0,		// Idle
 	TASK_STATE_ACTIVE = 1,		// In the FD table
-	TASK_STATE_DESTROY = 2		// Waiting for worker to kill it
+	TASK_STATE_DESTROY = 2,		// Waiting for worker to kill it
+	TASK_STATE_FREEING = 3		// Claimed for recycling; no new references
 } task_state_t;
 
 typedef enum {
@@ -211,11 +212,11 @@ struct task {
 
 	uint32_t		active_flags;		// Worker-processed action flags
 	uint32_t		state;			// Operational state of the task
-	uint32_t			type;			// Type of task
+	_Atomic uint32_t	type;			// Type of task
 	uint32_t			io_depth;		// Direct callback nesting depth
-	int64_t				tfd;			// Task File Descriptor that identifies this task
-	struct worker			*worker;		// The current io worker task is bound to
-	int32_t				fd;			// The actual system socket FD we're working on
+	_Atomic int64_t		tfd;			// Task File Descriptor that identifies this task
+	struct worker			*_Atomic worker;	// The current io worker task is bound to
+	_Atomic int32_t		fd;			// The actual system socket FD we're working on
 	int32_t				epfd;			// The worker epoll FD we're registered with
 	uint32_t			events;			// Active poll/epoll events
 	uint32_t		notifyqlen;		// Number of (worker-owned) notifyq entries
@@ -296,10 +297,10 @@ __attribute__ ((aligned(64))) struct task_timer tm_tt;		// 32 bytes - Timer Info
 	// (the previous packed bitfield could).
 	uint32_t			rd_state;
 	uint32_t			wr_state;
-	uint32_t		rd_shut;
-	uint32_t		wr_shut;
-	uint32_t		rd_cancel;
-	uint32_t		wr_cancel;
+	_Atomic uint32_t		rd_shut;
+	_Atomic uint32_t		wr_shut;
+	_Atomic uint32_t		rd_cancel;
+	_Atomic uint32_t		wr_cancel;
 	uint32_t		rt_cancelled;
 	uint32_t		wt_cancelled;
 	uint32_t		rd_expires_modified;
@@ -308,7 +309,7 @@ __attribute__ ((aligned(64))) struct task_timer tm_tt;		// 32 bytes - Timer Info
 	uint32_t		in_epoll;
 	uint32_t		registered_fd;
 	uint32_t		listen_child;
-	uint32_t		closed;			// Final close cleanup has run
+	_Atomic uint32_t		closed;			// Final close cleanup has run
 	uint32_t			unused_32;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
@@ -341,8 +342,8 @@ __attribute__ ((aligned(64))) uint32_t	type;
 	struct ntfyq			*notifyq_head;
 	struct ntfyq			*notifyq_tail;
 	struct ntfyq			*notifyq_batches;
-	struct ntfyq			*notifyq_locked_head;
-	struct ntfyq			*notifyq_locked_tail;
+	struct ntfyq			*_Atomic notifyq_locked_head;
+	struct ntfyq			*_Atomic notifyq_locked_tail;
 
 __attribute__ ((aligned(64))) void	*timer_queue;
 	int64_t				colt_next_us;
@@ -357,8 +358,8 @@ __attribute__ ((aligned(64))) void	*timer_queue;
 	int32_t				evfd;
 
 __attribute__ ((aligned(64))) pthread_t	thr;
-	worker_state_t			state;
-	worker_state_t			old_state;
+	_Atomic uint32_t		state;
+	_Atomic uint32_t		old_state;
 	struct task			*listeners;
 	struct pollfd 			*pollfds;
 	struct instance			*instance;
@@ -367,8 +368,8 @@ __attribute__ ((aligned(64))) pthread_t	thr;
 
 	// Blocking worker call info.  The state flags live at the start of this
 	// cache line so the third worker cache line above remains exactly 64 bytes.
-__attribute__ ((aligned(64))) uint32_t	started;	// Thread has been created
-	uint32_t			notified;	// Wakeup already pending (atomic)
+__attribute__ ((aligned(64))) _Atomic uint32_t started;	// Thread has been created
+	_Atomic uint32_t		notified;	// Wakeup already pending (atomic)
 	void				(*work_func)(void *work_data);
 	void				*work_data;
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
@@ -564,7 +565,7 @@ void worker_timer_scan_colt(struct worker *w);
 void task_destroy_timeouts(struct task *t);
 void task_remove_list(struct task **head, struct task *t);
 void task_init(struct instance *i, struct task *t);
-void task_free(struct instance *i, struct task *t);
+void task_free(struct instance *i, struct task *t, bool published);
 void task_maybe_free(struct task *t);
 void task_action_done(struct task *t, task_action_flag_t action);
 bool task_action_is_meta(task_action_flag_t action);
@@ -585,6 +586,9 @@ int notifier_write(int fd);
 int worker_notify(struct worker *w);
 int instance_notify(struct instance *i);
 struct ntfyq * worker_notify_get_free_ntfyq(struct worker *w);
+struct ntfyq * worker_notify_reserve_locked(struct worker *w);
+void worker_notify_queue_locked(struct worker *w, struct ntfyq *tq, struct task *t, task_action_flag_t action);
+bool task_queue_close(struct task *t);
 bool task_notify_action(struct task *t, task_action_flag_t action, bool force_close_q, bool force_q);
 int64_t task_calculate_io_timeout(int64_t us_from_now);
 void task_activate_rd_timeout(struct worker *w, struct task *t);

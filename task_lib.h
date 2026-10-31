@@ -33,7 +33,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
-#include <ck_pr.h>
+#include "task_atomics.h"
 #include <signal.h>
 #include <execinfo.h>
 #include <sched.h>

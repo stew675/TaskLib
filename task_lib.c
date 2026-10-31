@@ -941,8 +941,8 @@ task_free(struct task *t)
 {
 	register struct instance *i = __thr_current_instance;
 
-	ck_pr_dec_64(&i->tfd_pool_used);
-	ck_pr_dec_64(&t->worker->num_tasks);
+	task_atomic_dec(&i->tfd_pool_used);
+	task_atomic_dec(&t->worker->num_tasks);
 	task_destroy_timeouts(t);
 	task_init(t);
 
@@ -1077,7 +1077,7 @@ task_unlock(struct task *t, register task_action_flag_t action)
 		return;
 	}
 
-	if (ck_pr_load_64(&t->notifyqlen_locked)) {
+	if (task_atomic_load(&t->notifyqlen_locked)) {
 		tfd_unlock(tfdi);
 		return;
 	}
@@ -1124,7 +1124,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		return NULL;
 	}
 
-	i = (struct instance *)ck_pr_load_ptr(&instances[ti]);
+	i = (struct instance *)task_atomic_load(&instances[ti]);
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
 		return NULL;
@@ -1233,7 +1233,7 @@ task_nuke(uint32_t tfdi)
 		t->fd = -1;
 	}
 	task_init(t);
-	ck_pr_dec_64(&__thr_current_instance->tfd_pool_used);
+	task_atomic_dec(&__thr_current_instance->tfd_pool_used);
 } // task_nuke
 
 
@@ -1266,7 +1266,7 @@ task_get_free_task(void)
 	t->state = TASK_STATE_ACTIVE;
 	pthread_mutex_unlock(&i->cpulock);
 
-	ck_pr_inc_64(&i->tfd_pool_used);
+	task_atomic_inc(&i->tfd_pool_used);
 
 	return t;
 } // task_get_free_task
@@ -1652,13 +1652,13 @@ worker_notify(struct worker *w)
 	// may notify several different workers in succession; using thread-local
 	// state here caused all but the first notification to be suppressed.
 	// If two threads race and both write, eventfd coalesces the writes.
-	if (ck_pr_load_32(&w->notified)) {
+	if (task_atomic_load(&w->notified)) {
 		return 0;
 	}
-	ck_pr_store_32(&w->notified, 1);
+	task_atomic_store(&w->notified, 1);
 
 	if (notifier_write(w->evfd) < 0) {
-		ck_pr_store_32(&w->notified, 0);
+		task_atomic_store(&w->notified, 0);
 		return -1;
 	}
 	return 0;
@@ -1806,7 +1806,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		}
 		w->notifyq_tail = tq;
 	} else {
-		ck_pr_inc_64(&t->notifyqlen_locked);
+		task_atomic_inc(&t->notifyqlen_locked);
 
 		worker_lock(w);
 		if ((tq = w->freeq_locked) != NULL) {
@@ -1818,7 +1818,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 			tq = worker_notify_get_free_ntfyq(w);
 			if (tq == NULL) {
 				assert(tq != NULL);	// Out of memory
-				ck_pr_dec_64(&t->notifyqlen_locked);
+				task_atomic_dec(&t->notifyqlen_locked);
 				return false;
 			}
 			worker_lock(w);
@@ -2351,8 +2351,8 @@ worker_cleanup(struct worker *w)
 				if (t->notifyqlen) {
 					t->notifyqlen--;
 				}
-			} else if (ck_pr_load_64(&t->notifyqlen_locked)) {
-				ck_pr_dec_64(&t->notifyqlen_locked);
+			} else if (task_atomic_load(&t->notifyqlen_locked)) {
+				task_atomic_dec(&t->notifyqlen_locked);
 			}
 
 			// The task may have migrated since this action was queued.
@@ -2707,7 +2707,7 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	t->stride->close_cb = close_cb;
 	t->stride->close_cb_data = close_cb_data;
 	t->fd = fd;
-	ck_pr_inc_64(&w->num_tasks);
+	task_atomic_inc(&w->num_tasks);
 
 	// task_get_free_tfd() already locked the task for us
 	return t;
@@ -3623,7 +3623,7 @@ worker_handle_event(struct worker *w, uint32_t events)
 	}
 
 	if (events & (EPOLLERR | EPOLLHUP)) {
-		ck_pr_store_32(&w->notified, 0);
+		task_atomic_store(&w->notified, 0);
 		close(w->evfd);
 		w->evfd = -1;
 		worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
@@ -3640,11 +3640,11 @@ worker_handle_event(struct worker *w, uint32_t events)
 				continue;
 			}
 			if (errno == EAGAIN) {
-				ck_pr_store_32(&w->notified, 0);
+				task_atomic_store(&w->notified, 0);
 				break;
 			}
 			// serious read error.  Close our eventfd and set worker to shutdown
-			ck_pr_store_32(&w->notified, 0);
+			task_atomic_store(&w->notified, 0);
 			close(w->evfd);
 			w->evfd = -1;
 			worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
@@ -3652,7 +3652,7 @@ worker_handle_event(struct worker *w, uint32_t events)
 		}
 
 		// We picked up the notification
-		ck_pr_store_32(&w->notified, 0);
+		task_atomic_store(&w->notified, 0);
 		break;
 	}
 } // worker_handle_event
@@ -3666,8 +3666,8 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	t->migrations++;
 	t->stride->preferred_worker = NULL;
 	t->worker = tw;
-	ck_pr_dec_64(&w->num_tasks);
-	ck_pr_inc_64(&tw->num_tasks);
+	task_atomic_dec(&w->num_tasks);
+	task_atomic_inc(&tw->num_tasks);
 
 	// Decouple any timeout from this worker
 	if (t->tm_tt.next) {
@@ -3882,7 +3882,7 @@ worker_process_notifyq(register struct worker *w)
 
 			notifyq = tq->next;
 			if (locked) {
-				ck_pr_dec_64(&t->notifyqlen_locked);
+				task_atomic_dec(&t->notifyqlen_locked);
 			} else {
 				// Return the node to the worker's own free list
 				tq->next = w->freeq;
@@ -4160,7 +4160,7 @@ worker_loop_blocking(void *arg)
 		if (w->state != WORKER_STATE_BLOCKING) {
 			ssize_t len;
 
-			ck_pr_store_32(&w->notified, 0);
+			task_atomic_store(&w->notified, 0);
 			len = read(w->evfd, (void *)&c, sizeof(c));
 			if (len < 0) {
 				if (errno == EINTR) {
@@ -4170,7 +4170,7 @@ worker_loop_blocking(void *arg)
 				worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
 				break;
 			}
-			ck_pr_store_32(&w->notified, 0);
+			task_atomic_store(&w->notified, 0);
 
 			if ((w->state == WORKER_STATE_SHUTTING_DOWN) ||
 			    (w->state == WORKER_STATE_DEAD)) {
@@ -4680,8 +4680,8 @@ instance_destroy(struct instance *i)
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
 	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-		if (ck_pr_load_ptr(&instances[ti]) == i) {
-			ck_pr_store_ptr(&instances[ti], NULL);
+		if (task_atomic_load(&instances[ti]) == i) {
+			task_atomic_store(&instances[ti], NULL);
 			break;
 		}
 	}
@@ -4867,7 +4867,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
-	ck_pr_store_ptr(&instances[ti], i);
+	task_atomic_store(&instances[ti], i);
 
 	return i;
 
@@ -6007,7 +6007,7 @@ TASK_instance_destroy(int32_t ti)
 	instance_nuke_tasks(i);
 
 	instance_destroy(i);
-	ck_pr_store_ptr(&instances[ti], NULL);
+	task_atomic_store(&instances[ti], NULL);
 	pthread_mutex_unlock(&creation_lock);
 
 	if (shutdown_cb) {

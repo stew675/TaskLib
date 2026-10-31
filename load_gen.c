@@ -53,7 +53,7 @@ loadgen_close_cb(int64_t tfd, void *user_data)
 	if (lg) {
 //		fprintf(stderr, "loadgen close_cb called: Received/Delivered %lu/%lu bytes, Read/Write Calls: %u/%u\n", lg->received, lg->delivered, lg->num_rd_calls, lg->num_wr_calls);
 		free(lg);
-		ck_pr_dec_64(&numgens);
+		task_atomic_dec(&numgens);
 	}
 } // loadgen_close_cb
 
@@ -82,7 +82,7 @@ loadgen_read_cb(int64_t tfd, void *buf, ssize_t result, void *user_data)
 		return;
 	}
 
-	ck_pr_add_64(&total_received, result);
+	task_atomic_add(&total_received, result);
 	lg->received += result;
 	if (lg->done) {
 		if (lg->delivered == lg->received) {
@@ -136,7 +136,7 @@ loadgen_write_cb(int64_t tfd, const void *buf, ssize_t result, void *user_data)
 		return;
 	}
 
-	ck_pr_add_64(&total_deliver, result);
+	task_atomic_add(&total_deliver, result);
 	lg->delivered += result;
 	loadgen_start_wr(lg);
 } // loadgen_write_cb
@@ -194,7 +194,7 @@ loadgen_connect(struct loadgen *lg)
 	// We've got an address to connect to.  create, bind, connect
 	if ((lg->tfd = TASK_socket_create(task_instance, AF_INET, SOCK_STREAM, 0, (void *)lg, loadgen_close_cb)) < 0) {
 		perror("loadgen_connect->TASK_socket_create");
-		ck_pr_dec_64(&numgens);
+		task_atomic_dec(&numgens);
 		free(lg);
 		return;
 	}
@@ -242,11 +242,11 @@ loadgen_start(int64_t tfd, int64_t lateness_us, void *user_data)
 
 		lg->wr_buf = wr_buf;
 
-		ck_pr_inc_64(&num_connects);
-		ck_pr_inc_64(&numgens);
+		task_atomic_inc(&num_connects);
+		task_atomic_inc(&numgens);
 
 		max_outstanding = MAX_TCP_MEM / (numgens + 100);
-		ap = ck_pr_load_64(&num_connects) % num_addrs;
+		ap = task_atomic_load(&num_connects) % num_addrs;
 		lg->addr = (struct sockaddr_in *)conn_addrs[ap];
 		loadgen_connect(lg);
 	}

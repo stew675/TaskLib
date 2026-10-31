@@ -4,20 +4,33 @@
 // Author: Stew Forster (stew675@gmail.com)
 //
 // Ideas present within derived from multiple sources and many...many hours of testing
+//
+// The head and tail of the ticket queue are updated with C11 atomics (<stdatomic.h>) instead
+// of inline x86 assembly, so the implementation builds and runs on any architecture that
+// provides atomic 32-bit integers.  The operations used are seq_cst read-modify-writes and
+// seq_cst loads: the latter are required to avoid a missed futex wakeup (the waiter bumps
+// tail and then reads head, while the releaser bumps head and then reads tail).
 
 #ifndef __TICKET_LOCK_H_
 #define __TICKET_LOCK_H_
 
 #include <stdint.h>
+#include <stdatomic.h>
+
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#define	ticket_cpu_relax()	_mm_pause()
+#else
+#define	ticket_cpu_relax()	atomic_signal_fence(memory_order_seq_cst)
+#endif
 
 // Gather statistics about the number of calls, contentions, and spins.  Slows down locking by ~10%
 // #define __TICKET_LOCK_STATISTICS
 
 typedef struct {
 	struct __ticket {
-		volatile uint32_t head; // On little-endian architectures, head must appear before tail
-		uint32_t	  tail; // On big-endian architectures, tail must appear before head
+		_Atomic uint32_t head;	// Ticket currently being served
+		_Atomic uint32_t tail;	// Ticket to be handed to the next acquirer
 	} tickets;
 #ifdef __TICKET_LOCK_STATISTICS
 	volatile uint64_t	calls;
@@ -31,34 +44,36 @@ typedef struct {
 
 static inline void ticket_lock(register ticketlock_t *lock)
 {
-	struct __ticket tkt = { .tail = 1 };
+	register uint32_t tkt_tail, tkt_head;
 #ifdef __TICKET_LOCK_STATISTICS
 	register uint64_t contentions = 0, spins = 0;
 #endif
 
-	// Atomically adds tkt (with head = 0, tail = 1) to lock->tickets, and stores the result
-	// back into tkt while generating an acquire style memory fence to the CPU bus
-	asm __volatile__ ("lock xaddq %q0, %1\n" : "+r"(tkt), "+m"(lock->tickets) : : "memory", "cc");
-	while (tkt.tail - tkt.head) {
+	// Take the next ticket.  fetch_add returns the previous value of tail, which
+	// is the ticket this acquirer now owns
+	tkt_tail = atomic_fetch_add_explicit(&lock->tickets.tail, 1, memory_order_seq_cst);
+	tkt_head = atomic_load_explicit(&lock->tickets.head, memory_order_acquire);
+	while (tkt_tail - tkt_head) {
 #ifdef __TICKET_LOCK_STATISTICS
 		contentions = 1;
 #endif
-		// It's slightly faster for the uncontested path to calculate tkt.head here
-		tkt.head = tkt.tail - tkt.head;
+		// It's slightly faster for the uncontested path to calculate the queue
+		// distance here
+		tkt_head = tkt_tail - tkt_head;
 
 		// It's also slightly faster when contesting to use > 2 than > 1
-		if (tkt.head > 2) {
+		if (tkt_head > 2) {
 #ifdef __TICKET_LOCK_STATISTICS
-			spins += tkt.head;
+			spins += tkt_head;
 #endif
-			for (_mm_pause(); --tkt.head; _mm_pause());
+			for (ticket_cpu_relax(); --tkt_head; ticket_cpu_relax());
 		} else {
 #ifdef __TICKET_LOCK_STATISTICS
 			spins++;
 #endif
-			_mm_pause();
+			ticket_cpu_relax();
 		}
-		tkt.head = lock->tickets.head;
+		tkt_head = atomic_load_explicit(&lock->tickets.head, memory_order_acquire);
 	}
 #ifdef __TICKET_LOCK_STATISTICS
 	lock->calls++;
@@ -69,7 +84,9 @@ static inline void ticket_lock(register ticketlock_t *lock)
 
 static inline void ticket_unlock(register ticketlock_t *lock)
 {
-	// Atomically adds 1 to lock->tickets.head while generating a release style memory fence
-	asm __volatile__ ("lock addl %1, %0\n" : "+m"(lock->tickets.head) : "ri"(1) : "memory", "cc");
+	// Hand the lock to the next ticket in the queue.  The release ordering
+	// publishes everything done inside the critical section to the next owner,
+	// which pairs with the acquire loads in ticket_lock()
+	atomic_fetch_add_explicit(&lock->tickets.head, 1, memory_order_release);
 }
 #endif

@@ -37,7 +37,7 @@ close_cb(int64_t tfd, void *user_data)
 //		fprintf(stderr, "Connection Completed: tfd=%lu, Received/Delivered %lu/%lu bytes\n", tfd, e->received, e->delivered);
 		free(e);
 	}
-	ck_pr_dec_32(&num_conns);
+	task_atomic_dec(&num_conns);
 } // close_cb
 
 
@@ -130,10 +130,10 @@ accept_cb(int64_t new_tfd, void *data)
 		return;
 	}
 
-	ck_pr_inc_32(&total_conns);
+	task_atomic_inc(&total_conns);
 	e->tfd = new_tfd;
 	TASK_socket_set_close_cb(new_tfd, e, close_cb);
-	ck_pr_inc_32(&num_conns);
+	task_atomic_inc(&num_conns);
 	start_read(e);
 } // accept_cb
 

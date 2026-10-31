@@ -6,13 +6,13 @@ A high-performance, multi-threaded, event-driven IO library.
 
 ## Building
 
-TaskLib requires [Concurrency Kit](https://github.com/concurrencykit/ck) for its
-lock-free atomic primitives. The Makefile looks for the headers under
-`/usr/local/include` by default. Override `CK_CFLAGS` if they are installed
-elsewhere:
+TaskLib has no third-party dependencies. Its lock-free atomic primitives are
+implemented in `task_atomics.h` on top of the compiler's `__atomic` builtins,
+which are available in GCC 4.7+ and Clang 3.1+. Only a C compiler and pthreads
+are required:
 
 ```sh
-make CK_CFLAGS=-I/path/to/ck/include
+make
 ```
 
 The main targets are `echoes` and `load_gen`; `*-asan` and `*-prof` variants are

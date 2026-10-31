@@ -8,20 +8,42 @@ A high-performance, multi-threaded, event-driven IO library.
 
 TaskLib has no third-party dependencies. Its lock-free atomic primitives are
 implemented in `task_atomics.h` on top of the compiler's `__atomic` builtins,
-which are available in GCC 4.7+ and Clang 3.1+. Only a C compiler and pthreads
-are required:
+which are available in GCC 4.7+ and Clang 3.1+. A C compiler, pthreads and a
+Linux/glibc userspace (epoll, eventfd, futex, `SO_INCOMING_CPU`) are required:
 
 ```sh
 make
 ```
 
-The main targets are `echoes` and `load_gen`; `*-asan` and `*-prof` variants are
-also provided.
+This builds the `echoes` and `load_gen` examples. The sanitizer and profiling
+variants are opt-in because they need a working ASan or profiling runtime:
+
+```sh
+make asan
+make prof
+make check     # regression tests for the task-lifetime/concurrency fixes
+```
+
+### Source layout
+
+| File | Contents |
+| --- | --- |
+| `task_lib.h` | Public API |
+| `task_internal.h` | Private types, cache-line layout, shared prototypes |
+| `task_core.c` | Task pool, TFD lookup/lifetime, notifications, workers, instances |
+| `task_worker.c` | Worker loops, epoll dispatch, notify queues, migration |
+| `task_io.c` | Socket/IO/connect/listen APIs and their callbacks |
+| `task_timer.c` | Timer cool-off lists, paired-heap integration, timeout API |
+| `task_atomics.h` | `__atomic` wrappers |
+| `stewticket_thr.h` | Adaptive futex ticket lock |
+| `ph.c` / `ph.h` | Paired heap |
 
 ## Features
 
 - An easy to use, high-performance, event-driven asynchronous IO API.
-- A fully event-driven, multi-threaded, MP-safe framework.
+- A fully event-driven, multi-threaded framework.  Public APIs may be called
+  from any thread; operations that are not issued by the owning worker are
+  queued to it so all task state and epoll manipulation has a single owner.
 - Socket connect and IO calls with automated timeout handling.
 - Fully distributed connection acceptance across IO workers.
 - A lightweight, fast timer queue built on the paired heap library at
@@ -95,7 +117,11 @@ When a timeout fires, the callback receives `result == -1` and `errno` is set to
   `TASK_instance_wait()`, `TASK_instance_destroy()`) must not race with each
   other for the same `ti`. The application must serialize them.
 - Socket, timer, connect, read, write, and close callbacks run on the task's
-  owning worker thread. Do not block inside them.
+  owning worker thread.  If an IO call is made from that worker's thread and
+  can complete immediately it runs inline (still on the owning worker).  If an
+  operation cannot even be started (invalid arguments, EBADF, EOWNERDEAD), the
+  error callback is invoked synchronously on the calling thread.  Do not block
+  inside any callback.
 - The accept callback runs on the worker that accepted the connection. The new
   task may later migrate to its preferred worker.
 - The blocking work callback (`work_cb_func`) runs on the instance notification
@@ -137,7 +163,10 @@ close for every live task, and stops its workers. Close callbacks are suppressed
 during shutdown.
 
 The `shutdown_cb`, if supplied, is stored and invoked later by
-`TASK_instance_wait()` or `TASK_instance_destroy()`.
+`TASK_instance_wait()` or `TASK_instance_destroy()`.  Close callbacks are
+suppressed during shutdown, so per-task application state must be released from
+the `shutdown_cb` (or by another application-owned tracker) rather than relying
+on `close_cb`.
 
 Returns `0`, or `-1` with `errno` set.
 
@@ -304,7 +333,8 @@ Queues a migration so that the `from_tfd` task moves to the same worker as
 `to_tfd`. This can reduce cross-thread latency between related tasks.
 
 Returns `0`, or `-1` with `errno` set. `EALREADY` means both tasks already share
-a worker.
+a worker. `EINVAL` means `to_tfd` belongs to a different instance; `EBADF` means
+the target handle is stale or not active.
 
 ---
 

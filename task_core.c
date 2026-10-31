@@ -1,0 +1,2444 @@
+#include "task_internal.h"
+
+// Per-library global state
+__thread struct worker	*__thr_current_worker = NULL;
+__thread int64_t		w__curtime_us = 0;
+
+struct instance		*instances[TASK_MAX_INSTANCES];
+bool			initialised = false;
+size_t			__page_size;
+pthread_mutex_t		creation_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// ---------------------------------------------------------------------------------------------//
+//					DEBUGGING STUFF						//
+//----------------------------------------------------------------------------------------------//
+
+void
+task_dump(struct task *t)
+{
+	fprintf(stderr, "Task Dump for TFD = %u\n", (unsigned)TFD_TO_INDEX(t->tfd));
+	fprintf(stderr, "Expiry us = %ld\n", t->tm_tt.expiry_us);
+	fprintf(stderr, "Type = ");
+	switch(t->type) {
+	case	TASK_TYPE_NONE:
+		fprintf(stderr, "NONE, State = ");
+		break;
+	case	TASK_TYPE_IO:
+		fprintf(stderr, "IO, State = ");
+		break;
+	case	TASK_TYPE_TIMER:
+		fprintf(stderr, "TIMER, State = ");
+		break;
+	case	TASK_TYPE_CONNECT:
+		fprintf(stderr, "CONNECT, State = ");
+		break;
+	case	TASK_TYPE_LISTEN:
+		if (t->listen_child) {
+			fprintf(stderr, "LISTEN_CHILD, State = ");
+		} else {
+			fprintf(stderr, "LISTEN_PARENT, State = ");
+		}
+		break;
+	default:
+		fprintf(stderr, "BAD TYPE, State = ");
+		break;
+	}
+	switch (task_atomic_load(&t->state)) {
+	case	TASK_STATE_UNUSED:
+		fprintf(stderr, "UNUSED\n");
+		break;
+	case	TASK_STATE_ACTIVE:
+		fprintf(stderr, "ACTIVE\n");
+		break;
+	case	TASK_STATE_DESTROY:
+		fprintf(stderr, "DESTROY\n");
+		break;
+	default:
+		fprintf(stderr, "BAD STATE\n");
+		break;
+	}
+	fprintf(stderr, "FD = %d, migrations = %d\n",
+			t->fd, t->migrations);
+	fprintf(stderr, "\n");
+} // task_dump
+
+
+// Uncomment the following #define to allow for inserting backtraces for debugging
+//#define TASK_POOL_OP_DEBUG
+#ifdef TASK_POOL_OP_DEBUG
+#define	DO_BT	do_bt()
+#else
+#define	DO_BT	true
+#endif
+
+#ifdef TASK_POOL_OP_DEBUG
+#define BT_BUF_SIZE 256
+
+static __thread int bufpos = 0;
+static __thread char buf[65536];
+
+static void
+do_bt(void)
+{
+	int j, nptrs;
+	void *buffer[BT_BUF_SIZE];
+	char **strings;
+
+	nptrs = backtrace(buffer, BT_BUF_SIZE);
+	sprintf(buf + bufpos, "backtrace() returned %d addresses\n", nptrs);
+	bufpos += strlen(buf + bufpos);
+
+	/* The call backtrace_symbols_fd(buffer, nptrs, STDOUT_FILENO)
+	   would produce similar output to the following: */
+
+	strings = backtrace_symbols(buffer, nptrs);
+	if (strings == NULL) {
+		perror("backtrace_symbols");
+		exit(EXIT_FAILURE);
+	}
+
+	for (j = 0; j < nptrs; j++) {
+		sprintf(buf + bufpos, "%s\n", strings[j]);
+		bufpos += strlen(buf + bufpos);
+	}
+
+	write(1, buf, bufpos);
+	bufpos = 0;
+
+	free(strings);
+}
+#endif
+
+// Get the microsecond current time into the given int64_t pointer space
+int64_t
+get_time_us(time_precision_t prec)
+{
+	struct timespec ts[1];
+	int r;
+
+	if ((prec == TASK_TIME_COARSE) && (__thr_current_worker != NULL) && (w__curtime_us > 0)) {
+		return w__curtime_us;
+	}
+	r = clock_gettime(CLOCK_MONOTONIC, ts);
+	if (r == 0) {
+		return (TASK_S_TO_US(ts->tv_sec) + TASK_NS_TO_US(ts->tv_nsec));
+	}
+	return w__curtime_us;
+} // get_time_us
+
+
+
+void
+task_remove_list(register struct task **head, register struct task *t)
+{
+	register struct task *scan;
+
+	if ((t == NULL) || (*head == NULL)) {
+		return;
+	}
+	if (*head == t) {
+		*head = t->task_next;
+		return;
+	}
+	for (scan = *head; scan->task_next != NULL; scan = scan->task_next) {
+		if (scan->task_next == t) {
+			scan->task_next = t->task_next;
+			t->task_next = NULL;
+			return;
+		}
+	}
+} // task_remove_list
+
+
+
+void
+task_init(struct instance *i, struct task *t)
+{
+	uint32_t tfdi = (uint32_t)(t - i->tfd_pool);
+	uint32_t iteration = (TFD_TO_ITERATION(t->tfd) + 1) & TFD_ITERATION_MASK;
+	uint32_t refs = task_atomic_load(&t->api_refs);
+
+	memset(t, 0, sizeof(struct task));
+	task_atomic_store(&t->api_refs, refs);
+	memset(i->tfd_stride + tfdi, 0, sizeof(struct task_stride));
+
+	t->stride = i->tfd_stride + tfdi;
+	task_atomic_store(&t->state, TASK_STATE_UNUSED);
+	__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
+	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
+	t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
+	t->wr_expires_in_us = TIMER_TIME_DESTROY;
+	t->rd_expires_in_us = TIMER_TIME_DESTROY;
+	task_atomic_store(&t->rd_state, TASK_READ_STATE_IDLE);
+	task_atomic_store(&t->wr_state, TASK_WRITE_STATE_IDLE);
+	t->closed = 0;
+
+	// Calculate and assign the new tfd.  The generation ensures stale handles
+	// referencing this slot are rejected by task_lookup()
+	t->tfd = TFD_MAKE(i->ti, iteration, tfdi);
+} // task_init
+
+
+
+void
+task_free(struct instance *i, struct task *t)
+{
+	struct worker *w = t->worker;
+
+	if (w) {
+		task_atomic_dec(&w->num_tasks);
+	}
+	task_atomic_dec(&i->tfd_pool_used);
+	task_destroy_timeouts(t);
+	task_init(i, t);
+
+	pthread_mutex_lock(&i->cpulock);
+	t->task_next = i->free_tasks;
+	i->free_tasks = t;
+	pthread_mutex_unlock(&i->cpulock);
+} // task_free
+
+
+
+// Release a task slot back to the pool if nothing else refers to it.  The
+// caller must not hold the TFD lock.  This is the single place where a task
+// is recycled, so the state transition to UNUSED and the free-list insertion
+// can never race with another release.
+void
+task_maybe_free(struct task *t)
+{
+	struct instance *i;
+	struct worker *w;
+	uint32_t tfdi;
+
+	w = t->worker;
+	if (w == NULL) {
+		return;
+	}
+	i = w->instance;
+
+	if (task_atomic_load(&t->state) != TASK_STATE_DESTROY) {
+		return;
+	}
+	if (task_atomic_load(&t->active_flags) != 0) {
+		return;
+	}
+	if (task_atomic_load(&t->notifyqlen) != 0) {
+		return;
+	}
+	if (task_atomic_load(&t->notifyqlen_locked) != 0) {
+		return;
+	}
+	if (task_atomic_load(&t->api_refs) != 0) {
+		return;
+	}
+	if (task_atomic_load(&t->closed) == 0) {
+		return;
+	}
+
+	tfdi = TFD_TO_INDEX(t->tfd);
+	tfd_lock(t, tfdi);
+
+	if ((task_atomic_load(&t->state) != TASK_STATE_DESTROY) ||
+	    (task_atomic_load(&t->active_flags) != 0) ||
+	    (task_atomic_load(&t->notifyqlen) != 0) ||
+	    (task_atomic_load(&t->notifyqlen_locked) != 0) ||
+	    (task_atomic_load(&t->api_refs) != 0) ||
+	    (task_atomic_load(&t->closed) == 0) ||
+	    (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) ||
+	    (task_atomic_load(&t->wr_state) != TASK_WRITE_STATE_IDLE)) {
+		tfd_unlock(t, tfdi);
+		return;
+	}
+
+	// Mark the slot unused while we still hold the TFD lock so a lookup on
+	// another thread cannot observe a stale ACTIVE state between here and
+	// task_free()
+	task_atomic_store(&t->state, TASK_STATE_UNUSED);
+	tfd_unlock(t, tfdi);
+	task_free(i, t);
+} // task_maybe_free
+
+
+
+// Drop an internal action flag.  If the task was in the DESTROY state and this
+// was the last reference, the task is recycled.
+void
+task_action_done(struct task *t, register task_action_flag_t action)
+{
+	if (action) {
+		task_atomic_and(&t->active_flags, ~(uint32_t)action);
+	}
+	task_maybe_free(t);
+} // task_action_done
+
+
+
+// Actions that only need a short-lived mutual-exclusion bit and are never
+// queued to a worker.
+bool
+task_action_is_meta(task_action_flag_t action)
+{
+	return (action & (FLG_LU | FLG_LI | FLG_MG | FLG_BND | FLG_CCB |
+			  FLG_TC | FLG_TD | FLG_TS | FLG_GFD | FLG_SD |
+			  FLG_DBG)) != 0;
+} // task_action_is_meta
+
+
+
+// Acquire a task for a public API operation.  Read/write/connect use a
+// lock-free reservation of the relevant side (CAS IDLE -> PENDING), which is
+// the hot path and must not take the TFD lock.  Meta operations and close use
+// the TFD lock because they mutate listener/timer/close state.
+//
+// On success an API reference has been taken; the caller must call
+// task_unlock() exactly once.
+struct task *
+task_lookup(register int64_t tfd, register task_action_flag_t action)
+{
+	register uint32_t tfdi;
+	register uint32_t tfd_iter;
+	register uint32_t ti;
+	register struct instance *i;
+	register struct task *t;
+	register struct worker *w;
+	bool locked;
+
+	// Validate the TFD before using any of its fields
+	if (tfd < 0) {
+		errno = ERANGE;
+		return NULL;
+	}
+
+	tfdi = TFD_TO_INDEX(tfd);
+	tfd_iter = TFD_TO_ITERATION(tfd);
+	ti = TFD_TO_INSTANCE(tfd);
+
+	if (ti >= TASK_MAX_INSTANCES) {
+		errno = ERANGE;
+		return NULL;
+	}
+
+	i = (struct instance *)task_atomic_load(&instances[ti]);
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		errno = EBADF;
+		return NULL;
+	}
+
+	if ((instance_state_t)task_atomic_load(&i->state) > INSTANCE_STATE_RUNNING) {
+		errno = EOWNERDEAD;
+		return NULL;
+	}
+
+	if (tfdi >= i->tfd_pool_size) {
+		errno = ERANGE;
+		return NULL;
+	}
+
+	t = i->tfd_pool + tfdi;
+	w = t->worker;
+	if (w == NULL) {
+		errno = EBADF;
+		return NULL;
+	}
+
+	locked = ((action & (FLG_RD | FLG_WR | FLG_CO)) == 0);
+
+	if (locked) {
+		tfd_lock(t, tfdi);
+		if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) ||
+		    (TFD_TO_ITERATION(t->tfd) != tfd_iter)) {
+			tfd_unlock(t, tfdi);
+			errno = EBADF;
+			return NULL;
+		}
+	} else {
+		// Pin the slot first: a concurrent close may otherwise recycle it
+		// between the state check and the reservation below.
+		task_ref(t);
+		if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) ||
+		    (TFD_TO_ITERATION(t->tfd) != tfd_iter) ||
+		    (t->worker == NULL)) {
+			task_unref(t);
+			errno = EBADF;
+			return NULL;
+		}
+	}
+
+	if (action == FLG_CL) {
+		// Claim the task for close.  A second closer fails with EBADF.
+		task_atomic_store(&t->state, TASK_STATE_DESTROY);
+		t->rd_shut = 1;
+		t->wr_shut = 1;
+		t->rd_cancel = 1;
+		t->wr_cancel = 1;
+		__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
+		t->closed = 0;
+	} else if (action & FLG_RD) {
+		uint32_t expected = TASK_READ_STATE_IDLE;
+
+		if (!__atomic_compare_exchange_n(&t->rd_state, &expected,
+						 TASK_READ_STATE_PENDING, false,
+						 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+			if (!locked) task_unref(t);
+			errno = EINPROGRESS;
+			return NULL;
+		}
+	} else if (action & (FLG_WR | FLG_CO)) {
+		uint32_t expected = TASK_WRITE_STATE_IDLE;
+
+		if (!__atomic_compare_exchange_n(&t->wr_state, &expected,
+						 TASK_WRITE_STATE_PENDING, false,
+						 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+			if (!locked) task_unref(t);
+			errno = EINPROGRESS;
+			return NULL;
+		}
+	} else if (task_action_is_meta(action)) {
+		if (task_atomic_fetch_or(&t->meta_flags, (uint32_t)action) & (uint32_t)action) {
+			tfd_unlock(t, tfdi);
+			errno = EINPROGRESS;
+			return NULL;
+		}
+	}
+
+	if (locked) {
+		task_atomic_inc(&t->api_refs);
+	}
+	errno = 0;
+	return t;
+} // task_lookup
+
+
+
+// Release a task acquired by task_lookup().  The lock is only held for meta
+// operations and close; the IO fast path uses an atomic reference count and
+// a CAS-reserved state instead.
+void
+task_unlock(struct task *t, register task_action_flag_t action)
+{
+	uint32_t tfdi = TFD_TO_INDEX(t->tfd);
+	uint32_t refs;
+	bool locked = ((action & (FLG_RD | FLG_WR | FLG_CO)) == 0);
+
+	if (locked) {
+		if (task_action_is_meta(action)) {
+			task_atomic_and(&t->meta_flags, ~(uint32_t)action);
+		}
+	}
+
+	// A _PENDING state means the API failed before committing the operation
+	if ((action & FLG_RD) && (task_atomic_load(&t->rd_state) == TASK_READ_STATE_PENDING)) {
+		task_atomic_store(&t->rd_state, TASK_READ_STATE_IDLE);
+	}
+	if ((action & (FLG_WR | FLG_CO)) && (task_atomic_load(&t->wr_state) == TASK_WRITE_STATE_PENDING)) {
+		task_atomic_store(&t->wr_state, TASK_WRITE_STATE_IDLE);
+	}
+
+	refs = __atomic_sub_fetch(&t->api_refs, 1, __ATOMIC_SEQ_CST);
+
+	if (locked) {
+		tfd_unlock(t, tfdi);
+	}
+	if ((refs == 0) && (task_atomic_load(&t->state) == TASK_STATE_DESTROY)) {
+		task_maybe_free(t);
+	}
+} // task_unlock
+
+
+// Claim a task for destruction from a context that does not own it (instance
+// shutdown, parent-listener teardown).  The task is marked DESTROY under its
+// TFD lock and an API reference is taken so it cannot be recycled between the
+// claim and the queued FLG_CL notification.
+bool
+task_claim_close(struct instance *i, struct task *t)
+{
+	uint32_t tfdi = TFD_TO_INDEX(t->tfd);
+
+	itfd_lock(i, tfdi);
+	if ((task_atomic_load(&t->state) == TASK_STATE_UNUSED) ||
+	    (t->worker == NULL)) {
+		itfd_unlock(i, tfdi);
+		return false;
+	}
+	if (task_atomic_load(&t->state) == TASK_STATE_ACTIVE) {
+		task_atomic_store(&t->state, TASK_STATE_DESTROY);
+		t->rd_shut = 1;
+		t->wr_shut = 1;
+		t->rd_cancel = 1;
+		t->wr_cancel = 1;
+		__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
+		t->closed = 0;
+	}
+	task_ref(t);
+	itfd_unlock(i, tfdi);
+	return true;
+} // task_claim_close
+
+
+
+bool
+task_claim_listen_child(struct instance *i, struct task *c, int64_t parent_tfd)
+{
+	uint32_t tfdi = TFD_TO_INDEX(c->tfd);
+
+	itfd_lock(i, tfdi);
+	if ((c->type != TASK_TYPE_LISTEN) || (c->listen_child == 0) ||
+	    (task_atomic_load(&c->state) != TASK_STATE_ACTIVE) ||
+	    (c->stride->parent_tfd != parent_tfd)) {
+		tfd_unlock(c, tfdi);
+		return false;
+	}
+	task_atomic_store(&c->state, TASK_STATE_DESTROY);
+	c->rd_shut = 1;
+	c->wr_shut = 1;
+	c->rd_cancel = 1;
+	c->wr_cancel = 1;
+	c->closed = 0;
+	task_ref(c);
+	itfd_unlock(i, tfdi);
+	return true;
+} // task_claim_listen_child
+
+
+
+// Utterly blows a task away.  Intended only to be called in shutdown scenarios
+// when the task's worker is dead, otherwise it's unsafe as all get out
+void
+task_nuke(struct instance *i, uint32_t tfdi)
+{
+	register struct task *t = i->tfd_pool + tfdi;
+
+	task_destroy_timeouts(t);
+	if ((t->fd >= 0) && (t->registered_fd == false)) {
+		int flags[1] = {0};
+
+		ioctl(t->fd, FIONBIO, flags);
+		shutdown(t->fd, SHUT_RDWR);
+		close(t->fd);
+		t->fd = -1;
+	}
+	task_init(i, t);
+	task_atomic_dec(&i->tfd_pool_used);
+} // task_nuke
+
+
+
+// Finds a free task in the task pool, and returns the TFD for it
+struct task *
+task_get_free_task(struct instance *i)
+{
+	register struct task *t;
+
+	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+		errno = EOWNERDEAD;
+		return NULL;
+	}
+
+	// Also ensure we're not at our max open tfd limit
+	if ((uint64_t)task_atomic_load(&i->tfd_pool_used) > (uint64_t)(i->tfd_pool_size * 0.8)) {
+		errno = EMFILE;
+		return NULL;
+	}
+	
+	pthread_mutex_lock(&i->cpulock);
+	if ((t = i->free_tasks) == NULL) {
+		pthread_mutex_unlock(&i->cpulock);
+		errno = EMFILE;
+		return NULL;
+	}
+	i->free_tasks = t->task_next;
+	assert(task_atomic_load(&t->state) == TASK_STATE_UNUSED);
+	task_atomic_store(&t->state, TASK_STATE_ACTIVE);
+	pthread_mutex_unlock(&i->cpulock);
+
+	task_atomic_inc(&i->tfd_pool_used);
+
+	return t;
+} // task_get_free_task
+
+
+// ---------------------------------------------------------------------------------------------//
+// 				   CPU Affinity Managment API					//
+// ---------------------------------------------------------------------------------------------//
+
+
+int
+get_cpu_of_sock(struct instance *i, int sock)
+{
+	int cpu;
+	socklen_t cpusz = sizeof(cpu);
+
+	if (i->cpus == NULL) {
+		return -1;
+	}
+
+	if (getsockopt(sock, SOL_SOCKET, SO_INCOMING_CPU, &cpu, &cpusz) < 0) {
+		return -1;
+	}
+
+	if ((cpu < 0) || (cpu >= i->num_cpus)) {
+		return -1;
+	}
+
+	pthread_mutex_lock(&i->cpulock);
+	if (i->cpus[cpu].seen == true) {
+		pthread_mutex_unlock(&i->cpulock);
+		return cpu;
+	}
+	i->cpus[cpu].seen = true;
+	i->num_cpus_seen++;
+	pthread_mutex_unlock(&i->cpulock);
+
+	if (i->num_cpus_seen == i->num_cpus) {
+		i->all_cpus_seen = true;
+	}
+	return cpu;
+} // get_cpu_of_sock
+
+
+
+int
+get_cpu_adjusted_for_direction(struct instance *i, int cpu, bool is_client)
+{
+	// Adjust the cpu pick based on the direction
+	// Outgoing connections prefer odd CPUs
+	// Incoming connections prefer even CPUs
+	if (is_client) {
+		if (i->num_cpus > 1) {
+			if ((cpu & 0x1) == 0) cpu++;
+		}
+	} else {
+		if ((cpu & 0x1) == 1) cpu--;
+	}
+
+	return cpu;
+} // get_cpu_adjusted_for_direction
+
+
+
+struct worker *
+get_affined_worker_from_direction(struct instance *i, bool is_client)
+{
+	struct worker *w = NULL;
+	uint64_t least = UINT64_MAX;
+	uint32_t nio = i->num_workers_io;
+
+	// Try to find the next worker with the least tasks that matches our direction
+	for (uint32_t wn = 0; wn < nio; wn++) {
+		struct worker *tw = NULL;
+
+		tw = i->io_workers[wn];
+		if (is_client) {
+			if ((tw->affined_cpu & 0x1)) {
+				uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
+				if (ntasks < least) {
+					least = ntasks;
+					w = tw;
+				}
+			}
+		} else {
+			if ((tw->affined_cpu & 0x1) == 0) {
+				uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
+				if (ntasks < least) {
+					least = ntasks;
+					w = tw;
+				}
+			}
+		}
+	}
+
+	// Now re-scan the opposite direction.  Try to find the least worker
+	// with less than 2/3 of the tasks of the least directional worker,
+	// and use that instead.  There's no point excessively overloading
+	// worker threads if there are other worker threads that aren't doing
+	// much. In this way, we are essentially implementing a "preferred
+	// direction", without doing so with total exclusivity
+	least = (least / 3) * 2;
+
+	for (uint32_t wn = 0; wn < nio; wn++) {
+		struct worker *tw = NULL;
+
+		tw = i->io_workers[wn];
+		if (is_client) {
+			if ((tw->affined_cpu & 0x1) == 0) {
+				uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
+				if (ntasks < least) {
+					least = ntasks;
+					w = tw;
+				}
+			}
+		} else {
+			if ((tw->affined_cpu & 0x1)) {
+				uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
+				if (ntasks < least) {
+					least = ntasks;
+					w = tw;
+				}
+			}
+		}
+	}
+
+	return w;
+} // get_affined_worker_from_direction
+
+
+
+void
+set_worker_cpu_affinity(struct worker *w, int tcpu)
+{
+	cpu_set_t acs[1];
+
+	// Set the new worker's CPU affinity to its matching CPU
+	CPU_ZERO(acs);
+	CPU_SET(tcpu, acs);
+	if (pthread_setaffinity_np(w->thr, sizeof(cpu_set_t), acs) != 0) {
+		perror("pthread_setaffinity_np failed");
+	}
+} // set_worker_cpu_affinity
+
+
+
+void
+set_one_workers_affinity(struct instance *i, int cpu)
+{
+	struct worker *w = NULL;
+	int row = 0, tcpu = 0;
+	bool outgoing;
+
+	// Not ideal that we're holding a mutex for this amount of time
+	// but we only do it once for each IO worker, ever, so it's okay
+
+	pthread_mutex_lock(&i->cpulock);
+
+	// Pick a direction based on observed operation.  If we're both
+	// client and server, just alternate directions each time
+	if (i->is_client && i->is_server) {
+		if (i->flip) {
+			outgoing = true;
+			i->flip = false;
+		} else {
+			outgoing = false;
+			i->flip = true;
+		}
+	} else if (i->is_client) {
+		outgoing = true;
+	} else {
+		outgoing = false;
+	}
+
+	cpu = get_cpu_adjusted_for_direction(i, cpu, outgoing);
+
+	// Find a worker that isn't affined yet
+	for (uint32_t n = 0; n < i->num_workers_io; n++) {
+		struct worker *c;
+		c = i->io_workers[n];
+		if (c->affined_cpu < 0) {
+			w = c;
+			break;
+		}
+	}
+	if (w == NULL) {
+		i->all_io_workers_affined = true;
+		pthread_mutex_unlock(&i->cpulock);
+		return;
+	}
+
+	// A single-CPU system needs special handling because the pairs-of-CPUs
+	// scan below would perform zero iterations and walk off the row array.
+	if (i->num_cpus < 2) {
+		for (row = 0; row < i->num_cpu_rows; row++) {
+			if (i->cpus[0].workers[row] == NULL) {
+				break;
+			}
+		}
+		if (row >= i->num_cpu_rows) {
+			i->all_io_workers_affined = true;
+			pthread_mutex_unlock(&i->cpulock);
+			return;
+		}
+		i->cpus[0].num_workers++;
+		i->cpus[0].workers[row] = w;
+		w->affined_cpu = 0;
+		pthread_mutex_unlock(&i->cpulock);
+		set_worker_cpu_affinity(w, 0);
+		return;
+	}
+
+	// We found a worker to affine, now bind it to a CPU
+	// Scan row by row.  Fill out a row fully before moving on
+	for (row = 0; row < i->num_cpu_rows; row++) {
+		int s, sl = (i->num_cpus / 2);
+
+		// Scan by 2's starting from adjusted CPU
+		for (s = 0; s < sl; s++) {
+			tcpu = (cpu + (s * 2)) % i->num_cpus;
+			if (i->cpus[tcpu].workers[row] == NULL) {
+				break;
+			}
+		}
+		if (s < sl) {
+			break;
+		}
+
+		// Try the other set of odds or evens
+		for (s = 0; s < sl; s++) {
+			tcpu = (cpu + 1 + (s * 2)) % i->num_cpus;
+			if (i->cpus[tcpu].workers[row] == NULL) {
+				break;
+			}
+		}
+		if (s < sl) {
+			break;
+		}
+	}
+
+	// We got a target CPU (tcpu)!  Bind it to the row (row) and set the CPU affinity
+	if ((row >= i->num_cpu_rows) || (i->cpus[tcpu].workers == NULL) ||
+	    (i->cpus[tcpu].workers[row] != NULL)) {
+		// No free slot found (should not happen with a consistent layout)
+		i->all_io_workers_affined = true;
+		pthread_mutex_unlock(&i->cpulock);
+		return;
+	}
+	i->cpus[tcpu].num_workers++;
+	i->cpus[tcpu].workers[row] = w;
+	w->affined_cpu = tcpu;
+
+	// We can finally release the lock!
+	pthread_mutex_unlock(&i->cpulock);
+
+	// Actually set the affinity now of w to tcpu
+	set_worker_cpu_affinity(w, tcpu);
+} // set_one_workers_affinity
+
+
+
+void
+task_set_initial_preferred_worker(struct instance *i, struct task *t, bool is_client)
+{
+	struct worker *tw;
+
+	if (i->flags & TASK_FLAGS_AFFINITY_DISABLE) {
+		t->stride->preferred_worker = NULL;
+		return;
+	}
+
+	// If tw is not NULL and it's not already our
+	// worker then make it the preferred one
+	// Incoming TCP socket CPU affinity will be
+	// set when the task actually migrates
+	tw = get_affined_worker_from_direction(i, is_client);
+
+	t->stride->preferred_worker = NULL;
+	if (tw && (t->worker == NULL)) {
+		t->stride->preferred_worker = tw;
+
+		// At least set the incoming affinity for the TCP connection
+		// Doesn't matter if this fails.  It's only a hint to the TCP stack
+		if (i->flags & TASK_FLAGS_AFFINITY_NET) {
+			if (setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &tw->affined_cpu, sizeof(tw->affined_cpu)) < 0) {
+				return;
+			}
+		}
+		return;
+	}
+
+	if (tw && (tw != t->worker)) {
+		t->stride->preferred_worker = tw;
+		return;
+	}
+
+	if (tw == NULL) {
+		struct worker *w = t->worker;
+
+		// At least set the incoming affinity for the TCP connection
+		// Doesn't matter if this fails.  It's only a hint to the TCP stack
+		if (i->flags & TASK_FLAGS_AFFINITY_NET) {
+			if (setsockopt(t->fd, SOL_SOCKET, SO_INCOMING_CPU, &w->affined_cpu, sizeof(w->affined_cpu)) < 0) {
+				return;
+			}
+		}
+		return;
+	}
+} // task_set_initial_preferred_worker
+
+
+
+void
+worker_learn_cpu_affinity(struct task *t)
+{
+	struct instance *i = t->worker->instance;
+	int cpu;
+
+	if (i->flags & TASK_FLAGS_AFFINITY_DISABLE) {
+		return;
+	}
+
+	if ((i->flags & TASK_FLAGS_AFFINITY_CPU) == 0){
+		return;
+	}
+
+	// We need to continue observing
+	if((cpu = get_cpu_of_sock(i, t->fd)) < 0) {
+		return;
+	}
+
+	if (i->all_cpus_seen) {
+		set_one_workers_affinity(i, cpu);
+	}
+} // worker_learn_cpu_affinity
+
+
+
+int
+notifier_write(int fd)
+{
+	uint64_t m = 1;
+	ssize_t r;
+
+	if (fd < 0) {
+		return -1;
+	}
+
+	do {
+		r = write(fd, &m, sizeof (m));
+	} while ((r == -1) && (errno == EINTR));
+
+	if (r != sizeof (m)) {
+		return -1;
+	}
+
+	return 0;
+} // notifier_write
+
+
+
+// Notify worker to wake up.  This quickly breaks it out of the epoll_wait() call
+// when we want it to notice something has changed (like us adding new tasks to it)
+int
+worker_notify(struct worker *w)
+{
+	if (w == NULL) {
+		return -1;
+	}
+
+	// The pending-notification flag is per worker, not per thread.  A thread
+	// may notify several different workers in succession; using thread-local
+	// state here caused all but the first notification to be suppressed.
+	// If two threads race and both write, eventfd coalesces the writes.
+	if (task_atomic_load(&w->notified)) {
+		return 0;
+	}
+	task_atomic_store(&w->notified, 1);
+
+	if (notifier_write(w->evfd) < 0) {
+		task_atomic_store(&w->notified, 0);
+		return -1;
+	}
+	return 0;
+} // worker_notify
+
+
+
+int
+instance_notify(struct instance *i)
+{
+	if (i == NULL) {
+		return -1;
+	}
+
+	worker_notify(i->instance_worker);
+	return notifier_write(i->evfd);
+} // instance_notify
+
+
+
+struct ntfyq *
+worker_notify_get_free_ntfyq(register struct worker *w)
+{
+	register struct ntfyq *freeq_head = NULL, *freeq_tail = NULL;
+	register struct ntfyq *tq = NULL, *ntq;
+	register size_t batch_size, n;
+
+	// Grab an aligned system page of memory, and we'll dice it up ourselves
+	if ((tq = aligned_alloc(__page_size, __page_size)) == NULL) {
+		return NULL;
+	}
+	memset(tq, 0, __page_size);
+	batch_size = __page_size / sizeof(struct ntfyq);
+
+	// Add all our new entries to a local list.  We can minimise
+	// the time we hold the worker lock for by doing it this way
+
+	for (n = 2; n < batch_size; n++) {
+		ntq = tq + n;
+		if (freeq_tail == NULL) {
+			freeq_head = ntq;
+		} else {
+			freeq_tail->next = ntq;
+		}
+		freeq_tail = ntq;
+		ntq->next = NULL;
+	}
+
+	// We don't use the first entry, but instead stick it on a worker
+	// list so we have a list of what memory to pass to free() later
+	worker_lock(w);
+	tq->next = w->notifyq_batches;
+	w->notifyq_batches = tq;
+	if (lockless_worker(w)) {
+		// Don't need to hold the lock if we're on the worker
+		worker_unlock(w);
+		freeq_tail->next = w->freeq;
+		w->freeq = freeq_head;
+	} else {
+		freeq_tail->next = w->freeq_locked;
+		w->freeq_locked = freeq_head;
+		worker_unlock(w);
+	}
+
+	return tq + 1;
+} // worker_notify_get_free_ntfyq
+
+
+
+// Must be called with the task lock held. 
+bool
+task_notify_action(register struct task *t, register task_action_flag_t action, bool force_close_q, bool force_q)
+{
+	register struct worker *w = t->worker;
+	register struct ntfyq *tq = NULL;
+	uint32_t state;
+
+	(void)force_close_q;
+
+	if (w == NULL) {		// This can be true sometimes during shutdown
+		return false;
+	}
+
+	state = task_atomic_load(&t->state);
+	if (action == FLG_CL) {
+		// Close is always allowed once a task has entered DESTROY, and it is
+		// the action that performs the transition from ACTIVE.
+		if (state == TASK_STATE_UNUSED) {
+			return false;
+		}
+		if (state == TASK_STATE_ACTIVE) {
+			task_atomic_store(&t->state, TASK_STATE_DESTROY);
+		}
+		t->rd_shut = 1;
+		t->wr_shut = 1;
+		t->rd_cancel = 1;
+		t->wr_cancel = 1;
+	} else if (state != TASK_STATE_ACTIVE) {
+		return false;
+	}
+
+	// Do not lock IO timeout flags.  Their presence is already implied by their parent
+	// FLG_RD/FLG_WR flags. Also don't lock for connecting events, write flags cover this
+	if ((action & (FLG_RD | FLG_WR | FLG_RT | FLG_WT | FLG_CN | FLG_TM)) == 0) {
+		// Only call task_lock() if we actually need to
+		if ((task_atomic_load(&t->active_flags) & action) == 0) {
+			task_lock(t, action);
+		}
+	}
+
+	if (lockless_worker(w)) {
+		// Try to process the action immediately if it's allowable.  We always queue
+		// closes to give other activities a chance to realise the task is finished
+		if (force_q == false) {
+			if (((action & (FLG_CN | FLG_MG | FLG_CL | FLG_WR | FLG_RD)) == 0)) {
+				worker_process_one_action(w, t, action);
+				return true;
+			}
+			if (action & (FLG_RD | FLG_WR)) {
+				if (t->io_depth < TASK_MAX_IO_DEPTH) {
+					worker_process_one_action(w, t, action);
+					return true;
+				}
+			}
+		}
+
+		// Allocate a notification node.  Running out is reported as a
+		// failure to the caller rather than aborting the process.
+		if ((tq = w->freeq)) {
+			w->freeq = tq->next;
+		} else {
+			tq = worker_notify_get_free_ntfyq(w);
+			if (tq == NULL) {
+				return false;
+			}
+		}
+
+		*tq = (struct ntfyq) { .t = t, .action = action, .next = NULL };
+		task_atomic_inc(&t->notifyqlen);
+
+		if (w->notifyq_tail == NULL) {
+			w->notifyq_head = tq;
+		} else {
+			w->notifyq_tail->next = tq;
+		}
+		w->notifyq_tail = tq;
+	} else {
+		task_atomic_inc(&t->notifyqlen_locked);
+
+		worker_lock(w);
+		if ((tq = w->freeq_locked) != NULL) {
+			w->freeq_locked = tq->next;
+		} else {
+			// Can't be holding the worker lock when
+			// calling worker_notify_get_free_ntfyq
+			worker_unlock(w);
+			tq = worker_notify_get_free_ntfyq(w);
+			if (tq == NULL) {
+				task_atomic_dec(&t->notifyqlen_locked);
+				return false;
+			}
+			worker_lock(w);
+		}
+
+		*tq = (struct ntfyq) { .t = t, .action = action, .next = NULL };
+
+		if (w->notifyq_locked_tail == NULL) {
+			w->notifyq_locked_head = tq;
+		} else {
+			w->notifyq_locked_tail->next = tq;
+		}
+		w->notifyq_locked_tail = tq;
+		worker_unlock(w);
+	}
+
+	// worker_notify() itself checks whether a wakeup is already pending
+	worker_notify(w);
+	return true;
+} // task_notify_action
+
+
+
+// Destroy all the notifications on the worker's notification queue
+void
+worker_cleanup(struct worker *w)
+{
+	struct ntfyq *owned, *locked, *tq;
+
+	// Bulk grab the queues to process.  This minimises lock contention/churn
+	owned = w->notifyq_head;
+	w->notifyq_head = NULL;
+	w->notifyq_tail = NULL;
+	w->freeq = NULL;
+
+	worker_lock(w);
+	locked = w->notifyq_locked_head;
+	w->notifyq_locked_head = NULL;
+	w->notifyq_locked_tail = NULL;
+	w->freeq_locked = NULL;
+	worker_unlock(w);
+
+	// Process both lists.  The notification count is dropped *after* the
+	// action is processed so that it keeps the task alive for the duration
+	// of the callback.  That is what allows task_maybe_free() to be the only
+	// place that recycles a task.
+	for (int pass = 0; pass < 2; pass++) {
+		for (tq = (pass == 0) ? owned : locked; tq != NULL; tq = tq->next) {
+			struct task *t = tq->t;
+			task_action_flag_t action = tq->action;
+
+			if (t == NULL) {
+				continue;
+			}
+
+			// The task may have migrated since this action was queued.
+			// Do not close it from the wrong thread; its new owner will
+			// process its own queued close, or the final nuke will reap it.
+			if (t->worker == w) {
+				if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) && (action != FLG_CL)) {
+					task_action_done(t, action);
+				} else if ((action & (FLG_RT | FLG_WT)) == 0) {
+					// At shutdown everything still queued is closed.
+					task_lock(t, FLG_CL);
+					if ((action & FLG_CL) == 0) {
+						task_action_done(t, action);
+					}
+					task_do_close_cb(t);
+				}
+			}
+
+			if (pass == 0) {
+				task_atomic_dec(&t->notifyqlen);
+			} else {
+				task_atomic_dec(&t->notifyqlen_locked);
+			}
+			if (task_atomic_load(&t->state) == TASK_STATE_DESTROY) {
+				task_maybe_free(t);
+			}
+		}
+	}
+
+	// Notification batches are deliberately *not* freed here.  During
+	// shutdown another worker may still notify a task owned by this worker;
+	// queued nodes may point into these batches.  worker_destroy() frees
+	// them once every worker thread has stopped.
+} // worker_cleanup
+
+
+
+// Free up a worker's state entirely
+void
+worker_destroy(struct worker *w)
+{
+	struct instance *i;
+	struct ntfyq *tq;
+
+	if (w == NULL) return;
+	i = w->instance;
+
+	// Make sure the thread has actually exited before freeing its state.
+	// The self-join guard covers the hard-shutdown path.
+	if (w->started) {
+		if (!pthread_equal(pthread_self(), w->thr)) {
+			pthread_join(w->thr, NULL);
+		}
+		w->started = 0;
+	}
+
+	// Remove from instance's list of IO workers
+	if (w->type == WORKER_TYPE_IO) {
+		for (uint32_t n = 0; n < i->num_workers_io; n++) {
+			if (i->io_workers[n] == w) {
+				i->io_workers[n] = NULL;
+				break;
+			}
+		}
+	}
+
+	// While technically 0 is a valid fd number, that's also stdin, and we're assuming that is still there
+	// and will never have been chosen for any of the worker's fd's
+	if (w->evfd >= 0) {
+		close(w->evfd);
+		w->evfd = -1;
+	}
+	// Free any notification batches not already released by worker_cleanup()
+	while ((tq = w->notifyq_batches) != NULL) {
+		w->notifyq_batches = tq->next;
+		free(tq);
+	}
+	if (w->timer_queue) {
+		pheap_destroy(w->timer_queue, NULL);
+		w->timer_queue = NULL;
+	}
+	if (w->gepfd >= 0) {
+		close(w->gepfd);
+		w->gepfd = -1;
+	}
+	if (w->pollfds) {
+		free(w->pollfds);
+		w->pollfds = NULL;
+		w->max_pollfds = 0;
+	}
+	if (w->events) {
+		free(w->events);
+		w->events = NULL;
+		w->max_events = 0;
+	}
+
+	pthread_mutex_destroy(&w->lock);
+
+	free(w->poll_tasks);
+	free(w);
+	w = NULL;
+} // worker_destroy
+
+
+
+// Selects an io worker to send a task to.  We just do a round robin selection
+struct worker *
+worker_select_io_worker(struct instance *i, struct task *t, bool outgoing)
+{
+	struct worker *w = NULL;
+	int n, nio;
+	uint64_t least = UINT64_MAX;
+
+	// Try CPU affinity method for worker selection first
+	if (t && i->all_io_workers_affined && (t->fd >= 0)) {
+		task_set_initial_preferred_worker(i, t, outgoing);
+		if ((w = t->stride->preferred_worker) != NULL) {
+			t->stride->preferred_worker = NULL;
+			return w;
+		}
+	}
+
+	// Select the worker with the least number of tasks
+	nio = i->num_workers_io;
+	for (n = 0; n < nio; n++) {
+		struct worker *tw = i->io_workers[n];
+
+		if (tw == NULL) {
+			continue;
+		}
+		if ((worker_state_t)task_atomic_load(&tw->state) > WORKER_STATE_RUNNING) {
+			continue;
+		}
+		uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
+		if (ntasks < least) {
+			least = ntasks;
+			w = tw;
+		}
+	}
+	return w;
+} // worker_select_io_worker
+
+
+
+// Choose the first running IO worker we find to attach to
+int
+instance_assign_worker(struct instance *i)
+{
+	struct worker *w;
+
+	if ((w = worker_select_io_worker(i, NULL, false)) == NULL) {
+		// No available workers
+		task_atomic_store(&i->instance_worker, NULL);
+		errno = ECHILD;
+		return -1;
+	}
+	task_atomic_store(&i->instance_worker, w);
+	return 0;
+} // instance_assign_worker
+
+
+
+void
+worker_set_state(struct worker *w, worker_state_t new_state)
+{
+	struct instance *i;
+
+	instance_lock(w->instance);
+
+	// First handle lock failure for a hard instance shutdown scenario
+	if ((i = w->instance) == NULL) {
+		task_atomic_store(&w->old_state, (uint32_t)task_atomic_load(&w->state));
+		task_atomic_store(&w->state, (uint32_t)(new_state));
+		if (new_state == WORKER_STATE_DEAD) {
+			worker_destroy(w);
+		}
+		return;
+	}
+
+
+	// If new state is same as old state, we have nothing to do
+	if (w->state == new_state) {
+		instance_unlock(i);
+		if ((new_state == WORKER_STATE_NOTIFYING) ||
+		    (new_state == WORKER_STATE_SHUTTING_DOWN) ||
+		    (new_state == WORKER_STATE_DEAD)) {
+			instance_notify(i);
+		}
+		return;
+	}
+
+	// Enforce inability to move to a new state if old state was WORKER_STATE_DEAD
+	if (w->old_state == WORKER_STATE_DEAD) {
+		// Ensure that the current state is WORKER_STATE_LIMBO
+		assert(w->state == WORKER_STATE_LIMBO);
+		instance_unlock(i);
+		return;
+	}
+
+	// Remove from old state list
+	switch(w->state) {
+	case WORKER_STATE_LIMBO:
+		// Do nothing. It shouldn't be attached to any list
+		break;
+	case WORKER_STATE_CREATED:
+		TAILQ_REMOVE(&i->workers_created, w, list);
+		break;
+	case WORKER_STATE_IDLE:
+		i->num_blocking_idle--;
+		TAILQ_REMOVE(&i->workers_idle, w, list);
+		break;
+	case WORKER_STATE_RUNNING:
+		TAILQ_REMOVE(&i->workers_running, w, list);
+		break;
+	case WORKER_STATE_BLOCKING:
+		TAILQ_REMOVE(&i->workers_blocking, w, list);
+		break;
+	case WORKER_STATE_NOTIFYING:
+		TAILQ_REMOVE(&i->workers_notify, w, list);
+		break;
+	case WORKER_STATE_SHUTTING_DOWN:
+		TAILQ_REMOVE(&i->workers_shutdown, w, list);
+		break;
+	case WORKER_STATE_DEAD:
+		// The only valid state to move into from WORKER_STATE_DEAD
+		// is WORKER_STATE_LIMBO.  Enforce that here
+		TAILQ_REMOVE(&i->workers_dead, w, list);
+		new_state = WORKER_STATE_LIMBO;
+		break;
+	default:
+		assert(0);
+	}
+
+	task_atomic_store(&w->old_state, (uint32_t)task_atomic_load(&w->state));
+
+	switch(new_state) {
+	case WORKER_STATE_LIMBO:
+		// Do nothing. It shouldn't be attached to any list
+		break;
+	case WORKER_STATE_CREATED:
+		TAILQ_INSERT_TAIL(&i->workers_created, w, list);
+		break;
+	case WORKER_STATE_IDLE:
+		i->num_blocking_idle++;
+		TAILQ_INSERT_TAIL(&i->workers_idle, w, list);
+		break;
+	case WORKER_STATE_RUNNING:
+		TAILQ_INSERT_TAIL(&i->workers_running, w, list);
+		break;
+	case WORKER_STATE_BLOCKING:
+		TAILQ_INSERT_TAIL(&i->workers_blocking, w, list);
+		break;
+	case WORKER_STATE_NOTIFYING:
+		TAILQ_INSERT_TAIL(&i->workers_notify, w, list);
+		break;
+	case WORKER_STATE_SHUTTING_DOWN:
+		TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
+		break;
+	case WORKER_STATE_DEAD:
+		TAILQ_INSERT_TAIL(&i->workers_dead, w, list);
+		// A dead blocking worker no longer counts against the pool limit
+		if ((w->type == WORKER_TYPE_BLOCKING) && (i->num_blocking_workers > 0)) {
+			i->num_blocking_workers--;
+		}
+		break;
+	default:
+		assert(0);
+	}
+
+	task_atomic_store(&w->state, (uint32_t)(new_state));
+
+	// Move the instance to a new worker if we need to
+	if ((task_atomic_load(&i->instance_worker) != NULL) &&
+	    (task_atomic_load(&i->instance_worker) == w)) {
+		if (task_atomic_load(&w->state) != WORKER_STATE_RUNNING) {
+			instance_assign_worker(i);
+		}
+	}
+
+	instance_unlock(i);
+
+	// Notify instance of a worker state change as required
+	if ((new_state == WORKER_STATE_NOTIFYING) ||
+	    (new_state == WORKER_STATE_SHUTTING_DOWN) ||
+	    (new_state == WORKER_STATE_DEAD)) {
+		instance_notify(i);
+	}
+} // worker_set_state
+
+
+
+int
+worker_start(struct worker *w)
+{
+	if ((w->type != WORKER_TYPE_IO) && (w->type != WORKER_TYPE_BLOCKING)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (w->type == WORKER_TYPE_BLOCKING) {
+		// Only create the thread once.  Reused idle workers already have a
+		// thread blocked on their eventfd and only need a wakeup.
+		if (!w->started) {
+			worker_set_state(w, WORKER_STATE_BLOCKING);
+			if (pthread_create(&w->thr, NULL, worker_loop_blocking, w) != 0) {
+				goto worker_start_failed;
+			}
+			w->started = 1;
+		}
+		worker_notify(w);
+		return 0;
+	} 
+
+	if (w->type == WORKER_TYPE_IO) {
+		worker_set_state(w, WORKER_STATE_RUNNING);
+		// Create worker thread for handling task requests
+		if (pthread_create(&w->thr, NULL, worker_loop_io, w) != 0) {
+			goto worker_start_failed;
+		}
+		w->started = 1;
+		worker_notify(w);
+		return 0;
+	} 
+
+worker_start_failed:
+	worker_set_state(w, WORKER_STATE_DEAD);
+	errno = ECHILD;
+	return -1;
+} // worker_start
+
+
+
+// Create a new worker state and initialise it
+struct worker *
+worker_create(struct instance *i, int worker_type)
+{
+	register struct worker *w = NULL;
+	register size_t sz;
+	pthread_mutexattr_t attr;
+	int num_pages = 3;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+
+	if ((worker_type != WORKER_TYPE_IO) && (worker_type != WORKER_TYPE_BLOCKING)) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	for (sz = 1; sz < sizeof(struct worker); sz += sz);
+	// Create the worker state itself
+	if ((w = aligned_alloc(sz, sz)) == NULL) {
+		return NULL;
+	}
+	memset(w, 0, sz);
+	// Initialise the fields worker_destroy() needs before any allocation can
+	// fail.  memset() would otherwise leave type 0 (IO) and instance NULL.
+	w->instance = i;
+	w->type = worker_type;
+	w->affined_cpu = -1;
+	w->gepfd = -1;
+	w->evfd = -1;
+	pthread_mutex_init(&w->lock, &attr);
+
+	if ((w->events = aligned_alloc(__page_size, (__page_size * num_pages))) == NULL) {
+		goto worker_create_failed;
+	}
+	w->max_events = (__page_size * num_pages) / sizeof(struct epoll_event);
+	w->num_events = w->max_events;
+
+	if ((w->pollfds = aligned_alloc(__page_size, __page_size)) == NULL) {
+		goto worker_create_failed;
+	}
+	w->max_pollfds = __page_size / sizeof(struct pollfd);
+	if ((w->poll_tasks = calloc(w->max_pollfds, sizeof(struct task *))) == NULL) {
+		goto worker_create_failed;
+	}
+
+	// Now initialise the worker state
+	task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_LIMBO));
+
+	if (w->type == WORKER_TYPE_IO) {
+		if ((w->gepfd = epoll_create1(0)) < 0) {
+			goto worker_create_failed;
+		}
+
+		// Create event fd for task event loop notifications
+		if ((w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
+			// eventfd will set errno
+			goto worker_create_failed;
+		} else {
+			// Register worker notification event fd against the worker epoll fd
+			// Do not use EPOLLET here since we don't do selective re-arming
+			struct epoll_event ev = {.data.ptr = NULL, .events = EPOLLIN };
+
+			if (epoll_ctl(w->gepfd, EPOLL_CTL_ADD, w->evfd, &ev) < 0) {
+				// epoll_ctl will set errno
+				goto worker_create_failed;
+			}
+		}
+	} else if (w->type == WORKER_TYPE_BLOCKING) {
+		// Blocking workers use a blocking eventfd and just wait on that instead of epoll_wait
+		if ((w->evfd = eventfd(0, 0)) < 0) {
+			// eventfd will set errno
+			goto worker_create_failed;
+		}
+	} else {
+		errno = EINVAL;
+		goto worker_create_failed;
+	}
+
+	// Create timer queue for the worker. Use the default keys as intptr_t comparison function
+	if ((w->timer_queue = pheap_create(NULL)) == NULL) {
+		errno = ENOMEM;
+		goto worker_create_failed;
+	}
+
+	// Success!
+	worker_set_state(w, WORKER_STATE_CREATED);
+	return w;
+
+	// Failure :(
+worker_create_failed:
+	worker_destroy(w);
+	return NULL;
+} // worker_create
+
+
+
+// Run through list of workers.  Remove anything marked as dead and destroy its state
+void
+instance_reap_workers(struct instance *i)
+{
+	struct worker_list workers_to_destroy;
+	struct worker *w, *wn;
+
+	TAILQ_INIT(&workers_to_destroy);
+
+	// Move all workers to destroy scan list
+	if (!TAILQ_EMPTY(&i->workers_dead)) {
+		instance_lock(i);
+		TAILQ_CONCAT(&workers_to_destroy, &i->workers_dead, list);
+		instance_unlock(i);
+	}
+
+	// Move workers that are still alive back to the worker list
+	// Destroy anything that's dead
+	w = TAILQ_FIRST(&workers_to_destroy);
+	while (w != NULL) {
+		wn = TAILQ_NEXT(w, list);
+		worker_destroy(w);
+		w = wn;
+	}
+} // instance_reap_workers
+
+
+
+// Queue a close action for every live task.  The task's owning worker performs
+// the actual fd/timer cleanup, preserving the single-owner access model instead
+// of mutating another worker's state from the shutdown thread.
+void
+instance_queue_shutdown(struct instance *i)
+{
+	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+		struct task *t = i->tfd_pool + n;
+
+		if (!task_claim_close(i, t)) {
+			continue;
+		}
+		// If the notification cannot be queued the task is left for the
+		// final nuke pass; task_unref() lets it be recycled if it was already
+		// closed by the time we got here.
+		task_notify_action(t, FLG_CL, true, true);
+		task_unref(t);
+	}
+} // instance_queue_shutdown
+
+
+
+// Nuke any task that survived the worker cleanup phase.  This must only be
+// called after all workers have been reaped, otherwise t->worker would be a
+// dangling pointer.
+void
+instance_nuke_tasks(struct instance *i)
+{
+	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+		struct task *t = i->tfd_pool + n;
+
+		if ((task_atomic_load(&t->state) == TASK_STATE_ACTIVE) || (task_atomic_load(&t->state) == TASK_STATE_DESTROY)) {
+			// Workers are gone.  Do not try to touch their timer queues.
+			t->worker = NULL;
+			task_nuke(i, n);
+		}
+	}
+} // instance_nuke_tasks
+
+
+
+// Wait until all workers have transitioned to DEAD.  Worker state changes
+// notify the instance eventfd, so this blocks without polling.
+void
+instance_wait_workers(struct instance *i)
+{
+	for (;;) {
+		bool busy;
+
+		instance_lock(i);
+		busy = !TAILQ_EMPTY(&i->workers_created) ||
+		       !TAILQ_EMPTY(&i->workers_running) ||
+		       !TAILQ_EMPTY(&i->workers_blocking) ||
+		       !TAILQ_EMPTY(&i->workers_notify) ||
+		       !TAILQ_EMPTY(&i->workers_idle) ||
+		       !TAILQ_EMPTY(&i->workers_shutdown);
+		instance_unlock(i);
+
+		if (!busy) {
+			return;
+		}
+
+		if (i->evfd < 0) {
+			poll(NULL, 0, 1000);
+			continue;
+		}
+
+		uint64_t c;
+		ssize_t len = read(i->evfd, (void *)&c, sizeof(c));
+		if (len < 0) {
+			if ((errno == EINTR) || (errno == EAGAIN)) {
+				continue;
+			}
+			close(i->evfd);
+			i->evfd = -1;
+		}
+	}
+} // instance_wait_workers
+
+
+
+// Ask all workers to shutdown.
+void
+instance_shutdown_workers(struct instance *i)
+{
+	struct worker_list workers_to_shutdown;
+	struct worker *w;
+
+	instance_lock(i);
+
+	// Move all workers to shutdown scan list
+	TAILQ_INIT(&workers_to_shutdown);
+	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_created, list);
+	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_running, list);
+	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_blocking, list);
+	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_idle, list);
+	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_notify, list);
+
+	while ((w = TAILQ_FIRST(&workers_to_shutdown))) {
+		bool notify = true;
+
+		TAILQ_REMOVE(&workers_to_shutdown, w, list);
+
+		if ((w->state == WORKER_STATE_CREATED) && !w->started) {
+			// The thread was never created, so there is nothing to wake.
+			// Move it straight to DEAD so the shutdown waiter does not
+			// block forever.
+			task_atomic_store(&w->old_state, (uint32_t)task_atomic_load(&w->state));
+			task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_DEAD));
+			if ((w->type == WORKER_TYPE_BLOCKING) &&
+			    (i->num_blocking_workers > 0)) {
+				i->num_blocking_workers--;
+			}
+			TAILQ_INSERT_TAIL(&i->workers_dead, w, list);
+			notify = false;
+		} else {
+			task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_SHUTTING_DOWN));
+			TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
+		}
+
+		if (notify) {
+			instance_unlock(i);
+			worker_notify(w);
+			instance_lock(i);
+		}
+	}
+	instance_unlock(i);
+} // instance_shutdown_workers
+
+
+
+void
+instance_destroy(struct instance *i)
+{
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		return;
+	}
+	if (i->evfd >= 0) {
+		close(i->evfd);
+		i->evfd = -1;
+	}
+	pthread_mutex_destroy(&i->listeners_lock);
+	pthread_mutex_destroy(&i->lock);
+	pthread_mutex_destroy(&i->cpulock);
+	if (i->io_workers) {
+		free(i->io_workers);
+		i->io_workers = NULL;
+	}
+	if (i->tfd_pool) {
+		free((void *)i->tfd_pool);
+		i->tfd_pool = NULL;
+	}
+	if (i->tfd_stride) {
+		free((void *)i->tfd_stride);
+		i->tfd_stride = NULL;
+	}
+#ifndef USE_TICKET_LOCKS
+	for (uint32_t n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
+		pthread_mutex_destroy(&(i->tfd_locks[n].lock));
+	}
+#endif
+	if (i->tfd_locks_real) {
+		// Hack to get around compiler warning stubborness over passing volatile
+		// pointers to free().  Hey, don't judge me!  It gets the job done!
+		union { volatile void *a; void *b;} whatevs;
+		whatevs.a = i->tfd_locks_real;
+		free(whatevs.b);
+		i->tfd_locks_real = NULL;
+		i->tfd_locks = NULL;
+	}
+	if (i->cpus) {
+		for(int n = 0; n < i->num_cpus; n++) {
+			if (i->cpus[n].workers) {
+				free(i->cpus[n].workers);
+			}
+		}
+		free(i->cpus);
+		i->cpus = NULL;
+	}
+	memset(i, 0, sizeof(struct instance));
+	i->magic = INSTANCE_MAGIC;
+	i->state = INSTANCE_STATE_FREE;
+	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
+		if (task_atomic_load(&instances[ti]) == i) {
+			task_atomic_store(&instances[ti], NULL);
+			break;
+		}
+	}
+	free(i);
+} // instance_destroy
+
+
+
+// ---------------------------------------------------------------------------------------------//
+// 				Task FD Pool Managment API					//
+// ---------------------------------------------------------------------------------------------//
+
+int
+instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
+{
+	register size_t num_pages;
+	uint32_t n;
+#ifndef USE_TICKET_LOCKS
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+#endif
+
+	// Don't allow less than 100 tfd entries for pool size
+	pool_size = (pool_size < 100) ? 100 : pool_size;
+
+	// Make actual pool size be 130% of what was asked for hashing efficiency
+	pool_size += 100;	// To allow for any listener and timer tasks
+	pool_size *= 1.3;
+
+	i->tfd_pool_used = 0;
+	i->tfd_pool_size = pool_size;
+
+	// Allocate the "stride" task area before the "active" area
+	num_pages = pool_size * sizeof(struct task_stride);
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
+
+	if ((i->tfd_stride = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
+		i->tfd_stride = NULL;
+		return -1;
+	}
+	memset(i->tfd_stride, 0, num_pages * __page_size);
+
+	// Allocate the "active" task tfd_pool space now
+	num_pages = pool_size * sizeof(struct task);
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
+
+	if ((i->tfd_pool = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
+		i->tfd_pool = NULL;
+		return -1;
+	}
+	memset(i->tfd_pool, 0, num_pages * __page_size);
+	for (n = 0; n < pool_size; n++) {
+		uint32_t tfdi = pool_size - (n + 1);
+		struct task *t = i->tfd_pool + tfdi;
+
+		task_init(i, t);
+		t->task_next = i->free_tasks;
+		i->free_tasks = t;
+	}
+
+	// Allocate the lock storage now.  We 
+	num_pages = (TASK_MAX_TFD_LOCKS + 1) * sizeof(tfd_lock_t);
+	num_pages += (__page_size - 1);
+	num_pages /= __page_size;
+
+	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
+		i->tfd_locks = NULL;
+		return -1;
+	}
+	union { volatile void *a; void *b;} whatevs;
+	whatevs.a = i->tfd_locks_real;
+	memset(whatevs.b, 0, num_pages * __page_size);
+	for (n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
+#ifdef USE_TICKET_LOCKS
+		ticket_init(&(i->tfd_locks_real[n].lock));
+#else
+		pthread_mutex_init(&(i->tfd_locks_real[n].lock), &attr);
+#endif
+	}
+	i->tfd_locks = i->tfd_locks_real + 1;
+	return 0;
+} // instance_tfd_pool_init
+
+
+
+struct instance *
+instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks)
+{
+	uint32_t ti;
+	struct instance *i = NULL;
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+
+	// Find an unused instance
+	for (ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
+		if (instances[ti]) {
+			continue;
+		}
+		break;
+	}
+
+	if (ti >= TASK_MAX_INSTANCES) {
+		goto instance_creation_fail;
+	}
+
+	size_t sz;
+	for (sz = 1; sz < sizeof(struct instance); sz += sz);
+	if ((i = aligned_alloc(sz, sz)) == NULL) {
+		goto instance_creation_fail;
+	}
+	memset(i, 0, sz);
+
+	i->magic = INSTANCE_MAGIC;
+	i->curtime_us = get_time_us(TASK_TIME_PRECISE);
+	i->ti = ti;
+
+	i->state = INSTANCE_STATE_CREATED;
+	i->thr = pthread_self();
+
+
+	pthread_mutex_init(&i->lock, &attr);
+	pthread_mutex_init(&i->listeners_lock, &attr);
+	pthread_mutex_init(&i->cpulock, &attr);
+
+	TAILQ_INIT(&i->workers_created);
+	TAILQ_INIT(&i->workers_running);
+	TAILQ_INIT(&i->workers_blocking);
+	TAILQ_INIT(&i->workers_idle);
+	TAILQ_INIT(&i->workers_notify);
+	TAILQ_INIT(&i->workers_shutdown);
+	TAILQ_INIT(&i->workers_dead);
+
+	if ((i->io_workers = (struct worker **)calloc(num_workers_io, sizeof(struct worker *))) == NULL) {
+		goto instance_creation_fail;
+	}
+
+	i->num_workers_io = num_workers_io;	// May get modified downwards later
+	i->num_blocking_workers = 0;
+	i->num_blocking_idle = 0;
+
+	if (instance_tfd_pool_init(i, max_tasks) < 0) {
+		goto instance_creation_fail;
+	}
+
+	// CPU/Worker affinity setup
+	i->num_cpus_seen = 0;
+	if (num_workers_io > 1) {
+		i->num_cpus = get_nprocs_conf();
+		if ((i->num_cpus > 0) && ((i->cpus = calloc(i->num_cpus, sizeof(struct cpuinfo))))) {
+			int rows = (num_workers_io + i->num_cpus - 1) / i->num_cpus;
+
+			i->num_cpu_rows = rows;
+			for (int n = 0; n < i->num_cpus; n++) {
+				i->cpus[n].workers = (struct worker **)calloc(rows, sizeof(struct worker *));
+				if (i->cpus[n].workers == NULL) {
+					goto instance_creation_fail;
+				}
+			}
+		}
+	}
+
+	i->max_blocking_workers = max_blocking_workers;
+
+	if ((i->evfd = eventfd(0, 0)) < 0) {
+		goto instance_creation_fail;
+	}
+
+	task_atomic_store(&instances[ti], i);
+
+	return i;
+
+instance_creation_fail:
+	instance_destroy(i);
+	return NULL;
+} // instance_create
+
+
+
+//----------------------------------------------------------------------------------------------//
+// 			     Task Library Blocking Work API					//
+//----------------------------------------------------------------------------------------------//
+
+// Spawns a new worker thread, and calls the supplied via work_func(work_data)
+// When the work_func() completes, work_cb(work_cb_data) is called
+int
+TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_data), void *work_cb_data, void (*work_cb_func)(int32_t ti, void *work_cb_data))
+{
+	struct instance *i;
+	struct worker *w;
+	int do_start = 0;
+
+	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
+		errno = ERANGE;
+		return -1;
+	}
+
+	i = instances[ti];
+
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		errno = EBADF;
+		return -1;
+	}
+
+	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+		errno = EOWNERDEAD;
+		return -1;
+	}
+
+
+	// If we're not allowed to spawn blocking workers then we
+	// have to do it ourselves.  This is NOT ideal at all!!
+	if (i->max_blocking_workers == 0) {
+		work_func(work_data);
+		if (work_cb_func) {
+			work_cb_func(ti, work_cb_data);
+		}
+		return 0;
+	}
+
+	// We need to hold onto the instance lock while checking, so we cheat
+	// a bit with worker states here, instead of using worker_set_state()
+	instance_lock(i);
+
+	i->curtime_us = get_time_us(TASK_TIME_PRECISE);
+
+	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+		instance_unlock(i);
+		errno = EOWNERDEAD;
+		return -1;
+	}
+
+	if (i->state == INSTANCE_STATE_RUNNING) {
+		do_start = 1;
+	}
+
+	if((w = TAILQ_FIRST(&i->workers_idle))) {
+		// Reserve the worker while keeping its state machine bookkeeping
+		// consistent with the list it is actually on.  The worker thread
+		// is blocked on read(evfd) and will see WORKER_STATE_BLOCKING
+		// when the notification wakes it.
+		i->num_blocking_idle--;
+		TAILQ_REMOVE(&i->workers_idle, w, list);
+		task_atomic_store(&w->old_state, (uint32_t)task_atomic_load(&w->state));
+		task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_BLOCKING));
+		TAILQ_INSERT_TAIL(&i->workers_blocking, w, list);
+	}
+
+	// If workers_idle queue is now empty, take note of that
+	// here. This affects the idle pool reaping mechanism
+	if (TAILQ_EMPTY(&i->workers_idle)) {
+		i->worker_idle_empty_reaped = 0;
+		i->worker_idle_empty_time_us = get_time_us(TASK_TIME_PRECISE);
+	}
+
+	if(w == NULL) {
+		// Don't spawn more workers than we're allowed to
+		if (i->num_blocking_workers >= i->max_blocking_workers) {
+			instance_unlock(i);
+			errno = EAGAIN;
+			return -1;
+		}
+		// Pre-increment the blocking count before we release the lock
+		i->num_blocking_workers++;
+	}
+	instance_unlock(i);
+
+	// Create a new worker if needed
+	if (w == NULL) {
+		if ((w = worker_create(i, WORKER_TYPE_BLOCKING)) == NULL) {
+			instance_lock(i);
+			// Release our pre-increment of i->num_blocking_workers
+			i->num_blocking_workers--;
+			instance_unlock(i);
+
+			errno = EAGAIN;
+			return -1;
+		}
+	}
+
+	// We now have a worker to do the work on. Start it!
+	w->work_func = work_func;
+	w->work_data = work_data;
+	w->work_cb_func = work_cb_func;
+	w->work_cb_data = work_cb_data;
+
+	// If we don't start it now, it'll get started when TASK_instance_start() is called
+	if (do_start) {
+		if (worker_start(w) < 0) {
+			errno = EAGAIN;
+			return -1;
+		}
+	}
+
+	return 0;
+} // TASK_do_blocking_work
+
+
+
+//----------------------------------------------------------------------------------------------//
+//			     Task Library Debugging Management API				//
+//----------------------------------------------------------------------------------------------//
+
+// Dumps detailed information about the task to stderr
+int
+TASK_debug_task(int64_t tfd)
+{
+	register struct task *t = task_lookup(tfd, FLG_DBG);
+
+	if (t == NULL) return -1;	// errno already set
+
+	// Make the task debug call
+	task_dump(t);
+
+	task_unlock(t, FLG_DBG);
+	return 0;
+} //TASK_debug_task
+
+
+
+//----------------------------------------------------------------------------------------------//
+//			     Task Library Instance Management API				//
+//----------------------------------------------------------------------------------------------//
+
+// Destroys an instance without prejudice
+// Do NOT use the instance after this
+int
+TASK_instance_destroy(int32_t ti)
+{
+	struct instance *i;
+
+	pthread_mutex_lock(&creation_lock);
+	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
+		errno = ERANGE;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
+	i = instances[ti];
+
+	if (i == NULL) {
+		errno = EBADF;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
+	if (i->magic != INSTANCE_MAGIC) {
+		errno = EBADF;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
+	if ((i->state != INSTANCE_STATE_CREATED) &&
+	    (i->state != INSTANCE_STATE_RUNNING) &&
+	    (((instance_state_t)task_atomic_load(&i->state) != INSTANCE_STATE_SHUTTING_DOWN))) {
+		errno = EBADF;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
+	// Save the shutdown notification before the instance is freed
+	void (*shutdown_cb)(intptr_t ti, void *data) = i->shutdown_cb;
+	void *shutdown_data = i->shutdown_data;
+	bool need_queue = (((instance_state_t)task_atomic_load(&i->state) != INSTANCE_STATE_SHUTTING_DOWN));
+
+	task_atomic_store(&i->state, INSTANCE_STATE_SHUTTING_DOWN);
+
+	// Queue closes before stopping the workers so every close is processed by
+	// the task's owning worker.  If a shutdown is already in progress the
+	// closes were queued by TASK_instance_shutdown().
+	if (need_queue) {
+		instance_queue_shutdown(i);
+	}
+
+	instance_shutdown_workers(i);
+	instance_wait_workers(i);
+	instance_reap_workers(i);
+	instance_nuke_tasks(i);
+
+	instance_destroy(i);
+	task_atomic_store(&instances[ti], NULL);
+	pthread_mutex_unlock(&creation_lock);
+
+	if (shutdown_cb) {
+		shutdown_cb(ti, shutdown_data);
+	}
+	return 0;
+} // TASK_instance_destroy
+
+
+
+// Waits for instance to fully shutdown
+int
+TASK_instance_wait(int32_t ti)
+{
+	struct instance *i;
+
+	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
+		errno = ERANGE;
+		return -1;
+	}
+
+	i = instances[ti];
+
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		errno = EBADF;
+		return -1;
+	}
+
+
+	// Nothing has been started yet, so there is nothing to wait for
+	if (i->state == INSTANCE_STATE_CREATED) {
+		return 0;
+	}
+
+	for (;;) {
+		worker_handle_instance(i);
+
+		if (i->evfd < 0) {
+			if (poll(NULL, 0, 1000) < 0) {
+				if (errno != EINTR) {
+					break;
+				}
+			}
+		} else {
+			int len;
+			uint64_t c;
+
+			// Wait for something to happen! This is a blocking read
+			if ((len = read(i->evfd, (void *)&c, sizeof(c))) < 0) {
+				if ((errno == EINTR) || (errno == EAGAIN)) {
+					continue;
+				}
+				close(i->evfd);
+				i->evfd = -1;
+			}
+		}
+
+		instance_lock(i);
+		if ((i->state == INSTANCE_STATE_RUNNING)  ||
+		     (!TAILQ_EMPTY(&i->workers_created)) ||
+		     (!TAILQ_EMPTY(&i->workers_running)) ||
+		     (!TAILQ_EMPTY(&i->workers_blocking)) ||
+		     (!TAILQ_EMPTY(&i->workers_notify)) ||
+		     (!TAILQ_EMPTY(&i->workers_idle)) ||
+		     (!TAILQ_EMPTY(&i->workers_shutdown))) {
+			instance_unlock(i);
+			continue;
+		}
+		instance_unlock(i);
+		break;
+	}
+
+	// Reap any workers still about
+	instance_reap_workers(i);
+
+	// If user wanted to be notified that we just shutdown
+	if (i->shutdown_cb) {
+		i->shutdown_cb(ti, i->shutdown_data);
+		i->shutdown_cb = NULL;
+		i->shutdown_data = NULL;
+	}
+
+	return 0;
+} // TASK_instance_wait
+
+
+
+int
+TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intptr_t ti, void *shutdown_data))
+{
+	struct instance *i;
+
+	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
+		errno = ERANGE;
+		return -1;
+	}
+
+	i = instances[ti];
+
+	if (i == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+
+	if (i->magic != INSTANCE_MAGIC) {
+		errno = EBADF;
+		return -1;
+	}
+
+	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+		return 0;
+	}
+
+	task_atomic_store(&i->state, INSTANCE_STATE_SHUTTING_DOWN);
+	i->shutdown_cb = shutdown_cb;
+	i->shutdown_data = shutdown_data;
+
+	// Queue the closes first, then stop the workers.  worker_cleanup() will
+	// process the queued closes on each task's owning thread.
+	instance_queue_shutdown(i);
+	instance_shutdown_workers(i);
+	instance_notify(i);
+	return 0;
+} // TASK_instance_shutdown
+
+
+
+// Just a convenient function for the user to call for the initiating
+// process to stall on while an instance does its work
+int
+TASK_instance_start(int32_t ti)
+{
+	struct worker *w;
+	struct instance *i;
+
+	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
+		errno = ERANGE;
+		return -1;
+	}
+
+	i = instances[ti];
+
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		errno = EBADF;
+		return -1;
+	}
+
+	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+		errno = EOWNERDEAD;
+		return -1;
+	}
+
+
+	// Start all workers waiting to start
+	while ((w = TAILQ_FIRST(&i->workers_created))) {
+		worker_start(w);
+	}
+
+	// Assign the instance to a worker for instance notifications
+	instance_lock(i);
+	if (instance_assign_worker(i) < 0) {
+		instance_unlock(i);
+		errno = ECHILD;
+		return -1;
+	}
+	w = i->instance_worker;
+	task_atomic_store(&i->state, INSTANCE_STATE_RUNNING);
+	instance_unlock(i);
+
+	// Wake the newly assigned instance worker.  Notifications that arrived
+	// before it was assigned only wrote i->evfd, which no worker monitors.
+	instance_notify(i);
+	return 0;
+} // TASK_instance_start
+
+
+
+int32_t
+TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks, int tcp_sndbuf_size, uint64_t flags)
+{
+	struct instance *i = NULL;
+	int num_io_to_spawn = 0;
+
+	pthread_mutex_lock(&creation_lock);
+
+	if ((num_workers_io < 0) || (max_blocking_workers < 0) ||
+	    (max_tasks == 0) || (tcp_sndbuf_size < 0)) {
+		errno = EINVAL;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
+	if (!initialised) {
+		struct sigaction sa[1];
+		int32_t ti;
+
+#ifdef DEBUG_SIZES
+		printf("sizeof(tfd_lock_t)=%lu\n", sizeof(tfd_lock_t));
+		printf("sizeof(struct task)=%lu\n", sizeof(struct task));
+		printf("sizeof(struct task_stride)=%lu\n", sizeof(struct task_stride));
+		printf("sizeof(socklen_t)=%lu\n", sizeof(socklen_t));
+#endif
+
+		__page_size = sysconf(_SC_PAGESIZE);
+		memset(sa, 0, sizeof(struct sigaction));
+		sa->sa_handler = SIG_IGN;
+		if (sigaction(SIGPIPE, sa, NULL) < 0) {
+			goto TASK_instance_create_error;
+		}
+
+		for(ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
+			instances[ti] = NULL;
+		}
+		initialised = true;
+	}
+
+	// If we're not asked to spawn any io workers then
+	// we need to auto-detect how many threads to start
+	if (num_workers_io == 0) {
+		// If 0, default to 1 IO worker per 3 configured CPUs
+		num_io_to_spawn = (get_nprocs_conf() + 2) / 3;
+		// If the above command fails, just spawn 2
+		if (num_io_to_spawn < 2) {
+			num_io_to_spawn = 2;
+		}
+	} else {
+		num_io_to_spawn = num_workers_io;
+	}
+
+	if ((i = instance_create(num_io_to_spawn, max_blocking_workers, max_tasks)) == NULL) {
+		errno = ENOMEM;
+		goto TASK_instance_create_error;
+	}
+	i->flags = flags;
+
+	if (tcp_sndbuf_size == 0) {
+		tcp_sndbuf_size = (1024 * 1024 * 1024) / max_tasks;
+	}
+	i->per_task_sndbuf = tcp_sndbuf_size;
+
+	// Create our workers now
+	i->num_workers_io = num_io_to_spawn;
+	uint32_t nio = 0;
+	for (int n = 0; n < num_io_to_spawn; n++) {
+		struct worker *w;
+
+		if ((w = worker_create(i, WORKER_TYPE_IO))) {
+			i->io_workers[nio++] = w;
+		}
+	}
+	i->num_workers_io = nio;
+
+	if (i->num_workers_io == 0) {
+		errno = ENOMEM;
+		goto TASK_instance_create_error;
+	}
+
+	pthread_mutex_unlock(&creation_lock);
+	return i->ti;
+
+TASK_instance_create_error:
+	if (i) {
+		instance_destroy(i);
+	}
+	pthread_mutex_unlock(&creation_lock);
+	return -1;
+} // TASK_instance_create
+

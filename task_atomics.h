@@ -10,10 +10,11 @@
  *
  * Memory ordering deliberately mirrors ck_pr:
  *
- *   - load/store are relaxed.  ck_pr's load and store are a plain access
- *     behind a compiler barrier, not acquire/release operations.
- *   - inc/dec/add are sequentially consistent read-modify-write operations,
- *     i.e. full memory barriers, as ck_pr's arithmetic operations are.
+ *   - load/store use acquire/release ordering.  Task state is published from
+ *     one thread and consumed by another, so a plain relaxed access is not
+ *     sufficient on weakly ordered architectures.
+ *   - inc/dec/add and the bit operations are sequentially consistent
+ *     read-modify-write operations (full memory barriers).
  *
  * The variables these operate on are plain (non-_Atomic) types, matching the
  * previous behaviour, so they may still be read directly in places where a
@@ -28,12 +29,20 @@
 #include <stdint.h>
 
 /* Relaxed atomic load/store.  Works with any integer or pointer type. */
-#define	task_atomic_load(p)		__atomic_load_n((p), __ATOMIC_RELAXED)
-#define	task_atomic_store(p, v)		__atomic_store_n((p), (v), __ATOMIC_RELAXED)
+#define	task_atomic_load(p)		__atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define	task_atomic_store(p, v)		__atomic_store_n((p), (v), __ATOMIC_RELEASE)
 
 /* Full-barrier atomic read-modify-write operations. */
 #define	task_atomic_inc(p)		((void)__atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST))
 #define	task_atomic_dec(p)		((void)__atomic_sub_fetch((p), 1, __ATOMIC_SEQ_CST))
 #define	task_atomic_add(p, v)		((void)__atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_sub(p, v)		((void)__atomic_sub_fetch((p), (v), __ATOMIC_SEQ_CST))
+
+/* Atomic bit set/clear/test-and-set.  These are used for the per-task state
+ * words that may be touched from both a worker and an API caller. */
+#define	task_atomic_or(p, v)		((void)__atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_and(p, v)		((void)__atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_fetch_or(p, v)	__atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#define	task_atomic_fetch_and(p, v)	__atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
 
 #endif	// __TASK_ATOMICS_H_

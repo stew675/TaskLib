@@ -26,6 +26,7 @@
 // - Fully instanced self-contained configuration allows for multiple services to use the
 //   library within the same process independently of each other
 
+#include <stddef.h>
 #include "ph.h"
 #include "task_lib.h"
 #include "stewticket_thr.h"
@@ -188,8 +189,9 @@ struct task_timer {
 
 // The task structure is broken into 2 parts, being the "stride" and "active" portions. Infrequently
 // accessed fields exists within the "stride" portion.  The sizes of these structures are also
-// broken out into 3 x 64 byte, and 8 x 64 byte sized elements, which introduces a staggered data
-// "striding" pattern for the CPU caches for better CPU cache-set utlisation
+// broken out into 3 x 64 byte and 6 x 64 byte sized elements, which introduces a staggered data
+// "striding" pattern for the CPU caches for better CPU cache-set utlisation.  The static
+// assertions after struct worker enforce these cache-line boundaries.
 
 struct task_stride {
 	// For TASK_TYPE_ACCEPT tasks, addr refers to the local address we're listening on
@@ -209,6 +211,7 @@ __attribute__ ((aligned(64))) void	*accept_cb_data;
 	void				*close_cb_data;		//  User data to pass to the close callback
 	void				(*close_cb)(int64_t tfd, void *close_cb_data);
 	struct worker			*preferred_worker;	// To initiate task io worker migration
+	int64_t				parent_tfd;		// Parent listener TFD for child listeners
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 } __attribute__ ((aligned(64)));
@@ -242,7 +245,6 @@ struct task {
 	int32_t				epfd;			// The worker epoll FD we're registered with
 	int32_t				fd;			// The actual system socket FD we're working on
 	socklen_t			addrlen;		// The valid length of the data in .addr
-	struct ntfyq			*listen_children;	// The list of child accept tasks
 	uint32_t			migrations;		// Number of times the task has migrated
 	uint32_t			unused_32_1;		// Unused
 	struct task_stride		*stride;
@@ -290,11 +292,6 @@ __attribute__ ((aligned(64))) char	*rd_buf;
 	void				(*rdv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *rd_cb_data);
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
-
-__attribute__ ((aligned(64))) struct ntfyq *freeq;		// The list of free ntfyq events for this task
-	struct ntfyq			*freeq_overflow;
-	struct ntfyq			free1;
-	struct ntfyq			free2;
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -382,7 +379,10 @@ __attribute__ ((aligned(64))) pthread_t	thr;
 	uint64_t			num_tasks;
 	TAILQ_ENTRY(worker)		list;
 
-	// Blocking worker call info
+	// Blocking worker call info.  The state flags live at the start of this
+	// cache line so the third worker cache line above remains exactly 64 bytes.
+__attribute__ ((aligned(64))) uint32_t	started;	// Thread has been created
+	uint32_t			notified;	// Wakeup already pending (atomic)
 	void				(*work_func)(void *work_data);
 	void				*work_data;
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
@@ -391,6 +391,42 @@ __attribute__ ((aligned(64))) pthread_t	thr;
 	// Put this all by itself at the end
 __attribute__ ((aligned(64))) pthread_mutex_t lock;
 }  __attribute__ ((aligned(64)));
+
+//----------------------------------------------------------------------------------------------//
+// Cache-line layout invariants.  The task/worker/stride structures are deliberately laid out
+// in 64-byte cache-line-sized groups.  These assertions catch accidental field additions or
+// removals that would straddle a cache line or shift a group off its boundary.
+//----------------------------------------------------------------------------------------------//
+_Static_assert(_Alignof(struct task) == 64, "struct task alignment");
+_Static_assert(sizeof(struct task) == 384, "struct task must be 6 cache lines");
+_Static_assert(offsetof(struct task, wr_buf) == 64, "task write group must start on line 1");
+_Static_assert(offsetof(struct task, wrv_cb) + sizeof(((struct task *)0)->wrv_cb) <= 128, "task write group crosses line 1");
+_Static_assert(offsetof(struct task, rd_buf) == 128, "task read group must start on line 2");
+_Static_assert(offsetof(struct task, rdv_cb) + sizeof(((struct task *)0)->rdv_cb) <= 192, "task read group crosses line 2");
+_Static_assert(offsetof(struct task, rd_tt) == 192, "task read timer group must start on line 3");
+_Static_assert(offsetof(struct task, rdv_unused_32) + sizeof(uint32_t) <= 256, "task read timer group crosses line 3");
+_Static_assert(offsetof(struct task, wr_tt) == 256, "task write timer group must start on line 4");
+_Static_assert(offsetof(struct task, wrv_unused_32) + sizeof(uint32_t) <= 320, "task write timer group crosses line 4");
+_Static_assert(offsetof(struct task, tm_tt) == 320, "task timer group must start on line 5");
+_Static_assert(offsetof(struct task, task_next) + sizeof(void *) <= sizeof(struct task), "task timer group crosses line 5");
+
+_Static_assert(_Alignof(struct task_stride) == 64, "struct task_stride alignment");
+_Static_assert(sizeof(struct task_stride) == 192, "struct task_stride must be 3 cache lines");
+_Static_assert(offsetof(struct task_stride, accept_cb_data) == 128, "task_stride callback group must start on line 2");
+_Static_assert(offsetof(struct task_stride, parent_tfd) + sizeof(int64_t) <= sizeof(struct task_stride), "task_stride callback group crosses line 2");
+
+_Static_assert(_Alignof(struct worker) == 64, "struct worker alignment");
+_Static_assert(sizeof(struct worker) % 64 == 0, "struct worker must be cache-line sized");
+_Static_assert(offsetof(struct worker, timer_queue) == 64, "worker timer group must start on line 1");
+_Static_assert(offsetof(struct worker, evfd) + sizeof(int32_t) <= 128, "worker timer group crosses line 1");
+_Static_assert(offsetof(struct worker, thr) == 128, "worker state group must start on line 2");
+_Static_assert(offsetof(struct worker, list) + sizeof(TAILQ_ENTRY(worker)) <= 192, "worker state group crosses line 2");
+_Static_assert(offsetof(struct worker, started) == 192, "worker work group must start on line 3");
+_Static_assert(offsetof(struct worker, work_cb_data) + sizeof(void *) <= 256, "worker work group crosses line 3");
+_Static_assert(offsetof(struct worker, lock) % 64 == 0, "worker lock must be cache-line aligned");
+
+_Static_assert(_Alignof(tfd_lock_t) == 64, "tfd_lock_t alignment");
+_Static_assert(sizeof(tfd_lock_t) % 64 == 0, "tfd_lock_t must be cache-line sized");
 
 // The ordering of these tasks states is important
 typedef enum {
@@ -484,12 +520,12 @@ struct instance {
 static bool task_notify_action(struct task *t, task_action_flag_t action, bool force_close_q, bool force_q);
 static void worker_process_one_action(struct worker *w, struct task *t, task_action_flag_t action);
 static void task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us);
+static void task_shutdown_listen_children(struct task *parent);
 
 // The current IO worker.  MUST BE NULL if current thread is not an IO worker
 static __thread struct worker	*__thr_current_worker = NULL;
 static __thread struct instance	*__thr_current_instance = NULL;
 static __thread	int64_t		w__curtime_us = 0;
-static __thread	int64_t		w__notified = 0;
 
 static struct instance		*instances[TASK_MAX_INSTANCES];
 static bool initialised = false;
@@ -506,9 +542,20 @@ static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 #define TASK_NS_TO_US(a)	(((int64_t)a) / 1000)
 #define TASK_US_TO_S(a)		(((int64_t)a) / 1000000)
 
-#define	TFD_TO_INDEX(tfd)	(tfd & 0xffffffff)
-#define	TFD_TO_ITERATION(tfd)	((tfd > 32) & 0x00ffffff)
-#define	TFD_ITERATION_MASK	(0x00ffffff)
+// A TFD is a 64-bit opaque handle composed of:
+//   bits  0-31: index into the instance's task pool
+//   bits 32-35: instance index (TASK_MAX_INSTANCES is 16)
+//   bits 36-62: generation/iteration counter (27 bits, keeps the handle positive)
+// The instance index embedded in the handle means TFD APIs do not need to rely on
+// thread-local state to determine which instance a TFD belongs to.  The generation
+// counter allows stale handles to be rejected after a task slot has been recycled.
+#define	TFD_TO_INDEX(tfd)	((uint32_t)((uint64_t)(tfd) & 0xffffffffu))
+#define	TFD_TO_INSTANCE(tfd)	((uint32_t)(((uint64_t)(tfd) >> 32) & 0xfu))
+#define	TFD_TO_ITERATION(tfd)	((uint32_t)(((uint64_t)(tfd) >> 36) & TFD_ITERATION_MASK))
+#define	TFD_ITERATION_MASK	(0x07ffffffu)
+#define	TFD_MAKE(ti, iteration, index) \
+	((int64_t)((((uint64_t)(iteration)) & TFD_ITERATION_MASK) << 36) | \
+		 (((uint64_t)(ti) & 0xfu) << 32) | ((uint64_t)(index) & 0xffffffffu))
 
 // The non-existent TFD Identifier
 #define TFD_NONE 		(int64_t)(0xffffffffffffffff)
@@ -521,7 +568,7 @@ static pthread_mutex_t	creation_lock = PTHREAD_MUTEX_INITIALIZER;
 static void
 task_dump(struct task *t)
 {
-	fprintf(stderr, "Task Dump for TFD = %ld\n", TFD_TO_INDEX(t->tfd));
+	fprintf(stderr, "Task Dump for TFD = %u\n", (unsigned)TFD_TO_INDEX(t->tfd));
 	fprintf(stderr, "Expiry us = %ld\n", t->tm_tt.expiry_us);
 	fprintf(stderr, "Type = ");
 	switch(t->type) {
@@ -867,17 +914,11 @@ task_remove_list(register struct task **head, register struct task *t)
 static void
 task_init(struct task *t)
 {
-	uint64_t tfdi = t - __thr_current_instance->tfd_pool;
-	int64_t iteration = (TFD_TO_ITERATION(t->tfd) + 1) & TFD_ITERATION_MASK;
-	struct ntfyq *freeq_overflow = t->freeq_overflow;
+	uint32_t tfdi = (uint32_t)(t - __thr_current_instance->tfd_pool);
+	uint32_t iteration = (TFD_TO_ITERATION(t->tfd) + 1) & TFD_ITERATION_MASK;
 
 	memset((__thr_current_instance->tfd_pool + tfdi), 0, sizeof(struct task));
 	memset((__thr_current_instance->tfd_stride + tfdi), 0, sizeof(struct task_stride));
-
-	t->free2.next = NULL;
-	t->free1.next = &t->free2;
-	t->freeq = &t->free1;
-	t->freeq_overflow = freeq_overflow;
 
 	t->stride = __thr_current_instance->tfd_stride + tfdi;
 	t->state = TASK_STATE_UNUSED;
@@ -889,8 +930,9 @@ task_init(struct task *t)
 	t->rd_state = TASK_READ_STATE_IDLE;
 	t->wr_state = TASK_WRITE_STATE_IDLE;
 
-	// Calculate and assign the new tfd
-	t->tfd = (iteration << 32) | (TFD_TO_INDEX(tfdi));
+	// Calculate and assign the new tfd.  The generation ensures stale handles
+	// referencing this slot are rejected by task_lookup()
+	t->tfd = TFD_MAKE(__thr_current_instance->ti, iteration, tfdi);
 } // task_init
 
 
@@ -1045,7 +1087,10 @@ task_unlock(struct task *t, register task_action_flag_t action)
 		return;
 	}
 
-	// We're all clear to release/free the task
+	// We're all clear to release/free the task.  Mark the slot unused while we
+	// still hold the TFD lock so a lookup on another thread cannot observe a
+	// stale ACTIVE state between here and task_free()
+	t->state = TASK_STATE_UNUSED;
 	tfd_unlock(tfdi);
 	task_free(t);
 	return;
@@ -1057,27 +1102,49 @@ task_unlock(struct task *t, register task_action_flag_t action)
 static struct task *
 task_lookup(register int64_t tfd, register task_action_flag_t action)
 {
-	register uint32_t tfdi = (uint32_t)TFD_TO_INDEX(tfd);
+	register uint32_t tfdi;
+	register uint32_t tfd_iter;
+	register uint32_t ti;
+	register struct instance *i;
 	register struct task *t;
 	register struct worker *w;
 
-	// Validate the instance
-	if (__thr_current_instance->state > INSTANCE_STATE_RUNNING) {
-		errno = EOWNERDEAD;
-		return NULL;
-	}
-
-	// Validate the TFD
+	// Validate the TFD before using any of its fields
 	if (tfd < 0) {
 		errno = ERANGE;
 		return NULL;
 	}
-	if (tfdi >= __thr_current_instance->tfd_pool_size) {
+
+	tfdi = TFD_TO_INDEX(tfd);
+	tfd_iter = TFD_TO_ITERATION(tfd);
+	ti = TFD_TO_INSTANCE(tfd);
+
+	if (ti >= TASK_MAX_INSTANCES) {
 		errno = ERANGE;
 		return NULL;
 	}
 
-	t = __thr_current_instance->tfd_pool + tfdi;
+	i = (struct instance *)ck_pr_load_ptr(&instances[ti]);
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		errno = EBADF;
+		return NULL;
+	}
+
+	if (i->state > INSTANCE_STATE_RUNNING) {
+		errno = EOWNERDEAD;
+		return NULL;
+	}
+
+	if (tfdi >= i->tfd_pool_size) {
+		errno = ERANGE;
+		return NULL;
+	}
+
+	// From here on the TFD lock macros and the rest of the API use the
+	// instance resolved from the TFD itself, not thread-local state
+	__thr_current_instance = i;
+
+	t = i->tfd_pool + tfdi;
 	w = t->worker;
 	if (w == NULL) {
 		errno = EBADF;
@@ -1086,7 +1153,8 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 
 	if (!lockless_worker(w)) {
 		tfd_lock(tfdi);
-		if (t->state != TASK_STATE_ACTIVE) {
+		if ((t->state != TASK_STATE_ACTIVE) ||
+		    (TFD_TO_ITERATION(t->tfd) != tfd_iter)) {
 			tfd_unlock(tfdi);
 			errno = EBADF;
 			return NULL;
@@ -1114,7 +1182,8 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		task_add_locked_action(t, action);
 		tfd_unlock(tfdi);
 	} else {
-		if (t->state != TASK_STATE_ACTIVE) {
+		if ((t->state != TASK_STATE_ACTIVE) ||
+		    (TFD_TO_ITERATION(t->tfd) != tfd_iter)) {
 			errno = EBADF;
 			return NULL;
 		}
@@ -1222,7 +1291,7 @@ get_cpu_of_sock(int sock)
 		return -1;
 	}
 
-	if (cpu < 0) {
+	if ((cpu < 0) || (cpu >= i->num_cpus)) {
 		return -1;
 	}
 
@@ -1385,6 +1454,27 @@ set_one_workers_affinity(int cpu)
 		return;
 	}
 
+	// A single-CPU system needs special handling because the pairs-of-CPUs
+	// scan below would perform zero iterations and walk off the row array.
+	if (i->num_cpus < 2) {
+		for (row = 0; row < i->num_cpu_rows; row++) {
+			if (i->cpus[0].workers[row] == NULL) {
+				break;
+			}
+		}
+		if (row >= i->num_cpu_rows) {
+			i->all_io_workers_affined = true;
+			pthread_mutex_unlock(&i->cpulock);
+			return;
+		}
+		i->cpus[0].num_workers++;
+		i->cpus[0].workers[row] = w;
+		w->affined_cpu = 0;
+		pthread_mutex_unlock(&i->cpulock);
+		set_worker_cpu_affinity(w, 0);
+		return;
+	}
+
 	// We found a worker to affine, now bind it to a CPU
 	// Scan row by row.  Fill out a row fully before moving on
 	for (row = 0; row < i->num_cpu_rows; row++) {
@@ -1414,7 +1504,13 @@ set_one_workers_affinity(int cpu)
 	}
 
 	// We got a target CPU (tcpu)!  Bind it to the row (row) and set the CPU affinity
-	assert(i->cpus[tcpu].workers[row] == NULL);
+	if ((row >= i->num_cpu_rows) || (i->cpus[tcpu].workers == NULL) ||
+	    (i->cpus[tcpu].workers[row] != NULL)) {
+		// No free slot found (should not happen with a consistent layout)
+		i->all_io_workers_affined = true;
+		pthread_mutex_unlock(&i->cpulock);
+		return;
+	}
 	i->cpus[tcpu].num_workers++;
 	i->cpus[tcpu].workers[row] = w;
 	w->affined_cpu = tcpu;
@@ -1551,12 +1647,21 @@ worker_notify(struct worker *w)
 	if (w == NULL) {
 		return -1;
 	}
-	if (w__notified) {
+
+	// The pending-notification flag is per worker, not per thread.  A thread
+	// may notify several different workers in succession; using thread-local
+	// state here caused all but the first notification to be suppressed.
+	// If two threads race and both write, eventfd coalesces the writes.
+	if (ck_pr_load_32(&w->notified)) {
 		return 0;
 	}
+	ck_pr_store_32(&w->notified, 1);
 
-	w__notified = 1;
-	return notifier_write(w->evfd);
+	if (notifier_write(w->evfd) < 0) {
+		ck_pr_store_32(&w->notified, 0);
+		return -1;
+	}
+	return 0;
 } // worker_notify
 
 
@@ -1679,16 +1784,15 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		assert(t->notifyqlen < MAX_NOTIFY_QUEUE_LEN);
 		t->notifyqlen++;
 
-		if ((tq = t->freeq)) {
-			t->freeq = tq->next;
-		} else if ((tq = t->freeq_overflow)) {
-			t->freeq_overflow = tq->next;
-		} else if ((tq = w->freeq)) {
+		if ((tq = w->freeq)) {
 			w->freeq = tq->next;
 		} else {
 			tq = worker_notify_get_free_ntfyq(w);
 			if (tq == NULL) {
 				assert(tq != NULL);	// Out of memory
+				if (t->notifyqlen) {
+					t->notifyqlen--;
+				}
 				return false;
 			}
 		}
@@ -1714,6 +1818,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 			tq = worker_notify_get_free_ntfyq(w);
 			if (tq == NULL) {
 				assert(tq != NULL);	// Out of memory
+				ck_pr_dec_64(&t->notifyqlen_locked);
 				return false;
 			}
 			worker_lock(w);
@@ -1730,10 +1835,8 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		worker_unlock(w);
 	}
 
-	// Only call worker_notify() if we actually need to
-	if (w__notified == false) {
-		worker_notify(w);
-	}
+	// worker_notify() itself checks whether a wakeup is already pending
+	worker_notify(w);
 	return true;
 } // task_notify_action
 
@@ -1923,6 +2026,13 @@ task_do_close_cb(struct task *t)
 	// This is it boys, this is war! C'mon what are you waiting for?
 	t->state = TASK_STATE_DESTROY;
 
+	// If it's a parent listener, ask all of its child listeners to close.
+	// This is done while the parent task is still valid so the child scan is
+	// safe; the actual close is queued to each child's owning worker.
+	if ((t->type == TASK_TYPE_LISTEN) && (t->listen_child == 0)) {
+		task_shutdown_listen_children(t);
+	}
+
 	// If it's a listener, remove it from the worker's listeners list
 	if (t->type == TASK_TYPE_LISTEN) {
 		register struct worker *w = t->worker;
@@ -1969,20 +2079,18 @@ task_do_close_cb(struct task *t)
 	// If we're a child listener, don't make the close callback.  The caller
 	// only knows about the parent listener and won't know what to do with a
 	// a child listener since it isn't even aware of its existence
-	if ((cb == NULL) || (t->listen_child)) {
-		task_unlock(t, FLG_CL);
-		return;
-	}
-
-	// If the instance is shutting down, don't make any callbacks
- 	if (__thr_current_instance->state == INSTANCE_STATE_SHUTTING_DOWN) {
-		task_unlock(t, FLG_CL);
-		return;
+	//
+	// The callback is deliberately made *before* task_unlock() releases the
+	// final reference.  This keeps the task slot alive for the duration of the
+	// callback, so a stale TFD passed to the callback can never refer to a
+	// newly recycled task.
+	if ((cb != NULL) && (t->listen_child == 0) &&
+	    (__thr_current_instance->state != INSTANCE_STATE_SHUTTING_DOWN)) {
+		errno = 0;
+		cb(tfd, cb_data);
 	}
 
 	task_unlock(t, FLG_CL);
-	errno = 0;
-	cb(tfd, cb_data);
 } // task_do_close_cb
 
 
@@ -2174,25 +2282,36 @@ handle_write_timeout:
 } // task_do_timeout_cb
 
 
-// Separate any accept children from parent and mark them for destruction
+// Queue a close action for every child listener belonging to the given parent.
+// Child listeners are identified by their parent_tfd field rather than a linked
+// list of raw task pointers.  This avoids dangling pointers if a child is closed
+// independently, and avoids borrowing notification nodes from another worker's
+// free list.  Listener close is a rare operation, so an O(pool) scan is fine.
 static void
-task_shutdown_listen_children(struct worker *w, struct task *t)
+task_shutdown_listen_children(struct task *parent)
 {
-	register struct ntfyq *tq;
+	struct instance *i = parent->worker->instance;
+	int64_t ptfd = parent->tfd;
 
-	while ((tq = t->listen_children) != NULL) {
-		struct task *tac = tq->t;	// Accept Child
+	if (i == NULL) {
+		return;
+	}
 
-		t->listen_children->next = tq;
+	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+		struct task *c = i->tfd_pool + n;
 
-		worker_lock(w);
-		tq->next = w->freeq_locked;
-		w->freeq_locked = tq;
-		worker_unlock(w);
+		if ((c == parent) || (c->type != TASK_TYPE_LISTEN) ||
+		    (c->listen_child == 0) || (c->state != TASK_STATE_ACTIVE)) {
+			continue;
+		}
+		if (c->stride->parent_tfd != ptfd) {
+			continue;
+		}
 
-		tac->rd_state = TASK_READ_STATE_IDLE;
-		task_lock(tac, FLG_CL);
-		task_do_close_cb(tac);
+		// Route the close to the child's owning worker.  If the child is
+		// already being destroyed the notify is rejected and the eventual
+		// shutdown nuke will reap it.
+		task_notify_action(c, FLG_CL, false, true);
 	}
 } // task_shutdown_listen_children
 
@@ -2201,61 +2320,72 @@ task_shutdown_listen_children(struct worker *w, struct task *t)
 static void
 worker_cleanup(struct worker *w)
 {
-	register struct ntfyq *qhead, *qtail, *tq;
+	struct ntfyq *owned, *locked, *tq;
 
-	if ((w->notifyq_head == NULL) && (w->notifyq_locked_head == NULL)) {
-		return;		// Nothing to do
-	}
-
-	
-	// Bulk grab the queue to process.  This minimises lock contention/churn
-	qhead = w->notifyq_head;
-	qtail = w->notifyq_tail;
+	// Bulk grab the queues to process.  This minimises lock contention/churn
+	owned = w->notifyq_head;
 	w->notifyq_head = NULL;
 	w->notifyq_tail = NULL;
 	w->freeq = NULL;
 
 	worker_lock(w);
-	if (w->notifyq_locked_head != NULL) {
-		if (qtail != NULL) {
-			qtail->next = w->notifyq_locked_head;
-		} else {
-			qhead = w->notifyq_locked_head;
-		}
-		qtail = w->notifyq_locked_tail;
-		w->notifyq_locked_head = NULL;
-		w->notifyq_locked_tail = NULL;
-	}
+	locked = w->notifyq_locked_head;
+	w->notifyq_locked_head = NULL;
+	w->notifyq_locked_tail = NULL;
 	w->freeq_locked = NULL;
 	worker_unlock(w);
 
-	for (tq = qhead; tq != NULL; tq = tq->next) {
-		struct task *t = tq->t;
-		task_action_flag_t action = tq->action;
+	// Process both lists, keeping the per-task notification accounting in
+	// step.  Without this, task_unlock() sees a non-zero notifyqlen and
+	// refuses to free the task during shutdown.
+	for (int pass = 0; pass < 2; pass++) {
+		for (tq = (pass == 0) ? owned : locked; tq != NULL; tq = tq->next) {
+			struct task *t = tq->t;
+			task_action_flag_t action = tq->action;
 
-		if (t->state != TASK_STATE_ACTIVE) {
-			continue;
-		}
+			if (t == NULL) {
+				continue;
+			}
 
-		// Just drop all the actions we see by forwarding them to task_do_close_cb()
-		if (action & (FLG_RT | FLG_WT)) {
-			continue;
+			if (pass == 0) {
+				if (t->notifyqlen) {
+					t->notifyqlen--;
+				}
+			} else if (ck_pr_load_64(&t->notifyqlen_locked)) {
+				ck_pr_dec_64(&t->notifyqlen_locked);
+			}
+
+			// The task may have migrated since this action was queued.
+			// Do not close it from the wrong thread; its new owner will
+			// process its own queued close, or the final nuke will reap it.
+			if (t->worker != w) {
+				continue;
+			}
+
+			if (t->state != TASK_STATE_ACTIVE) {
+				if (action != FLG_CL) {
+					task_unlock(t, action);
+					continue;
+				}
+			}
+
+			// Just drop all the actions we see by forwarding them to task_do_close_cb()
+			if (action & (FLG_RT | FLG_WT)) {
+				continue;
+			}
+			t->stride->close_cb = NULL;
+			task_lock(t, FLG_CL);
+			if ((action & FLG_CL) == 0) {
+				task_unlock(t, action);
+			}
+			task_do_close_cb(t);
 		}
-		t->stride->close_cb = NULL;
-		task_lock(t, FLG_CL);
-		if ((action & FLG_CL) == 0) {
-			task_unlock(t, action);
-		}
-		task_do_close_cb(t);
 	}
 
-	// Free up our batch allocated memory
-	worker_lock(w);
-	while ((tq = w->notifyq_batches) != NULL) {
-		w->notifyq_batches = tq->next;
-		free(tq);
-	}
-	worker_unlock(w);
+	// Notification batches are deliberately *not* freed here.  During
+	// shutdown another worker may still notify a task owned by this worker;
+	// queued nodes may point into these batches.  worker_destroy() frees
+	// them once every worker thread has stopped.
 } // worker_cleanup
 
 
@@ -2264,9 +2394,19 @@ static void
 worker_destroy(struct worker *w)
 {
 	struct instance *i;
+	struct ntfyq *tq;
 
 	if (w == NULL) return;
 	i = w->instance;
+
+	// Make sure the thread has actually exited before freeing its state.
+	// The self-join guard covers the hard-shutdown path.
+	if (w->started) {
+		if (!pthread_equal(pthread_self(), w->thr)) {
+			pthread_join(w->thr, NULL);
+		}
+		w->started = 0;
+	}
 
 	// Remove from instance's list of IO workers
 	if (w->type == WORKER_TYPE_IO) {
@@ -2282,7 +2422,12 @@ worker_destroy(struct worker *w)
 	// and will never have been chosen for any of the worker's fd's
 	if (w->evfd >= 0) {
 		close(w->evfd);
-		w->evfd = 0;
+		w->evfd = -1;
+	}
+	// Free any notification batches not already released by worker_cleanup()
+	while ((tq = w->notifyq_batches) != NULL) {
+		w->notifyq_batches = tq->next;
+		free(tq);
 	}
 	if (w->timer_queue) {
 		pheap_destroy(w->timer_queue, NULL);
@@ -2459,6 +2604,10 @@ worker_set_state(struct worker *w, worker_state_t new_state)
 		break;
 	case WORKER_STATE_DEAD:
 		TAILQ_INSERT_TAIL(&i->workers_dead, w, list);
+		// A dead blocking worker no longer counts against the pool limit
+		if ((w->type == WORKER_TYPE_BLOCKING) && (i->num_blocking_workers > 0)) {
+			i->num_blocking_workers--;
+		}
 		break;
 	default:
 		assert(0);
@@ -2915,6 +3064,9 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 
 		// End of file response check
 		if (reddin == 0) {
+			task_lower_event_flag(t, EPOLLIN);
+			t->rd_shut = true;
+
 			// Notify first if we have anything in the buffer.  The actual EOF
 			// condition will have to get picked up on the next read attempt
 			if (rdv_bufpos > 0) {
@@ -3135,23 +3287,21 @@ task_handle_listen_event(struct task *t)
 		socklen_t			addrlen;
 
 		// Attempt to accept.  Break out of loop if nothing is there to pick up
-		addrlen = sizeof(addrlen);
+		addrlen = sizeof(addr);
 		if ((cfd = accept(t->fd, (struct sockaddr *)&addr, &addrlen)) < 0) {
 			task_action_t ta;
 
 			switch(errno) {
 			case EAGAIN:
-				ta = TASK_ACTION_ABORT;
-#ifdef USE_EPOLLONESHOT
-				// Re-arm the io event
-				if (task_raise_event_flag(t, EPOLLIN) < 0) {
-					perror("task_raise_event_flag");
-					goto task_handle_listen_event_fail;
-				}
-#endif
-				break;
 			case EMFILE:
 			case ENFILE:
+			case ECONNABORTED:
+			case EPROTO:
+			case EPERM:
+			case ENOBUFS:
+			case ENOMEM:
+				// Transient/soft conditions.  Abort this accept batch but
+				// keep the listener alive and re-arm it below.
 				ta = TASK_ACTION_ABORT;
 				break;
 			case EINTR:
@@ -3164,7 +3314,19 @@ task_handle_listen_event(struct task *t)
 
 			if (ta == TASK_ACTION_RETRY) {
 				continue;
-			} else if (ta == TASK_ACTION_ABORT) {
+			}
+#ifdef USE_EPOLLONESHOT
+			if (ta == TASK_ACTION_ABORT) {
+				// Re-arm the one-shot listener event.  Without this the
+				// listener silently stops accepting after a transient
+				// condition such as EMFILE.
+				if (task_raise_event_flag(t, EPOLLIN) < 0) {
+					perror("task_raise_event_flag");
+					goto task_handle_listen_event_fail;
+				}
+			}
+#endif
+			if (ta == TASK_ACTION_ABORT) {
 				break;
 			}
 			goto task_handle_listen_event_fail;
@@ -3208,8 +3370,12 @@ task_handle_listen_event(struct task *t)
 			continue;
 		}
 
+		// Record the peer address against the accepted connection, and learn
+		// CPU affinity from the accepted socket rather than the listener
+		t_new->addrlen = addrlen;
+		memcpy(&t_new->stride->addr, &addr, addrlen);
 		if (!i->all_io_workers_affined) {
-			worker_learn_cpu_affinity(t);
+			worker_learn_cpu_affinity(t_new);
 		}
 
 		t_new->stride->accept_cb = t->stride->accept_cb;
@@ -3381,10 +3547,24 @@ worker_handle_instance(struct instance *i)
 				instance_lock(i);
 			}
 
-			// Place the worker on the idle queue, but don't
-			// notify it. It doesn't have anything to do yet
-			w->state = WORKER_STATE_IDLE;
-			TAILQ_INSERT_TAIL(&i->workers_idle, w, list);
+			// The worker was temporarily off all lists while its callback
+			// ran.  If shutdown started during that window it would have
+			// been missed by instance_shutdown_workers(), so put it
+			// straight onto the shutdown list instead of idling it.
+			if (i->state == INSTANCE_STATE_SHUTTING_DOWN) {
+				w->old_state = w->state;
+				w->state = WORKER_STATE_SHUTTING_DOWN;
+				TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
+				worker_notify(w);
+			} else {
+				// Place the worker on the idle queue, but don't
+				// notify it. It doesn't have anything to do yet.
+				// Keep old_state/counters consistent with the list move.
+				w->old_state = w->state;
+				w->state = WORKER_STATE_IDLE;
+				i->num_blocking_idle++;
+				TAILQ_INSERT_TAIL(&i->workers_idle, w, list);
+			}
 		}
 		instance_unlock(i);
 	}
@@ -3410,6 +3590,7 @@ worker_handle_instance(struct instance *i)
 			if ((w = TAILQ_FIRST(&i->workers_idle))) {
 				w->old_state = w->state;
 				w->state = WORKER_STATE_SHUTTING_DOWN;
+				i->num_blocking_idle--;
 				TAILQ_REMOVE(&i->workers_idle, w, list);
 				TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
 			}
@@ -3442,6 +3623,7 @@ worker_handle_event(struct worker *w, uint32_t events)
 	}
 
 	if (events & (EPOLLERR | EPOLLHUP)) {
+		ck_pr_store_32(&w->notified, 0);
 		close(w->evfd);
 		w->evfd = -1;
 		worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
@@ -3450,24 +3632,27 @@ worker_handle_event(struct worker *w, uint32_t events)
 
 	// Pull off the event notification from the input queue
 	while (true) {
-		int len;
+		ssize_t len;
 
-		w__notified = 0;
-		if ((len = read(w->evfd, (void *)&c, sizeof(c)) < 0)) {
+		len = read(w->evfd, (void *)&c, sizeof(c));
+		if (len < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
 			if (errno == EAGAIN) {
+				ck_pr_store_32(&w->notified, 0);
 				break;
 			}
-		} else if (len >= 0) {
-			// We picked up the notification
+			// serious read error.  Close our eventfd and set worker to shutdown
+			ck_pr_store_32(&w->notified, 0);
+			close(w->evfd);
+			w->evfd = -1;
+			worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
 			break;
 		}
-		// weird length read or other serious error.  Close our eventfd and set worker to shutdown
-		close(w->evfd);
-		w->evfd = -1;
-		worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
+
+		// We picked up the notification
+		ck_pr_store_32(&w->notified, 0);
 		break;
 	}
 } // worker_handle_event
@@ -3502,13 +3687,19 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 #ifdef USE_EPOLLET
 	t->events &= ~(EPOLLET);		// Don't do an ADD with EPOLLET set
 #endif
-	if ((t->fd >= 0) && t->in_epoll) {
+	// Always update epfd, even if the task is not currently armed.  Otherwise
+	// a later task_raise_event_flag() would arm the fd in the old worker's
+	// epoll set while t->worker points at the new worker.
+	if (t->fd >= 0) {
+		int was_in_epoll = t->in_epoll;
 		struct epoll_event ev = { .data.ptr = t, .events = t->events };
 
-		epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
-		t->in_epoll = false;
+		if (was_in_epoll) {
+			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
+			t->in_epoll = false;
+		}
 		t->epfd = tw->gepfd;
-		if (epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev) == 0) {
+		if (was_in_epoll && (epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev) == 0)) {
 			t->in_epoll = true;
 #ifdef USE_EPOLLET
 			t->events |= EPOLLET;	// Set EPOLLET in the task ev flags now.
@@ -3598,13 +3789,7 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	}
 
 	if (action == FLG_CL) {
-		// If we're an accept parent with children then shut them down now
-		if (t->type == TASK_TYPE_LISTEN) {
-			if (t->listen_child == 0) {
-				task_shutdown_listen_children(w, t);
-			}
-			t->rd_state = TASK_READ_STATE_IDLE;
-		}
+		// task_do_close_cb() also shuts down any child listeners
 		task_do_close_cb(t);	// FLG_CL is always reset by task_do_close_cb
 		return;
 	}
@@ -3699,14 +3884,9 @@ worker_process_notifyq(register struct worker *w)
 			if (locked) {
 				ck_pr_dec_64(&t->notifyqlen_locked);
 			} else {
-				// Determine if it's one of the task's private freeq entries
-				if ((tq == &t->free1) || (tq == &t->free2)) {
-					tq->next = t->freeq;
-					t->freeq = tq;
-				} else {
-					tq->next = t->freeq_overflow;
-					t->freeq_overflow = tq;
-				}
+				// Return the node to the worker's own free list
+				tq->next = w->freeq;
+				w->freeq = tq;
 				t->notifyqlen--;
 			}
 
@@ -3869,20 +4049,28 @@ worker_do_io_epoll(register struct worker *w)
 			// Shutdown both connection sides and force an IO event
 			// which should make a system call to detect what happened
 			if (revents & (EPOLLERR | EPOLLHUP)) {
+				bool handled;
 worker_do_io_epoll_fail:
+				handled = false;
 				t->rd_shut = true;
 				t->wr_shut = true;
 				t->in_epoll = false;
 				epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
 				if (t->rd_state != TASK_READ_STATE_IDLE) {
 					task_handle_rd_event(t);	// Unlocks  the task
-					continue;
+					handled = true;
 				}
-				if (t->wr_state != TASK_WRITE_STATE_IDLE) {
-					task_handle_wr_event(t);	// Unlocks  the task
-					continue;
+				// Signal the write side too.  Previously a pending writer
+				// could wait forever (or until its timeout) when the read
+				// side handled the error first.
+				if ((t->state == TASK_STATE_ACTIVE) &&
+				    (t->wr_state != TASK_WRITE_STATE_IDLE)) {
+					task_handle_wr_event(t);	// Unlocks the task
+					handled = true;
 				}
-				task_notify_action(t, FLG_CL, false, true);
+				if (!handled) {
+					task_notify_action(t, FLG_CL, false, true);
+				}
 				continue;
 			}
 
@@ -3961,35 +4149,39 @@ worker_loop_blocking(void *arg)
 	__thr_current_worker = NULL;
 	__thr_current_instance = w->instance;
 
-	while((w->state == WORKER_STATE_IDLE) ||
-	      (w->state == WORKER_STATE_NOTIFYING)) {
+	while ((w->state == WORKER_STATE_IDLE) ||
+	       (w->state == WORKER_STATE_NOTIFYING) ||
+	       (w->state == WORKER_STATE_BLOCKING)) {
 		uint64_t c;
 
-		// Wait for something to happen! This is a blocking read
-		w__notified = 0;
-		int len = read(w->evfd, (void *)&c, sizeof(c));
-		w__notified = 0;
+		// If work is already pending (a new worker, or one just reserved by
+		// TASK_do_blocking_work()), run it immediately.  Otherwise wait for
+		// the dispatcher to notify us.
+		if (w->state != WORKER_STATE_BLOCKING) {
+			ssize_t len;
 
-		if (len < 0) {
-			if (errno != EINTR) {
+			ck_pr_store_32(&w->notified, 0);
+			len = read(w->evfd, (void *)&c, sizeof(c));
+			if (len < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
 				perror("read");
 				worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
 				break;
 			}
+			ck_pr_store_32(&w->notified, 0);
+
+			if ((w->state == WORKER_STATE_SHUTTING_DOWN) ||
+			    (w->state == WORKER_STATE_DEAD)) {
+				break;
+			}
+		}
+
+		// A spurious wakeup can leave us with no work to do
+		if (w->state != WORKER_STATE_BLOCKING) {
 			continue;
 		}
-
-		if (len == 0) {
-			continue;
-		}
-
-		if ((w->state == WORKER_STATE_SHUTTING_DOWN) ||
-		    (w->state == WORKER_STATE_DEAD)) {
-			break;
-		}
-
-		assert(w->state == WORKER_STATE_IDLE);
-		worker_set_state(w, WORKER_STATE_BLOCKING);
 
 		if (w->work_func) {
 			void (*work_func)(void *work_data), *work_data;
@@ -4031,10 +4223,14 @@ worker_start(struct worker *w)
 	}
 
 	if (w->type == WORKER_TYPE_BLOCKING) {
-		worker_set_state(w, WORKER_STATE_BLOCKING);
-		// Create worker thread for handling task requests
-		if (pthread_create(&w->thr, NULL, worker_loop_blocking, w) != 0) {
-			goto worker_start_failed;
+		// Only create the thread once.  Reused idle workers already have a
+		// thread blocked on their eventfd and only need a wakeup.
+		if (!w->started) {
+			worker_set_state(w, WORKER_STATE_BLOCKING);
+			if (pthread_create(&w->thr, NULL, worker_loop_blocking, w) != 0) {
+				goto worker_start_failed;
+			}
+			w->started = 1;
 		}
 		worker_notify(w);
 		return 0;
@@ -4046,6 +4242,7 @@ worker_start(struct worker *w)
 		if (pthread_create(&w->thr, NULL, worker_loop_io, w) != 0) {
 			goto worker_start_failed;
 		}
+		w->started = 1;
 		worker_notify(w);
 		return 0;
 	} 
@@ -4080,6 +4277,9 @@ worker_create(struct instance *i, int worker_type)
 		return NULL;
 	}
 	memset(w, 0, sz);
+	// memset() leaves these as 0, which is stdin; use explicit invalid values
+	w->gepfd = -1;
+	w->evfd = -1;
 
 	if ((w->events = aligned_alloc(__page_size, (__page_size * num_pages))) == NULL) {
 		goto worker_create_failed;
@@ -4236,6 +4436,8 @@ instance_listen_balance(struct task *t)
 
 		// Now listen on it
 		if (listen(nfd, TASK_LISTEN_BACKLOG) < 0) {
+			perror("instance_listen_balance->listen");
+			close(nfd);
 			continue;
 		}
 
@@ -4243,12 +4445,14 @@ instance_listen_balance(struct task *t)
 		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->stride->close_cb_data,
 				      t->stride->close_cb, false)) == NULL) {
 			perror("instance_listen_balance->task_create");
+			close(nfd);
 			continue;
 		}
 
 		// Convert new task to an listener type and inform task to expect incoming events
 		memcpy(&nt->stride->addr, &t->stride->addr, t->addrlen);
 		nt->listen_child = 1;
+		nt->stride->parent_tfd = t->tfd;
 		nt->addrlen = t->addrlen;
 		nt->stride->accept_cb = t->stride->accept_cb;
 		nt->stride->accept_cb_data = t->stride->accept_cb_data;
@@ -4257,8 +4461,8 @@ instance_listen_balance(struct task *t)
 		if (task_raise_event_flag(nt, EPOLLIN) < 0) {
 			perror("instance_listen_balance->task_raise_event_flag");
 			task_lower_event_flag(nt, (EPOLLIN | EPOLLOUT));
-			nt->state = TASK_STATE_DESTROY;
-			task_unlock(nt, (task_action_flag_t)0xffff);
+			// Let the owning worker close the fd and free the task
+			task_notify_action(nt, FLG_CL, false, true);
 			continue;
 		}
 
@@ -4267,29 +4471,6 @@ instance_listen_balance(struct task *t)
 		nt->task_next = w->listeners;
 		w->listeners = nt;
 		worker_unlock(w);
-
-		// Add the new listener to the parent listener list
-		struct ntfyq *ntq = NULL;
-
-		if (lockless_worker(w)) {
-			if ((ntq = w->freeq) != NULL) {
-				w->freeq = ntq->next;
-			}
-		} else {
-			worker_lock(w);
-			if ((ntq = w->freeq_locked) != NULL) {
-				w->freeq_locked = ntq->next;
-			}
-			worker_unlock(w);
-		}
-		if (ntq == NULL) {
-			ntq = worker_notify_get_free_ntfyq(w);
-			assert(ntq != NULL);	// Out of memory
-		}
-		ntq->t = nt;
-		ntq->action = FLG_LI;
-		ntq->next = t->listen_children;
-		t->listen_children = ntq;
 	}
 } // instance_listen_balance
 
@@ -4321,48 +4502,77 @@ instance_reap_workers(struct instance *i)
 } // instance_reap_workers
 
 
-// Ask all tasks to shutdown.
+// Queue a close action for every live task.  The task's owning worker performs
+// the actual fd/timer cleanup, preserving the single-owner access model instead
+// of mutating another worker's state from the shutdown thread.
 static void
-instance_shutdown_tasks(struct instance *i, int force)
+instance_queue_shutdown(struct instance *i)
 {
-	int num_open;
-	(void)force;
+	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+		struct task *t = i->tfd_pool + n;
 
-	// Just iterates over the entire instance task pool and if it finds
-	// an open task, it forces it to shut down
-	do {
-		num_open = 0;
-		for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
-			struct task *t = i->tfd_pool + n;
-			if ((t->state == TASK_STATE_ACTIVE) && force) {
-				task_nuke(n);
-				num_open++;
+		if ((t->state == TASK_STATE_ACTIVE) && (t->worker != NULL)) {
+			task_notify_action(t, FLG_CL, false, true);
+		}
+	}
+} // instance_queue_shutdown
+
+
+// Nuke any task that survived the worker cleanup phase.  This must only be
+// called after all workers have been reaped, otherwise t->worker would be a
+// dangling pointer.
+static void
+instance_nuke_tasks(struct instance *i)
+{
+	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
+		struct task *t = i->tfd_pool + n;
+
+		if ((t->state == TASK_STATE_ACTIVE) || (t->state == TASK_STATE_DESTROY)) {
+			// Workers are gone.  Do not try to touch their timer queues.
+			t->worker = NULL;
+			task_nuke(n);
+		}
+	}
+} // instance_nuke_tasks
+
+
+// Wait until all workers have transitioned to DEAD.  Worker state changes
+// notify the instance eventfd, so this blocks without polling.
+static void
+instance_wait_workers(struct instance *i)
+{
+	for (;;) {
+		bool busy;
+
+		instance_lock(i);
+		busy = !TAILQ_EMPTY(&i->workers_created) ||
+		       !TAILQ_EMPTY(&i->workers_running) ||
+		       !TAILQ_EMPTY(&i->workers_blocking) ||
+		       !TAILQ_EMPTY(&i->workers_notify) ||
+		       !TAILQ_EMPTY(&i->workers_idle) ||
+		       !TAILQ_EMPTY(&i->workers_shutdown);
+		instance_unlock(i);
+
+		if (!busy) {
+			return;
+		}
+
+		if (i->evfd < 0) {
+			poll(NULL, 0, 1000);
+			continue;
+		}
+
+		uint64_t c;
+		ssize_t len = read(i->evfd, (void *)&c, sizeof(c));
+		if (len < 0) {
+			if ((errno == EINTR) || (errno == EAGAIN)) {
 				continue;
 			}
-			if (t->state == TASK_STATE_ACTIVE) {
-				if ((t->fd >= 0) && (t->registered_fd == false)) {
-					int flags[1] = {0};
-
-					// Set socket back to blocking, which allows shutdown
-					// and close calls to return only when cleanly shutdown
-					ioctl(t->fd, FIONBIO, flags);
-					shutdown(t->fd, SHUT_RDWR);
-
-					// Don't close listener sockets on the first pass
-					if (t->type != TASK_TYPE_LISTEN) {
-						close(t->fd);
-						t->fd = -1;
-					}
-				}
-				task_destroy_timeouts(t);
-				t->state = TASK_STATE_DESTROY;
-				worker_notify(t->worker);
-				num_open++;
-			}
+			close(i->evfd);
+			i->evfd = -1;
 		}
-		usleep(100000);
-	} while (force && (num_open > 0));
-} // instance_shutdown_tasks
+	}
+} // instance_wait_workers
 
 
 // Ask all workers to shutdown.
@@ -4383,12 +4593,32 @@ instance_shutdown_workers(struct instance *i)
 	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_notify, list);
 
 	while ((w = TAILQ_FIRST(&workers_to_shutdown))) {
-		w->state = WORKER_STATE_SHUTTING_DOWN;
+		bool notify = true;
+
 		TAILQ_REMOVE(&workers_to_shutdown, w, list);
-		TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
-		instance_unlock(i);
-		worker_notify(w);
-		instance_lock(i);
+
+		if ((w->state == WORKER_STATE_CREATED) && !w->started) {
+			// The thread was never created, so there is nothing to wake.
+			// Move it straight to DEAD so the shutdown waiter does not
+			// block forever.
+			w->old_state = w->state;
+			w->state = WORKER_STATE_DEAD;
+			if ((w->type == WORKER_TYPE_BLOCKING) &&
+			    (i->num_blocking_workers > 0)) {
+				i->num_blocking_workers--;
+			}
+			TAILQ_INSERT_TAIL(&i->workers_dead, w, list);
+			notify = false;
+		} else {
+			w->state = WORKER_STATE_SHUTTING_DOWN;
+			TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
+		}
+
+		if (notify) {
+			instance_unlock(i);
+			worker_notify(w);
+			instance_lock(i);
+		}
 	}
 	instance_unlock(i);
 } // instance_shutdown_workers
@@ -4450,8 +4680,8 @@ instance_destroy(struct instance *i)
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
 	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-		if (instances[ti] == i) {
-			instances[ti] = NULL;
+		if (ck_pr_load_ptr(&instances[ti]) == i) {
+			ck_pr_store_ptr(&instances[ti], NULL);
 			break;
 		}
 	}
@@ -4624,6 +4854,9 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 			i->num_cpu_rows = rows;
 			for (int n = 0; n < i->num_cpus; n++) {
 				i->cpus[n].workers = (struct worker **)calloc(rows, sizeof(struct worker *));
+				if (i->cpus[n].workers == NULL) {
+					goto instance_creation_fail;
+				}
 			}
 		}
 	}
@@ -4634,7 +4867,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
-	instances[ti] = i;
+	ck_pr_store_ptr(&instances[ti], i);
 
 	return i;
 
@@ -4680,7 +4913,14 @@ TASK_timeout_destroy(int64_t tfd)
 
 	t->tm_cancelled = true;
 	t->tm_tt.expiry_us = TIMER_TIME_DESTROY;
-	task_notify_action(t, FLG_TM, false, true);
+
+	if (t->type == TASK_TYPE_TIMER) {
+		// Standalone timer tasks have no fd or other owner, so destroy the
+		// task itself.  For socket-backed tasks this behaves as a cancel.
+		task_notify_action(t, FLG_CL, false, true);
+	} else {
+		task_notify_action(t, FLG_TM, false, true);
+	}
 	task_unlock(t, FLG_TD);
 	return 0;
 } // TASK_timeout_destroy
@@ -4694,7 +4934,10 @@ TASK_timeout_cancel(int64_t tfd)
 
 	if (t == NULL) return -1;	// errno already set
 
+	// task_update_timer() decides based on the expiry value, so a bare
+	// tm_cancelled flag would just be cleared when the FLG_TM action runs
 	t->tm_cancelled = true;
+	t->tm_tt.expiry_us = TIMER_TIME_CANCEL;
 	task_notify_action(t, FLG_TM, false, true);
 	task_unlock(t, FLG_TC);
 	return 0;
@@ -4734,7 +4977,7 @@ TASK_timeout_set(int64_t tfd, int64_t us_from_now, void *timeout_cb_data,
 // this is not known, then to a random IO worker.
 // The time from now cannot be negative or more than one year into the future
 int64_t
-TASK_timeout_create(int32_t ti, intptr_t us_from_now, void *timeout_cb_data,
+TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data,
 		   void (*timeout_cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data))
 {
 	struct instance *i;
@@ -4792,47 +5035,61 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	int n;
 
 	if (t == NULL) {
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->wr_shut) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->wr_cancel) {
 		task_unlock(t, FLG_WR);
 		errno = EOWNERDEAD;
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 		task_unlock(t, FLG_WR);
 		errno = EBUSY;
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	// Validate the iov arguments and determine total read length
-	if ((iovcnt < 0) || (iovcnt > IOV_MAX)) {
+	if ((iov == NULL) || (iovcnt < 0) || (iovcnt > IOV_MAX)) {
 		task_unlock(t, FLG_WR);
 		errno = EINVAL;
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	for (n = 0; n < iovcnt; n++) {
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_WR);
 			errno = EINVAL;
-			return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+			if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+			return;
 		}
 		wrv_buflen += iov[n].iov_len;
+	}
+
+	if (wrv_buflen == 0) {
+		task_unlock(t, FLG_WR);
+		errno = EINVAL;
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	t->wrv_iov = iov;
@@ -4856,7 +5113,8 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		}
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return wrv_cb(tfd, iov, iovcnt, result, wr_cb_data);
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, result, wr_cb_data);
+		return;
 	} else {
 		t->io_depth = 0;
 	}
@@ -4865,7 +5123,8 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 	if (task_notify_action(t, FLG_WR, false, true) == false) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);	// errno already set
+		if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+		return;
 	}
 
 	// The operation is queued.  Just return
@@ -4880,31 +5139,43 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	register struct task *t = task_lookup(tfd, FLG_WR);
 
 	if (t == NULL) {
-		return wr_cb(tfd, wrbuf, -1, wr_cb_data);	// errno already set
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->wr_shut) {
 		task_unlock(t, FLG_WR);
 		errno = EPIPE;
-		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->wr_cancel) {
 		task_unlock(t, FLG_WR);
 		errno = EOWNERDEAD;
-		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_WR);
 		errno = EBADF;
-		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
 	}
 
 	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
 		task_unlock(t, FLG_WR);
 		errno = EBUSY;
-		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
+	}
+
+	if (buflen == 0) {
+		task_unlock(t, FLG_WR);
+		errno = EINVAL;
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
 	}
 
 	t->wr_bufpos = 0;
@@ -4927,7 +5198,8 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 		}
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return wr_cb(tfd, wrbuf, result, wr_cb_data);
+		if (wr_cb) wr_cb(tfd, wrbuf, result, wr_cb_data);
+		return;
 	} else {
 		t->io_depth = 0;
 	}
@@ -4936,7 +5208,8 @@ TASK_socket_write(int64_t tfd, const void *wrbuf, size_t buflen, int64_t expires
 	if (task_notify_action(t, FLG_WR, false, true) == false) {
 		t->wr_expires_modified = false;
 		t->wr_state = TASK_WRITE_STATE_IDLE;
-		return wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		if (wr_cb) wr_cb(tfd, wrbuf, -1, wr_cb_data);
+		return;
 	}
 
 	// The operation is queued.  Just return
@@ -4952,47 +5225,61 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	int n;
 
 	if (t == NULL) {
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);	// errno already set
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->rd_shut) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->rd_cancel) {
 		task_unlock(t, FLG_RD);
 		errno = EOWNERDEAD;
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_RD);
 		errno = EBADF;
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->rd_state != TASK_READ_STATE_IDLE) {
 		task_unlock(t, FLG_RD);
 		errno = EBUSY;
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	// Validate the iov arguments and determine total read length
-	if ((iovcnt < 0) || (iovcnt > IOV_MAX)) {
+	if ((iov == NULL) || (iovcnt < 0) || (iovcnt > IOV_MAX)) {
 		task_unlock(t, FLG_RD);
 		errno = EINVAL;
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	for (n = 0; n < iovcnt; n++) {
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_RD);
 			errno = EINVAL;
-			return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+			if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+			return;
 		}
 		rdv_buflen += iov[n].iov_len;
+	}
+
+	if (rdv_buflen == 0) {
+		task_unlock(t, FLG_RD);
+		errno = EINVAL;
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	t->rdv_iov = iov;
@@ -5016,7 +5303,8 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		}
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return rdv_cb(tfd, iov, iovcnt, result, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, result, rd_cb_data);
+		return;
 	} else {
 		t->io_depth = 0;
 	}
@@ -5025,7 +5313,8 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 	if (task_notify_action(t, FLG_RD, false, true) == false) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+		return;
 	}
 
 	// The operation is queued.  Just return
@@ -5039,31 +5328,43 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	register struct task *t = task_lookup(tfd, FLG_RD);
 
 	if (t == NULL) {
-		return rd_cb(tfd, rdbuf, -1, rd_cb_data);	// errno already set
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->rd_shut) {
 		task_unlock(t, FLG_RD);
 		errno = EPIPE;
-		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->rd_cancel) {
 		task_unlock(t, FLG_RD);
 		errno = EOWNERDEAD;
-		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_RD);
 		errno = EBADF;
-		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
 	}
 
 	if (t->rd_state != TASK_READ_STATE_IDLE) {
 		task_unlock(t, FLG_RD);
 		errno = EBUSY;
-		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
+	}
+
+	if (buflen == 0) {
+		task_unlock(t, FLG_RD);
+		errno = EINVAL;
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
 	}
 
 	t->rd_bufpos = 0;
@@ -5086,7 +5387,8 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 		}
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return rd_cb(tfd, rdbuf, result, rd_cb_data);
+		if (rd_cb) rd_cb(tfd, rdbuf, result, rd_cb_data);
+		return;
 	} else {
 		t->io_depth = 0;
 	}
@@ -5095,7 +5397,8 @@ TASK_socket_read(int64_t tfd, void *rdbuf, size_t buflen, int64_t expires_in_us,
 	if (task_notify_action(t, FLG_RD, false, true) == false) {
 		t->rd_expires_modified = false;
 		t->rd_state = TASK_READ_STATE_IDLE;
-		return rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		if (rd_cb) rd_cb(tfd, rdbuf, -1, rd_cb_data);
+		return;
 	}
 
 	// The operation is queued.  Just return
@@ -5131,15 +5434,23 @@ TASK_migrate(int64_t to_tfd, int64_t from_tfd)
 
 	// Validate the TFD
 	if (to_tfd < 0) {
+		task_unlock(from_t, FLG_MG);
 		errno = ERANGE;
 		return -1;
 	}
 	if (to_tfdi >= __thr_current_instance->tfd_pool_size) {
+		task_unlock(from_t, FLG_MG);
 		errno = ERANGE;
 		return -1;
 	}
 	tw = __thr_current_instance->tfd_pool[to_tfdi].worker;
+	if (tw == NULL) {
+		task_unlock(from_t, FLG_MG);
+		errno = EBADF;
+		return -1;
+	}
 	if (from_t->worker == tw) {
+		task_unlock(from_t, FLG_MG);
 		errno = EALREADY;
 		return -1;
 	}
@@ -5234,21 +5545,13 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 		return -1;
 	}
 
-	// Set the SO_REUSEADDR and SO_REUSEPORT flag on the socket
+	// SO_REUSEADDR/SO_REUSEPORT are normally set by TASK_socket_bind()
+	// before bind().  Re-apply them here for externally-bound registered
+	// sockets, but do not fail the listen if a family doesn't support them
+	// (e.g. AF_UNIX).
 	int val = 1;
-	if (setsockopt(t->fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) < 0) {
-		int err = errno;
-		task_unlock(t, FLG_LI);
-		errno = err;
-		return -1;
-	}
-
-	if (setsockopt(t->fd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val)) < 0) {
-		int err = errno;
-		task_unlock(t, FLG_LI);
-		errno = err;
-		return -1;
-	}
+	(void)setsockopt(t->fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+	(void)setsockopt(t->fd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
 
 	// Start the listen
 	if (listen(t->fd, TASK_LISTEN_BACKLOG) < 0) {
@@ -5291,13 +5594,33 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 	register struct instance *i;
 
 	if ((t = task_lookup(tfd, FLG_CO)) == NULL) {
-		return connect_cb(tfd, -1, connect_cb_data);		// errno already set
+		if (connect_cb) connect_cb(tfd, -1, connect_cb_data);	// errno already set
+		return;
+	}
+
+	// Validate the address arguments before copying them into the task.
+	// task_stride->addr is a sockaddr_storage and is followed by callback
+	// pointers, so an oversized addrlen would corrupt task state.
+	if ((addr == NULL) || (addrlen < sizeof(sa_family_t)) ||
+	    (addrlen > sizeof(t->stride->addr))) {
+		task_unlock(t, FLG_CO);
+		errno = EINVAL;
+		if (connect_cb) connect_cb(tfd, -1, connect_cb_data);
+		return;
 	}
 
 	if (t->fd < 0) {
 		task_unlock(t, FLG_CO);
 		errno = EBADF;
-		return connect_cb(tfd, -1, connect_cb_data);
+		if (connect_cb) connect_cb(tfd, -1, connect_cb_data);
+		return;
+	}
+
+	if (t->wr_state != TASK_WRITE_STATE_IDLE) {
+		task_unlock(t, FLG_CO);
+		errno = EBUSY;
+		if (connect_cb) connect_cb(tfd, -1, connect_cb_data);
+		return;
 	}
 
 	// Handle affinity stuff
@@ -5334,8 +5657,16 @@ TASK_socket_bind(int64_t tfd, struct sockaddr *addr, socklen_t addrlen)
 		return -1;
 	}
 
+	// REUSEADDR/REUSEPORT must be set before bind() or the listener
+	// balancing children may fail to bind to the same address.  Ignore
+	// unsupported socket families (e.g. AF_UNIX).
+	int val = 1;
+	(void)setsockopt(t->fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+	(void)setsockopt(t->fd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
+
 	// Bind to the given address
-	int ret = bind(t->fd, addr, addrlen), err = errno;
+	int ret = bind(t->fd, addr, addrlen);
+	int err = (ret < 0) ? errno : 0;
 	task_unlock(t, FLG_BND);
 	errno = err;
 	return ret;
@@ -5417,7 +5748,8 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 {
 	struct instance *i;
 	struct task *t;
-	int sock, tfd;
+	int sock;
+	int64_t tfd;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
@@ -5533,8 +5865,14 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	}
 
 	if((w = TAILQ_FIRST(&i->workers_idle))) {
+		// Reserve the worker while keeping its state machine bookkeeping
+		// consistent with the list it is actually on.  The worker thread
+		// is blocked on read(evfd) and will see WORKER_STATE_BLOCKING
+		// when the notification wakes it.
 		i->num_blocking_idle--;
 		TAILQ_REMOVE(&i->workers_idle, w, list);
+		w->old_state = w->state;
+		w->state = WORKER_STATE_BLOCKING;
 		TAILQ_INSERT_TAIL(&i->workers_blocking, w, list);
 	}
 
@@ -5578,7 +5916,10 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 
 	// If we don't start it now, it'll get started when TASK_instance_start() is called
 	if (do_start) {
-		worker_start(w);
+		if (worker_start(w) < 0) {
+			errno = EAGAIN;
+			return -1;
+		}
 	}
 
 	return 0;
@@ -5637,24 +5978,41 @@ TASK_instance_destroy(int32_t ti)
 		return -1;
 	}
 
-	if ((i->state != INSTANCE_STATE_CREATED) && (i->state != INSTANCE_STATE_RUNNING)) {
+	if ((i->state != INSTANCE_STATE_CREATED) &&
+	    (i->state != INSTANCE_STATE_RUNNING) &&
+	    (i->state != INSTANCE_STATE_SHUTTING_DOWN)) {
 		errno = EBADF;
 		pthread_mutex_unlock(&creation_lock);
 		return -1;
 	}
 
-	__thr_current_instance = i;
+	// Save the shutdown notification before the instance is freed
+	void (*shutdown_cb)(intptr_t ti, void *data) = i->shutdown_cb;
+	void *shutdown_data = i->shutdown_data;
+	bool need_queue = (i->state != INSTANCE_STATE_SHUTTING_DOWN);
 
+	__thr_current_instance = i;
 	i->state = INSTANCE_STATE_SHUTTING_DOWN;
 
+	// Queue closes before stopping the workers so every close is processed by
+	// the task's owning worker.  If a shutdown is already in progress the
+	// closes were queued by TASK_instance_shutdown().
+	if (need_queue) {
+		instance_queue_shutdown(i);
+	}
+
 	instance_shutdown_workers(i);
-	usleep(500000);			// Sleep for half a second to give workers a chance to clean up
-	instance_shutdown_tasks(i, 1);
+	instance_wait_workers(i);
+	instance_reap_workers(i);
+	instance_nuke_tasks(i);
 
 	instance_destroy(i);
-
-	instances[ti] = NULL;
+	ck_pr_store_ptr(&instances[ti], NULL);
 	pthread_mutex_unlock(&creation_lock);
+
+	if (shutdown_cb) {
+		shutdown_cb(ti, shutdown_data);
+	}
 	return 0;
 } // TASK_instance_destroy
 
@@ -5672,12 +6030,17 @@ TASK_instance_wait(int32_t ti)
 
 	i = instances[ti];
 
-	if (i->magic != INSTANCE_MAGIC) {
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
 		return -1;
 	}
 
 	__thr_current_instance = i;
+
+	// Nothing has been started yet, so there is nothing to wait for
+	if (i->state == INSTANCE_STATE_CREATED) {
+		return 0;
+	}
 
 	for (;;) {
 		worker_handle_instance(i);
@@ -5761,7 +6124,10 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 	i->state = INSTANCE_STATE_SHUTTING_DOWN;
 	i->shutdown_cb = shutdown_cb;
 	i->shutdown_data = shutdown_data;
-	instance_shutdown_tasks(i, 0);
+
+	// Queue the closes first, then stop the workers.  worker_cleanup() will
+	// process the queued closes on each task's owning thread.
+	instance_queue_shutdown(i);
 	instance_shutdown_workers(i);
 	instance_notify(i);
 	return 0;
@@ -5783,8 +6149,13 @@ TASK_instance_start(int32_t ti)
 
 	i = instances[ti];
 
-	if (i->magic != INSTANCE_MAGIC) {
+	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
+		return -1;
+	}
+
+	if (i->state == INSTANCE_STATE_SHUTTING_DOWN) {
+		errno = EOWNERDEAD;
 		return -1;
 	}
 
@@ -5797,7 +6168,11 @@ TASK_instance_start(int32_t ti)
 
 	// Assign the instance to a worker for instance notifications
 	instance_lock(i);
-	instance_assign_worker(i);
+	if (instance_assign_worker(i) < 0) {
+		instance_unlock(i);
+		errno = ECHILD;
+		return -1;
+	}
 	w = i->instance_worker;
 	i->state = INSTANCE_STATE_RUNNING;
 	instance_unlock(i);
@@ -5813,6 +6188,14 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	int num_io_to_spawn = 0;
 
 	pthread_mutex_lock(&creation_lock);
+
+	if ((num_workers_io < 0) || (max_blocking_workers < 0) ||
+	    (max_tasks == 0) || (tcp_sndbuf_size < 0)) {
+		errno = EINVAL;
+		pthread_mutex_unlock(&creation_lock);
+		return -1;
+	}
+
 	if (!initialised) {
 		struct sigaction sa[1];
 		int32_t ti;
@@ -5871,7 +6254,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 			i->io_workers[nio++] = w;
 		}
 	}
-	assert(i->num_workers_io == nio);
+	i->num_workers_io = nio;
 
 	if (i->num_workers_io == 0) {
 		errno = ENOMEM;

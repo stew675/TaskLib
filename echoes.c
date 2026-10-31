@@ -267,8 +267,7 @@ parse_acceptor_args(int argc, const char *argv[])
 
 			is_listen = false;
 
-			memcpy(worker_spec, argv[i], strlen(argv[i]) + 1);
-			worker_spec[WORKER_STATE_SPEC_LEN - 1] = '\0';
+			snprintf(worker_spec, sizeof(worker_spec), "%s", argv[i]);
 			port_spec = strchr(worker_spec, ':');
 
 			if (port_spec && (port_spec != worker_spec)) {
@@ -277,6 +276,11 @@ parse_acceptor_args(int argc, const char *argv[])
 			} else {
 				port_spec = worker_spec;
 				inet_aton("127.0.0.1", &addr->sin_addr);
+			}
+
+			if (num_acpt >= MAX_ADDRS) {
+				fprintf(stderr, "Too many listen addresses (max %d)\n", MAX_ADDRS);
+				continue;
 			}
 
 			addr->sin_family = AF_INET;

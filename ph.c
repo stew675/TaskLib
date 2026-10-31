@@ -213,7 +213,7 @@ pheap_insert(void *oph, void *key, void *data)
 	struct heap *n;
 
 	// First create the new node
-	n = (struct heap *)calloc(sizeof(struct heap), 1);
+	n = (struct heap *)calloc(1, sizeof(struct heap));
 	if (n == NULL)
 		return NULL;
 	n->key = key;
@@ -526,7 +526,7 @@ pheap_create(int (*cmp)(void *, void *))
 {
 	struct pheap *ph;
 
-	ph = (struct pheap *)calloc(sizeof(struct pheap), 1);
+	ph = (struct pheap *)calloc(1, sizeof(struct pheap));
 	if (ph == NULL)
 		return NULL;
 	if (cmp == NULL)

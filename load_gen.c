@@ -349,8 +349,7 @@ fprintf(stderr, "Setting deliver_size to %lu\n", deliver_size);
 
 			is_connect = false;
 
-			memcpy(worker_spec, argv[i], strlen(argv[i]) + 1);
-			worker_spec[WORKER_STATE_SPEC_LEN - 1] = '\0';
+			snprintf(worker_spec, sizeof(worker_spec), "%s", argv[i]);
 			port_spec = strchr(worker_spec, ':');
 
 			if (port_spec && (port_spec != worker_spec)) {
@@ -359,6 +358,11 @@ fprintf(stderr, "Setting deliver_size to %lu\n", deliver_size);
 			} else {
 				port_spec = worker_spec;
 				inet_aton("127.0.0.1", &addr->sin_addr);
+			}
+
+			if (num_addrs >= MAX_ADDRS) {
+				fprintf(stderr, "Too many connect addresses (max %d)\n", MAX_ADDRS);
+				continue;
 			}
 
 			addr->sin_family = AF_INET;

@@ -1,0 +1,19 @@
+# Build outputs
+echoes
+echoes-asan
+echoes-prof
+load_gen
+load_gen-asan
+load_gen-prof
+*.o
+*.gcda
+*.gcno
+*.gcov
+*.gcov.*
+*.gcov-*
+gmon.out
+core
+core.*
+
+# Debugging scratch files
+problem

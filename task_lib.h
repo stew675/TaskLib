@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <assert.h>
 #include <unistd.h>
@@ -174,9 +175,8 @@ int TASK_instance_wait(int32_t ti);
 // Instructs an active task instance to shutdown
 int TASK_instance_shutdown(int32_t ti, void *user_data, void (*shutdown_cb)(intptr_t ti, void *data));
 
-// Starts a task instance.  If the instance is single threaded, this function will block
-// until the instance shuts down via a call to TASK_instance_shutdown()
-// If the instance is multi-threaded, this function will return control to the user
+// Starts a task instance and returns control to the caller.  Use
+// TASK_instance_wait() to wait for the instance to shut down.
 int TASK_instance_start(int32_t ti);
 
 // Creates a task instance

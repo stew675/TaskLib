@@ -860,8 +860,8 @@ Final validation (Phase 8):
   The remaining TSan findings were test-synchronisation bugs in
   `test_blocking_work` and `test_rdhup` (plain reads / closing a registered fd
   before the close callback).
-- Stress: `test_create_shutdown_race` repeated 15x, with and without ASan;
-  `test_close_from_callback` repeated 10x.  All passed.
+- Stress: `test_create_shutdown_race`, `test_close_from_callback`, and
+  `test_migrate_timers` each repeated 20x on the final tree.  All passed.
 - Benchmarks: `benchmarks/results/micro_phase7.txt` and
   `benchmarks/results/http_phase7.txt`; HTTP throughput is within variance of
   the previous final result, and allocator throughput no longer collapses with
@@ -890,3 +890,11 @@ Final validation (Phase 8):
    authoritative bound.
 6. **`TASK_timeout_set_close_cb()`** was added as a thin wrapper over
    `TASK_socket_set_close_cb()` so standalone timer cleanup has a named API.
+7. **Close forwarding during shutdown** (final adversarial pass): if a close
+   list entry's task migrated to another worker, `worker_process_closes()` only
+   forwards while the target instance is still running and the target worker is
+   at most RUNNING.  Forwarding into a worker that has already drained its close
+   queue during shutdown would strand the pinned task and trip the
+   `worker_destroy()` assertion; such tasks are left DESTROY/FLG_CL pinned for
+   `instance_nuke_tasks()`.  Verified with repeated
+   `test_migrate_timers`/`test_create_shutdown_race` runs.

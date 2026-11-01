@@ -1507,8 +1507,14 @@ worker_process_closes(struct worker *w)
 			tw = task_atomic_load(&t->worker);
 			if (tw != w) {
 				// Migration raced with close.  Forward to the current
-				// owner; the pin keeps the slot alive.
-				if (tw != NULL) {
+				// owner only while that worker can still drain its queue.
+				// During shutdown the target may already be shutting down
+				// or dead; linking after its final drain would strand the
+				// pinned task and trip worker_destroy().  Such tasks are
+				// left DESTROY/FLG_CL pinned for instance_nuke_tasks().
+				if ((tw != NULL) &&
+				    ((instance_state_t)task_atomic_load(&i->state) <= INSTANCE_STATE_RUNNING) &&
+				    ((worker_state_t)task_atomic_load(&tw->state) <= WORKER_STATE_RUNNING)) {
 					task_close_link(tw, t, tfdi);
 				}
 				continue;

@@ -336,7 +336,24 @@ task_free(struct instance *i, struct task *t, bool published)
 		task_atomic_dec(&w->num_tasks);
 	}
 	task_atomic_dec(&i->tfd_pool_used);
-	task_destroy_timeouts(t);
+
+	/*
+	 * A published slot is only ever recycled after close has completed.
+	 * task_do_close_cb() detaches every timer node while running on the
+	 * owning worker, so task_free() must not touch timer heap/colt state
+	 * from a foreign thread.  The unpublished path is a failed
+	 * task_create(), where no timer can have been armed yet.
+	 */
+	if (published) {
+		assert(t->tm_tt.node == NULL);
+		assert(t->rd_tt.node == NULL);
+		assert(t->wr_tt.node == NULL);
+		assert(t->tm_tt.next == NULL);
+		assert(t->rd_tt.next == NULL);
+		assert(t->wr_tt.next == NULL);
+	} else {
+		task_destroy_timeouts(t);
+	}
 
 	// task_init() runs under the TFD lock so a stale maybe_free()/lookup
 	// blocks here rather than reading a half-initialised slot.  A task that
@@ -855,6 +872,10 @@ get_affined_worker_from_direction(struct instance *i, bool is_client)
 		struct worker *tw = NULL;
 
 		tw = i->io_workers[wn];
+		if ((tw == NULL) ||
+		    ((worker_state_t)task_atomic_load(&tw->state) > WORKER_STATE_RUNNING)) {
+			continue;
+		}
 		if (is_client) {
 			if ((tw->affined_cpu & 0x1)) {
 				uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
@@ -886,6 +907,10 @@ get_affined_worker_from_direction(struct instance *i, bool is_client)
 		struct worker *tw = NULL;
 
 		tw = i->io_workers[wn];
+		if ((tw == NULL) ||
+		    ((worker_state_t)task_atomic_load(&tw->state) > WORKER_STATE_RUNNING)) {
+			continue;
+		}
 		if (is_client) {
 			if ((tw->affined_cpu & 0x1) == 0) {
 				uint64_t ntasks = (uint64_t)task_atomic_load(&tw->num_tasks);
@@ -994,7 +1019,7 @@ set_one_workers_affinity(struct instance *i, int cpu)
 	// We found a worker to affine, now bind it to a CPU
 	// Scan row by row.  Fill out a row fully before moving on
 	for (row = 0; row < i->num_cpu_rows; row++) {
-		int s, sl = (i->num_cpus / 2);
+		int s, sl = (i->num_cpus + 1) / 2;
 
 		// Scan by 2's starting from adjusted CPU
 		for (s = 0; s < sl; s++) {
@@ -1077,6 +1102,12 @@ task_set_initial_preferred_worker(struct instance *i, struct task *t, bool is_cl
 
 	if (tw == NULL) {
 		struct worker *w = t->worker;
+
+		// The caller may not have assigned a worker yet.  There is no
+		// affinity hint to apply in that case.
+		if (w == NULL) {
+			return;
+		}
 
 		// At least set the incoming affinity for the TCP connection
 		// Doesn't matter if this fails.  It's only a hint to the TCP stack
@@ -1379,8 +1410,12 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		worker_unlock(w);
 	}
 
-	// worker_notify() itself checks whether a wakeup is already pending
-	worker_notify(w);
+	// A notification queued by the owning worker itself will be seen before
+	// it next blocks in epoll_wait(), so do not make it write to its own
+	// eventfd.  Foreign callers still need to wake the owner.
+	if (!lockless_worker(w)) {
+		worker_notify(w);
+	}
 	return true;
 } // task_notify_action
 
@@ -1799,12 +1834,14 @@ worker_create(struct instance *i, int worker_type)
 
 	if ((worker_type != WORKER_TYPE_IO) && (worker_type != WORKER_TYPE_BLOCKING)) {
 		errno = EINVAL;
+		pthread_mutexattr_destroy(&attr);
 		return NULL;
 	}
 
 	for (sz = 1; sz < sizeof(struct worker); sz += sz);
 	// Create the worker state itself
 	if ((w = aligned_alloc(sz, sz)) == NULL) {
+		pthread_mutexattr_destroy(&attr);
 		return NULL;
 	}
 	memset(w, 0, sz);
@@ -1836,7 +1873,7 @@ worker_create(struct instance *i, int worker_type)
 			goto worker_create_failed;
 		}
 
-		if ((w->gepfd = epoll_create1(0)) < 0) {
+		if ((w->gepfd = epoll_create1(EPOLL_CLOEXEC)) < 0) {
 			goto worker_create_failed;
 		}
 
@@ -1856,7 +1893,7 @@ worker_create(struct instance *i, int worker_type)
 		}
 	} else if (w->type == WORKER_TYPE_BLOCKING) {
 		// Blocking workers use a blocking eventfd and just wait on that instead of epoll_wait
-		if ((w->evfd = eventfd(0, 0)) < 0) {
+		if ((w->evfd = eventfd(0, EFD_CLOEXEC)) < 0) {
 			// eventfd will set errno
 			goto worker_create_failed;
 		}
@@ -1873,11 +1910,13 @@ worker_create(struct instance *i, int worker_type)
 	}
 
 	// Success!
+	pthread_mutexattr_destroy(&attr);
 	worker_set_state(w, WORKER_STATE_CREATED);
 	return w;
 
 	// Failure :(
 worker_create_failed:
+	pthread_mutexattr_destroy(&attr);
 	worker_destroy(w);
 	return NULL;
 } // worker_create
@@ -1985,8 +2024,9 @@ instance_wait_workers(struct instance *i)
 			if ((errno == EINTR) || (errno == EAGAIN)) {
 				continue;
 			}
-			close(i->evfd);
-			i->evfd = -1;
+			/* Never close the instance eventfd from a wait path: other
+			 * threads may be notifying it.  instance_destroy() owns it. */
+			poll(NULL, 0, 1);
 		}
 	}
 } // instance_wait_workers
@@ -2184,12 +2224,24 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
 #endif
 
-	// Don't allow less than 100 tfd entries for pool size
-	pool_size = (pool_size < 100) ? 100 : pool_size;
+	// Don't allow less than 100 tfd entries for pool size.  Do the growth
+	// arithmetic in uint64_t: max_tasks is a uint32_t supplied by the API and
+	// the old uint32_t +=/*= sequence wrapped for large values, silently
+	// creating a tiny pool instead of rejecting the request.
+	uint64_t wanted = (pool_size < 100) ? 100 : pool_size;
 
-	// Make actual pool size be 130% of what was asked for hashing efficiency
-	pool_size += 100;	// To allow for any listener and timer tasks
-	pool_size *= 1.3;
+	wanted += 100;	// To allow for any listener and timer tasks
+	wanted = (wanted * 130) / 100;	// 130% for hashing efficiency
+	if ((wanted > UINT32_MAX) ||
+	    (wanted > (SIZE_MAX / sizeof(struct task))) ||
+	    (wanted > (SIZE_MAX / sizeof(struct task_stride)))) {
+		errno = EINVAL;
+#ifndef USE_TICKET_LOCKS
+		pthread_mutexattr_destroy(&attr);
+#endif
+		return -1;
+	}
+	pool_size = (uint32_t)wanted;
 
 	i->tfd_pool_used = 0;
 	i->tfd_pool_size = pool_size;
@@ -2204,6 +2256,9 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 			uint32_t *ng = realloc(g->gens, (size_t)pool_size * sizeof(*ng));
 
 			if (ng == NULL) {
+#ifndef USE_TICKET_LOCKS
+				pthread_mutexattr_destroy(&attr);
+#endif
 				return -1;
 			}
 			memset(ng + g->capacity, 0,
@@ -2220,6 +2275,9 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 
 	if ((i->tfd_stride = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_stride = NULL;
+#ifndef USE_TICKET_LOCKS
+		pthread_mutexattr_destroy(&attr);
+#endif
 		return -1;
 	}
 	memset(i->tfd_stride, 0, num_pages * __page_size);
@@ -2231,6 +2289,9 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 
 	if ((i->tfd_pool = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_pool = NULL;
+#ifndef USE_TICKET_LOCKS
+		pthread_mutexattr_destroy(&attr);
+#endif
 		return -1;
 	}
 	memset(i->tfd_pool, 0, num_pages * __page_size);
@@ -2260,6 +2321,9 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 
 	if ((i->tfd_locks_real = aligned_alloc(__page_size, num_pages * __page_size)) == NULL) {
 		i->tfd_locks = NULL;
+#ifndef USE_TICKET_LOCKS
+		pthread_mutexattr_destroy(&attr);
+#endif
 		return -1;
 	}
 	union { volatile void *a; void *b;} whatevs;
@@ -2273,6 +2337,9 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 #endif
 	}
 	i->tfd_locks = i->tfd_locks_real + 1;
+#ifndef USE_TICKET_LOCKS
+	pthread_mutexattr_destroy(&attr);
+#endif
 	return 0;
 } // instance_tfd_pool_init
 
@@ -2306,6 +2373,11 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 	memset(i, 0, sz);
+
+	// memset() leaves fd fields at zero, and zero is a valid descriptor.
+	// Make them explicitly invalid before any fallible constructor step so a
+	// later cleanup cannot close stdin/stdout/stderr.
+	i->evfd = -1;
 
 	i->magic = INSTANCE_MAGIC;
 	i->curtime_us = get_time_us(TASK_TIME_PRECISE);
@@ -2366,16 +2438,18 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 
 	i->max_blocking_workers = max_blocking_workers;
 
-	if ((i->evfd = eventfd(0, 0)) < 0) {
+	if ((i->evfd = eventfd(0, EFD_CLOEXEC)) < 0) {
 		goto instance_creation_fail;
 	}
 
 	__atomic_store_n(&instances[ti], i, __ATOMIC_SEQ_CST);
+	pthread_mutexattr_destroy(&attr);
 
 	return i;
 
 instance_creation_fail:
 	instance_destroy(i);
+	pthread_mutexattr_destroy(&attr);
 	return NULL;
 } // instance_create
 
@@ -2687,8 +2761,8 @@ TASK_instance_wait(int32_t ti)
 				if ((errno == EINTR) || (errno == EAGAIN)) {
 					continue;
 				}
-				close(i->evfd);
-				i->evfd = -1;
+				/* Leave eventfd lifetime to instance_destroy(). */
+				poll(NULL, 0, 1);
 			}
 		}
 
@@ -2711,11 +2785,15 @@ TASK_instance_wait(int32_t ti)
 	instance_wait_api_refs((uint32_t)ti);
 	instance_reap_workers(i);
 
-	// If user wanted to be notified that we just shutdown
-	if (i->shutdown_cb) {
-		i->shutdown_cb(ti, i->shutdown_data);
-		i->shutdown_cb = NULL;
-		i->shutdown_data = NULL;
+	// If user wanted to be notified that we just shutdown.  Clear the
+	// callback and data before invoking it so a reentrant lifecycle call
+	// from the callback cannot see (and free) the same context twice.
+	void (*shutdown_cb)(intptr_t, void *) = i->shutdown_cb;
+	void *shutdown_data = i->shutdown_data;
+	i->shutdown_cb = NULL;
+	i->shutdown_data = NULL;
+	if (shutdown_cb) {
+		shutdown_cb(ti, shutdown_data);
 	}
 
 	return 0;
@@ -2797,9 +2875,14 @@ TASK_instance_start(int32_t ti)
 	}
 
 
-	// Start all workers waiting to start
+	// Start all workers waiting to start.  A failed pthread_create() used
+	// to be silently ignored, leaving a partially running instance.  Report
+	// it; TASK_instance_destroy() can still stop and reap whatever started.
 	while ((w = TAILQ_FIRST(&i->workers_created))) {
-		worker_start(w);
+		if (worker_start(w) < 0) {
+			errno = ECHILD;
+			return -1;
+		}
 	}
 
 	// Assign the instance to a worker for instance notifications

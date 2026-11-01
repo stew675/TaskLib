@@ -1071,9 +1071,12 @@ task_handle_listen_event(struct task *t)
 		struct sockaddr_storage		addr;
 		socklen_t			addrlen;
 
-		// Attempt to accept.  Break out of loop if nothing is there to pick up
+		// Attempt to accept.  Break out of loop if nothing is there to pick up.
+		// accept4() gives us CLOEXEC and non-blocking atomically, avoiding an
+		// fd leak window between accept() and fcntl().
 		addrlen = sizeof(addr);
-		if ((cfd = accept(t->fd, (struct sockaddr *)&addr, &addrlen)) < 0) {
+		if ((cfd = accept4(t->fd, (struct sockaddr *)&addr, &addrlen,
+				   SOCK_NONBLOCK | SOCK_CLOEXEC)) < 0) {
 			task_action_t ta;
 
 			switch(errno) {
@@ -1257,7 +1260,7 @@ instance_listen_balance(struct task *t)
 		perror("instance_listen_balance->getsockopt->SO_TYPE");
 		return;
 	}
-	sock_type |= SOCK_NONBLOCK;
+	sock_type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
 
 	// Get the protocol
 	solen = sizeof(sock_protocol);
@@ -1413,6 +1416,12 @@ TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t exp
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_WR);
 			errno = EINVAL;
+			if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
+			return;
+		}
+		if (iov[n].iov_len > (SIZE_MAX - wrv_buflen)) {
+			task_unlock(t, FLG_WR);
+			errno = EOVERFLOW;
 			if (wrv_cb) wrv_cb(tfd, iov, iovcnt, -1, wr_cb_data);
 			return;
 		}
@@ -1601,6 +1610,12 @@ TASK_socket_readv(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expi
 		if (iov[n].iov_base == NULL) {
 			task_unlock(t, FLG_RD);
 			errno = EINVAL;
+			if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
+			return;
+		}
+		if (iov[n].iov_len > (SIZE_MAX - rdv_buflen)) {
+			task_unlock(t, FLG_RD);
+			errno = EOVERFLOW;
 			if (rdv_cb) rdv_cb(tfd, iov, iovcnt, -1, rd_cb_data);
 			return;
 		}
@@ -2066,21 +2081,40 @@ TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64
 		i->all_cpus_seen = true;
 	}
 
+	// Save the fields we are about to mutate so a queue failure can roll the
+	// task back to a plain IO task instead of leaving it stuck in CONNECT
+	// with an unqueued operation.
+	struct task_stride *stride = t->stride;
+	uint32_t old_type = task_atomic_load(&t->type);
+	uint32_t old_wr_state = task_atomic_load(&t->wr_state);
+	socklen_t old_addrlen = t->addrlen;
+	int64_t old_expires = t->wr_expires_in_us;
+	bool old_modified = t->wr_expires_modified;
+	void *old_cb_data = task_atomic_load(&stride->connect_cb_data);
+	void (*old_cb)(int64_t, int, void *) = task_atomic_load(&stride->connect_cb);
+	struct sockaddr_storage old_addr = stride->addr;
+
 	// Convert this task to connect type
-	t->stride->connect_cb = connect_cb;
-	t->type = TASK_TYPE_CONNECT;
+	stride->connect_cb = connect_cb;
+	task_atomic_store(&t->type, TASK_TYPE_CONNECT);
 	t->addrlen = addrlen;
 	t->wr_expires_in_us = expires_in_us;
 	t->wr_expires_modified = true;
-	t->stride->connect_cb_data = connect_cb_data;
+	stride->connect_cb_data = connect_cb_data;
 	task_atomic_store(&t->wr_state, TASK_WRITE_STATE_CONNECT);
-	memcpy(&t->stride->addr, addr, addrlen);
+	memcpy(&stride->addr, addr, addrlen);
 
 	// Queue the connect so it starts on the correct worker
 	bool queued = task_notify_action(t, FLG_CN, false, true);
 	if (!queued) {
-		t->wr_expires_modified = 0;
-		task_atomic_store(&t->wr_state, TASK_WRITE_STATE_IDLE);
+		task_atomic_store(&t->type, old_type);
+		task_atomic_store(&t->wr_state, old_wr_state);
+		t->addrlen = old_addrlen;
+		t->wr_expires_in_us = old_expires;
+		t->wr_expires_modified = old_modified;
+		task_atomic_store(&stride->connect_cb_data, old_cb_data);
+		task_atomic_store(&stride->connect_cb, old_cb);
+		stride->addr = old_addr;
 	}
 	task_unlock(t, FLG_CO);
 	if (!queued) {
@@ -2099,6 +2133,15 @@ TASK_socket_bind(int64_t tfd, struct sockaddr *addr, socklen_t addrlen)
 
 	if ((t = task_lookup(tfd, FLG_BND)) == NULL) {
 		// errno already set
+		return -1;
+	}
+
+	// Validate the address before handing it to the kernel.  Relying on
+	// bind() to reject a bogus addrlen is not portable across families.
+	if ((addr == NULL) || (addrlen < sizeof(sa_family_t)) ||
+	    (addrlen > sizeof(struct sockaddr_storage))) {
+		task_unlock(t, FLG_BND);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -2178,8 +2221,10 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 		goto out;
 	}
 
-	// Create a socket.  Must be non-blocking so we always turn that on here
-	if ((sock = socket(domain, type | SOCK_NONBLOCK, protocol)) < 0) {
+	// Create a socket.  Must be non-blocking so we always turn that on here.
+	// SOCK_CLOEXEC prevents library-owned sockets leaking into exec()'d
+	// children.
+	if ((sock = socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol)) < 0) {
 		goto out;
 	}
 

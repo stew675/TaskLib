@@ -116,8 +116,9 @@ worker_handle_event(struct worker *w, uint32_t events)
 
 	if (events & (EPOLLERR | EPOLLHUP)) {
 		task_atomic_store(&w->notified, 0);
-		close(w->evfd);
-		w->evfd = -1;
+		/* Do not close the eventfd here.  Foreign notifiers may still be
+		 * writing to it, and fd numbers can be reused.  worker_destroy()
+		 * closes it only after the worker thread has exited. */
 		worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
 		return;
 	}
@@ -135,10 +136,9 @@ worker_handle_event(struct worker *w, uint32_t events)
 				task_atomic_store(&w->notified, 0);
 				break;
 			}
-			// serious read error.  Close our eventfd and set worker to shutdown
+			// Serious read error.  Leave the eventfd alone; it is owned by
+			// worker_destroy() after the thread has stopped.
 			task_atomic_store(&w->notified, 0);
-			close(w->evfd);
-			w->evfd = -1;
 			worker_set_state(w, WORKER_STATE_SHUTTING_DOWN);
 			break;
 		}

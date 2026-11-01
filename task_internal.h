@@ -687,6 +687,7 @@ struct instance * instance_create(int num_workers_io, int max_blocking_workers, 
 int64_t TASK_get_us_time(int64_t *time_us, bool precise);
 int TASK_timeout_destroy(int64_t tfd);
 int TASK_timeout_cancel(int64_t tfd);
+int TASK_timeout_set_close_cb(int64_t tfd, void *close_cb_data, void(*close_cb)(int64_t tfd, void *close_cb_data));
 int TASK_timeout_set(int64_t tfd, int64_t us_from_now, void *timeout_cb_data, void(*timeout_cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data));
 int64_t TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data, void(*timeout_cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data));
 void TASK_socket_writev(int64_t tfd, const struct iovec *iov, int iovcnt, int64_t expires_in_us, void *wr_cb_data, void(*wrv_cb)(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result, void *wr_cb_data));

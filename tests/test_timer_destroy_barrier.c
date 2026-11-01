@@ -48,7 +48,7 @@ main(void)
 		if (s == NULL) return 1;
 		t = TASK_timeout_create(ti, 0, s, timeout_cb);
 		if (t < 0) return 1;
-		if (TASK_socket_set_close_cb(t, s, close_cb) < 0) return 1;
+		if (TASK_timeout_set_close_cb(t, s, close_cb) < 0) return 1;
 
 		/* Destroy immediately.  The timer may already be running on the
 		 * worker, but close_cb must be the last callback. */

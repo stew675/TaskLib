@@ -118,6 +118,13 @@ Most IO calls take an `expires_in_us` value:
 When a timeout fires, the callback receives `result == -1` and `errno` is set to
 `ETIMEDOUT`. The operation is cancelled.
 
+Timer and IO cancellation/destruction are requests, not barriers. A callback
+may already have been selected when the request is made. The task close
+callback (`close_cb`, or the instance `shutdown_cb` during shutdown) is the
+synchronisation point after which no further callback for that task may start.
+Do not free user context from `TASK_timeout_cancel()`/`TASK_timeout_destroy()`
+alone.
+
 ### Threading model
 
 - Task APIs that take a `tfd` can be called from any thread. The library
@@ -250,15 +257,32 @@ Returns `0`, or `-1` with `errno` set.
 
 ### `int TASK_timeout_cancel(int64_t tfd)`
 
-Cancels the timeout callback. For a standalone timer task the task remains
-allocated. Returns `0`, or `-1` with `errno` set.
+Requests cancellation of the timeout callback. For a standalone timer task the
+task remains allocated. Returns `0`, or `-1` with `errno` set.
+
+Cancellation is asynchronous: a timeout callback may already be in flight when
+this call returns. The close callback is the barrier after which no further
+timeout callback for the task may start.
 
 ### `int TASK_timeout_destroy(int64_t tfd)`
 
-For a standalone timer task, cancels the timer and frees the task. For a task
-that also owns a socket, this behaves like `TASK_timeout_cancel()`.
+For a standalone timer task, requests destruction of the task. For a task that
+also owns a socket, this behaves like `TASK_timeout_cancel()` and does **not**
+close the socket.
+
+Destruction is asynchronous. A timeout callback may still be in flight when
+this call returns; the task is freed after its close processing runs. Set a
+close callback with `TASK_timeout_set_close_cb()` and treat that callback as the
+point after which the task and any user context may be freed.
 
 Returns `0`, or `-1` with `errno` set.
+
+### `int TASK_timeout_set_close_cb(int64_t tfd, void *close_cb_data, void (*close_cb)(int64_t tfd, void *close_cb_data))`
+
+Sets the close callback for a standalone timer task (equivalent to
+`TASK_socket_set_close_cb()` for timer tasks). The callback runs exactly once
+when the timer task is closed, after all timeout/IO teardown. No timeout
+callback may start after it returns. Returns `0`, or `-1` with `errno` set.
 
 ### Timeout constants
 

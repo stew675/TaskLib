@@ -75,6 +75,12 @@ int TASK_timeout_destroy(int64_t tfd);
 // Cancels the timeout callback against the given tfd
 int TASK_timeout_cancel(int64_t tfd);
 
+// Sets a close callback on a standalone timer task.  close_cb runs once after
+// the timer task has been destroyed and is the barrier after which no timeout
+// callback may start.
+int TASK_timeout_set_close_cb(int64_t tfd, void *close_cb_data,
+			      void (*close_cb)(int64_t tfd, void *close_cb_data));
+
 // Sets the timeout on the given tfd to occur in us_from_now micro-seconds from now
 // Returns error if tfd doesn't exist
 // If the tfd already has a timeout set, then its value will just be updated

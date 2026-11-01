@@ -242,6 +242,7 @@ task_activate_rd_timeout(struct worker *w, struct task *t)
 	int64_t expiry_us = task_calculate_io_timeout(t->rd_expires_in_us);
 	task_atomic_store(&t->rd_tt.expiry_us, expiry_us);
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
+	t->rt_cancelled = false;
 
 	if (w__curtime_us > expiry_us) {
 		// It's already expired.  Handle that now
@@ -266,6 +267,7 @@ task_activate_wr_timeout(struct worker *w, struct task *t)
 	int64_t expiry_us = task_calculate_io_timeout(t->wr_expires_in_us);
 	task_atomic_store(&t->wr_tt.expiry_us, expiry_us);
 	t->wr_expires_in_us = TIMER_TIME_DESTROY;
+	t->wt_cancelled = false;
 
 	if (w__curtime_us > expiry_us) {
 		// It's already expired.  Handle that now
@@ -282,15 +284,24 @@ task_activate_wr_timeout(struct worker *w, struct task *t)
 void
 task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us)
 {
-	int64_t tfd = t->tfd;
+	int64_t tfd = task_atomic_load(&t->tfd);
 	void (*tm_cb)(int64_t tfd, int64_t lateness_us, void *tm_cb_data);
 	void *tm_cb_data;
-	uint32_t tfdi;
+	uint32_t tfdi = TFD_TO_INDEX(tfd);
 
 	switch (action) {
 	case	FLG_TM:
-		tfdi = TFD_TO_INDEX(tfd);
+		// Revalidate under the TFD lock.  The timer may have been cancelled,
+		// re-armed, or the task may have moved to DESTROY between the heap
+		// pop and this call.  Setting tm_cancelled marks the armed instance
+		// consumed; a later TASK_timeout_set() clears it again.
 		tfd_lock(t, tfdi);
+		if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) ||
+		    (task_atomic_load(&t->tm_tt.expiry_us) != timeout_us) ||
+		    (t->tm_cancelled)) {
+			tfd_unlock(t, tfdi);
+			return;
+		}
 		t->tm_cancelled = 1;
 		tm_cb = t->tm_cb;
 		tm_cb_data = t->tm_cb_data;
@@ -308,6 +319,15 @@ task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us
 		return;
 
 	case	FLG_RT:
+		tfd_lock(t, tfdi);
+		if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) ||
+		    (task_atomic_load(&t->rd_tt.expiry_us) != timeout_us) ||
+		    (t->rt_cancelled)) {
+			tfd_unlock(t, tfdi);
+			return;
+		}
+		t->rt_cancelled = 1;
+		tfd_unlock(t, tfdi);
 		if (task_atomic_load(&t->rd_state) == TASK_READ_STATE_BUFFER) {
 			task_do_read_cb(t, tfd, -1, ETIMEDOUT);
 		} else if (task_atomic_load(&t->rd_state) == TASK_READ_STATE_VECTOR) {
@@ -316,6 +336,15 @@ task_do_timeout_cb(struct task *t, task_action_flag_t action, int64_t timeout_us
 		return;
 
 	case	FLG_WT:
+		tfd_lock(t, tfdi);
+		if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) ||
+		    (task_atomic_load(&t->wr_tt.expiry_us) != timeout_us) ||
+		    (t->wt_cancelled)) {
+			tfd_unlock(t, tfdi);
+			return;
+		}
+		t->wt_cancelled = 1;
+		tfd_unlock(t, tfdi);
 		if (task_atomic_load(&t->wr_state) == TASK_WRITE_STATE_BUFFER) {
 			task_do_write_cb(t, tfd, -1, ETIMEDOUT);
 		} else if (task_atomic_load(&t->wr_state) == TASK_WRITE_STATE_CONNECT) {
@@ -457,19 +486,9 @@ worker_check_timeouts(struct worker *w)
 			continue;
 		}
 
-		switch (action) {
-		case FLG_TM:
-			t->tm_cancelled = 1;
-			break;
-		case FLG_RT:
-			t->rt_cancelled = 1;
-			break;
-		case FLG_WT:
-			t->wt_cancelled = 1;
-			break;
-		default:
-			break;
-		}
+		// Do not mark the timer cancelled here.  task_do_timeout_cb()
+		// revalidates state/expiry/cancel under the same lock immediately
+		// before invoking the user callback.
 		tfd_unlock(t, tfdi);
 
 		task_do_timeout_cb(t, action, expiry_us);
@@ -584,6 +603,16 @@ TASK_timeout_set(int64_t tfd, int64_t us_from_now, void *timeout_cb_data,
 	return 0;
 } // TASK_timeout_set
 
+
+
+// Sets the close callback for a standalone timer task.  This is the barrier
+// after which no further timeout callback for the task may start.
+int
+TASK_timeout_set_close_cb(int64_t tfd, void *close_cb_data,
+			  void (*close_cb)(int64_t tfd, void *close_cb_data))
+{
+	return TASK_socket_set_close_cb(tfd, close_cb_data, close_cb);
+} // TASK_timeout_set_close_cb
 
 
 // Creates an arbitrary timeout task that exists independently of any socket

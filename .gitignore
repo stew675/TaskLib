@@ -17,3 +17,8 @@ core.*
 
 # Debugging scratch files
 problem
+
+# Editor scratch files
+*.swp
+*.swo
+*~

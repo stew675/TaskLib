@@ -41,6 +41,11 @@ prof:		echoes-prof load_gen-prof
 check:		$(TASK_DEPS)
 		./tests/run.sh
 
+# AddressSanitizer variant of the regression tests.  The migration/timer
+# stress test and the destroy/API race test are most useful under ASan.
+check-asan:	$(TASK_DEPS)
+		CC="$(GCC)" EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" ./tests/run.sh
+
 clean:
 	rm -f echoes echoes-asan echoes-prof load_gen load_gen-asan load_gen-prof
 	rm -f *.gcda *.gcno *.gcov *.gcov.* *.gcov-* gmon.out core

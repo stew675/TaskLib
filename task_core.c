@@ -9,6 +9,93 @@ bool			initialised = false;
 size_t			__page_size;
 pthread_mutex_t		creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Per-instance slot API-entry references.  A lookup increments the reference
+// for the instance index *before* it dereferences instances[ti], and keeps it
+// until task_unlock().  TASK_instance_destroy() clears instances[ti] and then
+// waits for these references to drain before freeing the instance, so an API
+// call that raced with destruction cannot touch freed instance memory.
+// The counters are sharded so unrelated API-calling threads do not all bounce
+// one per-instance cache line.  Each thread sticks to one shard; destruction
+// scans all shards, which is a cold path.
+#define TASK_API_REF_SHARDS		64
+#define TASK_API_REF_SHARD_MASK		(TASK_API_REF_SHARDS - 1)
+
+struct api_slot_ref {
+	_Atomic uint32_t	refs;
+} __attribute__ ((aligned(64)));
+static struct api_slot_ref
+	task_api_slot_refs[TASK_MAX_INSTANCES][TASK_API_REF_SHARDS];
+
+static __thread uint32_t	task_api_thread_shard;
+static __thread bool		task_api_thread_shard_set;
+static _Atomic uint32_t		task_api_thread_seq;
+
+static inline uint32_t
+task_api_shard(void)
+{
+	if (!task_api_thread_shard_set) {
+		task_api_thread_shard =
+			__atomic_fetch_add(&task_api_thread_seq, 1, __ATOMIC_RELAXED) &
+			TASK_API_REF_SHARD_MASK;
+		task_api_thread_shard_set = true;
+	}
+	return task_api_thread_shard;
+} // task_api_shard
+
+// An API call running on one of the instance's own IO workers is already
+// protected by the worker lifetime: destruction stops and joins all workers
+// before it waits on these counters or frees the instance.
+static inline bool
+task_api_ref_required(uint32_t ti)
+{
+	struct worker *w = __thr_current_worker;
+
+	return !((w != NULL) && (w->instance != NULL) &&
+		 ((uint32_t)w->instance->ti == ti));
+} // task_api_ref_required
+
+static inline void
+task_api_enter(uint32_t ti)
+{
+	task_atomic_inc(&task_api_slot_refs[ti][task_api_shard()].refs);
+} // task_api_enter
+
+static inline void
+task_api_exit(uint32_t ti)
+{
+	task_atomic_dec(&task_api_slot_refs[ti][task_api_thread_shard].refs);
+} // task_api_exit
+
+// Lock-free free-list head encoding.  The tag makes the pop/push pair
+// ABA-safe; task->free_next stores the next slot index rather than a pointer
+// so concurrent readers never race on a plain pointer field.
+#define TASK_FREE_EMPTY		(0xffffffffu)
+
+static inline uint64_t
+task_free_pack(uint32_t idx, uint32_t tag)
+{
+	return (((uint64_t)tag) << 32) | (uint64_t)idx;
+} // task_free_pack
+
+static inline uint32_t
+task_free_idx(uint64_t head)
+{
+	return (uint32_t)head;
+} // task_free_idx
+
+static inline uint32_t
+task_free_tag(uint64_t head)
+{
+	return (uint32_t)(head >> 32);
+} // task_free_tag
+
+// Each thread sticks to one free-list shard so its head stays hot in the local
+// cache.  The first allocation in a new thread claims the next shard index; if
+// that shard is empty, the pop path falls back to scanning the others.
+static __thread uint32_t task_free_thread_shard;
+static __thread bool task_free_thread_shard_set;
+static _Atomic uint32_t task_free_thread_seq;
+
 // ---------------------------------------------------------------------------------------------//
 //					DEBUGGING STUFF						//
 //----------------------------------------------------------------------------------------------//
@@ -17,7 +104,7 @@ void
 task_dump(struct task *t)
 {
 	fprintf(stderr, "Task Dump for TFD = %u\n", (unsigned)TFD_TO_INDEX(t->tfd));
-	fprintf(stderr, "Expiry us = %ld\n", t->tm_tt.expiry_us);
+	fprintf(stderr, "Expiry us = %ld\n", (long)task_atomic_load(&t->tm_tt.expiry_us));
 	fprintf(stderr, "Type = ");
 	switch(t->type) {
 	case	TASK_TYPE_NONE:
@@ -178,9 +265,9 @@ task_init(struct instance *i, struct task *t)
 	memset(i->tfd_stride + tfdi, 0, sizeof(struct task_stride));
 
 	t->stride = i->tfd_stride + tfdi;
-	__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
-	t->wr_tt.expiry_us = TIMER_TIME_CANCEL;
-	t->rd_tt.expiry_us = TIMER_TIME_CANCEL;
+	task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
+	task_atomic_store(&t->wr_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
+	task_atomic_store(&t->rd_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 	t->wr_expires_in_us = TIMER_TIME_DESTROY;
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
 	task_atomic_store(&t->rd_state, TASK_READ_STATE_IDLE);
@@ -222,10 +309,22 @@ task_free(struct instance *i, struct task *t, bool published)
 		itfd_unlock(i, tfdi);
 	}
 
-	pthread_mutex_lock(&i->cpulock);
-	t->task_next = i->free_tasks;
-	i->free_tasks = t;
-	pthread_mutex_unlock(&i->cpulock);
+	// Publish the slot on its sharded lock-free free list.  The node is not
+	// reachable until the CAS succeeds, so storing free_next first is safe;
+	// the tag protects against ABA when a slot is popped and pushed
+	// concurrently.
+	for (;;) {
+		uint32_t shard = tfdi & TASK_FREE_SHARD_MASK;
+		uint64_t head = __atomic_load_n(&i->free_heads[shard].head, __ATOMIC_ACQUIRE);
+		uint64_t new_head;
+
+		task_atomic_store(&t->free_next, (uint32_t)head);
+		new_head = task_free_pack(tfdi, task_free_tag(head) + 1);
+		if (__atomic_compare_exchange_n(&i->free_heads[shard].head, &head, new_head, false,
+						__ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+			break;
+		}
+	}
 } // task_free
 
 
@@ -342,25 +441,36 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		return NULL;
 	}
 
+	// Pin the instance slot before dereferencing instances[ti].  Destroy
+	// clears instances[ti] and waits for this reference before freeing.
+	bool api_ref = task_api_ref_required(ti);
+	if (api_ref) {
+		task_api_enter(ti);
+	}
+
 	i = (struct instance *)task_atomic_load(&instances[ti]);
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+		if (api_ref) task_api_exit(ti);
 		errno = EBADF;
 		return NULL;
 	}
 
 	if ((instance_state_t)task_atomic_load(&i->state) > INSTANCE_STATE_RUNNING) {
+		if (api_ref) task_api_exit(ti);
 		errno = EOWNERDEAD;
 		return NULL;
 	}
 
 	if (tfdi >= i->tfd_pool_size) {
+		if (api_ref) task_api_exit(ti);
 		errno = ERANGE;
 		return NULL;
 	}
 
 	t = i->tfd_pool + tfdi;
-	w = t->worker;
+	w = task_atomic_load(&t->worker);
 	if (w == NULL) {
+		if (api_ref) task_api_exit(ti);
 		errno = EBADF;
 		return NULL;
 	}
@@ -371,8 +481,10 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		itfd_lock(i, tfdi);
 		if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) ||
 		    (task_atomic_load(&t->tfd) != tfd) ||
-		    (TFD_TO_ITERATION(task_atomic_load(&t->tfd)) != tfd_iter)) {
+		    (TFD_TO_ITERATION(task_atomic_load(&t->tfd)) != tfd_iter) ||
+		    (task_atomic_load(&t->worker) == NULL)) {
 			itfd_unlock(i, tfdi);
+			if (api_ref) task_api_exit(ti);
 			errno = EBADF;
 			return NULL;
 		}
@@ -387,6 +499,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		    (TFD_TO_ITERATION(task_atomic_load(&t->tfd)) != tfd_iter) ||
 		    (task_atomic_load(&t->worker) == NULL)) {
 			task_unref(t);
+			if (api_ref) task_api_exit(ti);
 			errno = EBADF;
 			return NULL;
 		}
@@ -399,7 +512,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		task_atomic_store(&t->wr_shut, 1);
 		task_atomic_store(&t->rd_cancel, 1);
 		task_atomic_store(&t->wr_cancel, 1);
-		__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
+		task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 		task_atomic_store(&t->closed, 0);
 	} else if (action & FLG_RD) {
 		uint32_t expected = TASK_READ_STATE_IDLE;
@@ -407,7 +520,8 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		if (!__atomic_compare_exchange_n(&t->rd_state, &expected,
 						 TASK_READ_STATE_PENDING, false,
 						 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-			if (!locked) task_unref(t);
+			task_unref(t);
+			if (api_ref) task_api_exit(ti);
 			errno = EINPROGRESS;
 			return NULL;
 		}
@@ -417,16 +531,19 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		if (!__atomic_compare_exchange_n(&t->wr_state, &expected,
 						 TASK_WRITE_STATE_PENDING, false,
 						 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-			if (!locked) task_unref(t);
+			task_unref(t);
+			if (api_ref) task_api_exit(ti);
 			errno = EINPROGRESS;
 			return NULL;
 		}
 	} else if (task_action_is_meta(action)) {
 		if (task_atomic_fetch_or(&t->meta_flags, (uint32_t)action) & (uint32_t)action) {
 			itfd_unlock(i, tfdi);
+			if (api_ref) task_api_exit(ti);
 			errno = EINPROGRESS;
 			return NULL;
 		}
+
 	}
 
 	if (locked) {
@@ -447,11 +564,15 @@ task_unlock(struct task *t, register task_action_flag_t action)
 	int64_t tfd = task_atomic_load(&t->tfd);
 	uint32_t tfdi = TFD_TO_INDEX(tfd);
 	uint32_t ti = TFD_TO_INSTANCE(tfd);
-	struct instance *i = (struct instance *)task_atomic_load(&instances[ti]);
 	uint32_t refs;
 	bool locked = ((action & (FLG_RD | FLG_WR | FLG_CO)) == 0);
+	struct instance *i = NULL;
 
 	if (locked) {
+		struct worker *w = task_atomic_load(&t->worker);
+
+		assert(w != NULL);
+		i = w->instance;
 		if (task_action_is_meta(action)) {
 			task_atomic_and(&t->meta_flags, ~(uint32_t)action);
 		}
@@ -472,6 +593,11 @@ task_unlock(struct task *t, register task_action_flag_t action)
 	}
 	if ((refs == 0) && (task_atomic_load(&t->state) == TASK_STATE_DESTROY)) {
 		task_maybe_free(t);
+	}
+
+	// Released last: instance destruction may proceed once this drops to 0.
+	if (task_api_ref_required(ti)) {
+		task_api_exit(ti);
 	}
 } // task_unlock
 
@@ -499,7 +625,7 @@ task_claim_close(struct instance *i, struct task *t)
 		task_atomic_store(&t->wr_shut, 1);
 		task_atomic_store(&t->rd_cancel, 1);
 		task_atomic_store(&t->wr_cancel, 1);
-		__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
+		task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 		task_atomic_store(&t->closed, 0);
 	}
 	task_ref(t);
@@ -574,21 +700,45 @@ task_get_free_task(struct instance *i)
 		errno = EMFILE;
 		return NULL;
 	}
-	
-	pthread_mutex_lock(&i->cpulock);
-	if ((t = i->free_tasks) == NULL) {
-		pthread_mutex_unlock(&i->cpulock);
-		errno = EMFILE;
-		return NULL;
+
+	if (!task_free_thread_shard_set) {
+		task_free_thread_shard = __atomic_fetch_add(&task_free_thread_seq, 1, __ATOMIC_RELAXED) &
+					 TASK_FREE_SHARD_MASK;
+		task_free_thread_shard_set = true;
 	}
-	i->free_tasks = t->task_next;
-	assert(task_atomic_load(&t->state) == TASK_STATE_UNUSED);
-	task_atomic_store(&t->state, TASK_STATE_ACTIVE);
-	pthread_mutex_unlock(&i->cpulock);
 
-	task_atomic_inc(&i->tfd_pool_used);
+	for (uint32_t scanned = 0; scanned < TASK_FREE_SHARDS; scanned++) {
+		uint32_t shard = (task_free_thread_shard + scanned) & TASK_FREE_SHARD_MASK;
 
-	return t;
+		for (;;) {
+			uint64_t head = __atomic_load_n(&i->free_heads[shard].head, __ATOMIC_ACQUIRE);
+			uint32_t tfdi = task_free_idx(head);
+			uint32_t next;
+			uint64_t new_head;
+
+			if (tfdi == TASK_FREE_EMPTY) {
+				break;
+			}
+			if (tfdi >= i->tfd_pool_size) {
+				errno = EMFILE;
+				return NULL;
+			}
+
+			t = i->tfd_pool + tfdi;
+			next = task_atomic_load(&t->free_next);
+			new_head = task_free_pack(next, task_free_tag(head) + 1);
+			if (__atomic_compare_exchange_n(&i->free_heads[shard].head, &head, new_head,
+							false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+				assert(task_atomic_load(&t->state) == TASK_STATE_UNUSED);
+				task_atomic_store(&t->state, TASK_STATE_ACTIVE);
+				task_atomic_inc(&i->tfd_pool_used);
+				return t;
+			}
+		}
+	}
+
+	errno = EMFILE;
+	return NULL;
 } // task_get_free_task
 
 
@@ -1143,6 +1293,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		} else {
 			tq = worker_notify_get_free_ntfyq(w);
 			if (tq == NULL) {
+				task_atomic_and(&t->active_flags, ~(uint32_t)action);
 				return false;
 			}
 		}
@@ -1169,6 +1320,7 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 			tq = worker_notify_get_free_ntfyq(w);
 			if (tq == NULL) {
 				task_atomic_dec(&t->notifyqlen_locked);
+				task_atomic_and(&t->active_flags, ~(uint32_t)action);
 				return false;
 			}
 			worker_lock(w);
@@ -1611,24 +1763,25 @@ worker_create(struct instance *i, int worker_type)
 	w->evfd = -1;
 	pthread_mutex_init(&w->lock, &attr);
 
-	if ((w->events = aligned_alloc(__page_size, (__page_size * num_pages))) == NULL) {
-		goto worker_create_failed;
-	}
-	w->max_events = (__page_size * num_pages) / sizeof(struct epoll_event);
-	w->num_events = w->max_events;
-
-	if ((w->pollfds = aligned_alloc(__page_size, __page_size)) == NULL) {
-		goto worker_create_failed;
-	}
-	w->max_pollfds = __page_size / sizeof(struct pollfd);
-	if ((w->poll_tasks = calloc(w->max_pollfds, sizeof(struct task *))) == NULL) {
-		goto worker_create_failed;
-	}
-
 	// Now initialise the worker state
 	task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_LIMBO));
 
 	if (w->type == WORKER_TYPE_IO) {
+		// Only IO workers need epoll/poll/listener/timer state.
+		if ((w->events = aligned_alloc(__page_size, (__page_size * num_pages))) == NULL) {
+			goto worker_create_failed;
+		}
+		w->max_events = (__page_size * num_pages) / sizeof(struct epoll_event);
+		w->num_events = w->max_events;
+
+		if ((w->pollfds = aligned_alloc(__page_size, __page_size)) == NULL) {
+			goto worker_create_failed;
+		}
+		w->max_pollfds = __page_size / sizeof(struct pollfd);
+		if ((w->poll_tasks = calloc(w->max_pollfds, sizeof(struct task *))) == NULL) {
+			goto worker_create_failed;
+		}
+
 		if ((w->gepfd = epoll_create1(0)) < 0) {
 			goto worker_create_failed;
 		}
@@ -1658,8 +1811,9 @@ worker_create(struct instance *i, int worker_type)
 		goto worker_create_failed;
 	}
 
-	// Create timer queue for the worker. Use the default keys as intptr_t comparison function
-	if ((w->timer_queue = pheap_create(NULL)) == NULL) {
+	// Create timer queue for IO workers.  Use the default keys as intptr_t
+	// comparison function.
+	if ((w->type == WORKER_TYPE_IO) && ((w->timer_queue = pheap_create(NULL)) == NULL)) {
 		errno = ENOMEM;
 		goto worker_create_failed;
 	}
@@ -1737,7 +1891,7 @@ instance_nuke_tasks(struct instance *i)
 
 		if ((task_atomic_load(&t->state) == TASK_STATE_ACTIVE) || (task_atomic_load(&t->state) == TASK_STATE_DESTROY)) {
 			// Workers are gone.  Do not try to touch their timer queues.
-			t->worker = NULL;
+			task_atomic_store(&t->worker, NULL);
 			task_nuke(i, n);
 		}
 	}
@@ -1782,6 +1936,28 @@ instance_wait_workers(struct instance *i)
 		}
 	}
 } // instance_wait_workers
+
+
+
+// Wait for all in-flight task API calls against this instance to finish.
+// Lookups increment the slot reference before dereferencing instances[ti], so
+// after instances[ti] has been cleared this is a complete barrier against both
+// existing and newly arriving callers.
+static void
+instance_wait_api_refs(uint32_t ti)
+{
+	for (;;) {
+		uint64_t total = 0;
+
+		for (uint32_t shard = 0; shard < TASK_API_REF_SHARDS; shard++) {
+			total += task_atomic_load(&task_api_slot_refs[ti][shard].refs);
+		}
+		if (total == 0) {
+			return;
+		}
+		sched_yield();
+	}
+} // instance_wait_api_refs
 
 
 
@@ -1944,13 +2120,23 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		return -1;
 	}
 	memset(i->tfd_pool, 0, num_pages * __page_size);
+	uint32_t free_head[TASK_FREE_SHARDS];
+
+	for (uint32_t shard = 0; shard < TASK_FREE_SHARDS; shard++) {
+		free_head[shard] = TASK_FREE_EMPTY;
+	}
 	for (n = 0; n < pool_size; n++) {
 		uint32_t tfdi = pool_size - (n + 1);
+		uint32_t shard = tfdi & TASK_FREE_SHARD_MASK;
 		struct task *t = i->tfd_pool + tfdi;
 
 		task_init(i, t);
-		t->task_next = i->free_tasks;
-		i->free_tasks = t;
+		task_atomic_store(&t->free_next, free_head[shard]);
+		free_head[shard] = tfdi;
+	}
+	for (uint32_t shard = 0; shard < TASK_FREE_SHARDS; shard++) {
+		__atomic_store_n(&i->free_heads[shard].head,
+				 task_free_pack(free_head[shard], 0), __ATOMIC_RELEASE);
 	}
 
 	// Allocate the lock storage now.  We 
@@ -2273,6 +2459,11 @@ TASK_instance_destroy(int32_t ti)
 
 	task_atomic_store(&i->state, INSTANCE_STATE_SHUTTING_DOWN);
 
+	// Publish the removal before waiting.  New task API calls will now fail
+	// without dereferencing the instance, while callers that already entered
+	// hold an api_slot_ref that keeps it alive until task_unlock().
+	task_atomic_store(&instances[ti], NULL);
+
 	// Queue closes before stopping the workers so every close is processed by
 	// the task's owning worker.  If a shutdown is already in progress the
 	// closes were queued by TASK_instance_shutdown().
@@ -2282,11 +2473,15 @@ TASK_instance_destroy(int32_t ti)
 
 	instance_shutdown_workers(i);
 	instance_wait_workers(i);
+
+	// All worker-held references are gone now.  Wait for the remaining public
+	// API entry references before the instance and its worker state are freed.
+	instance_wait_api_refs((uint32_t)ti);
+
 	instance_reap_workers(i);
 	instance_nuke_tasks(i);
 
 	instance_destroy(i);
-	task_atomic_store(&instances[ti], NULL);
 	pthread_mutex_unlock(&creation_lock);
 
 	if (shutdown_cb) {

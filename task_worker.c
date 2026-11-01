@@ -151,7 +151,7 @@ worker_handle_event(struct worker *w, uint32_t events)
 
 
 
-void
+bool
 worker_handle_task_migration(struct worker *w, struct task *t)
 {
 	struct instance *i = w->instance;
@@ -165,16 +165,16 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	if ((tq = worker_notify_reserve_locked(tw)) == NULL) {
 		t->stride->preferred_worker = NULL;
 		task_action_done(t, FLG_MG);
-		return;
+		return false;
 	}
 
 	t->migrations++;
 	t->stride->preferred_worker = NULL;
-	task_atomic_store(&t->worker, tw);
-	task_atomic_dec(&w->num_tasks);
-	task_atomic_inc(&tw->num_tasks);
 
-	// Decouple any timeout from this worker
+	// Decouple any timeout from this worker *before* publishing the new
+	// owner.  Otherwise a concurrent timer update or close can be routed to
+	// the target worker while the node is still linked into this worker's
+	// paired heap.
 	if (t->tm_tt.next) {
 		worker_timer_detach_list(w, &t->tm_tt);
 	}
@@ -223,6 +223,13 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 		pthread_mutex_unlock(&i->listeners_lock);
 	}
 
+	// Publish the new owner only after every piece of old-worker-owned state
+	// has been detached.  Queued notifications still sitting on the old
+	// worker are forwarded by worker_process_one_action() once they run.
+	task_atomic_store(&t->worker, tw);
+	task_atomic_dec(&w->num_tasks);
+	task_atomic_inc(&tw->num_tasks);
+
 	// All queued notifications automatically get forwarded to the new task worker
 
 	if ((tw->affined_cpu >= 0) && (i->flags & TASK_FLAGS_AFFINITY_NET)) {
@@ -232,7 +239,10 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	}
 
 	// Wake up the target worker with the receiver side of the migration.
+	// FLG_MG stays claimed until the receiver has run, so a second
+	// TASK_migrate() cannot overwrite preferred_worker in the meantime.
 	worker_notify_queue_locked(tw, tq, t, FLG_MG);
+	return true;
 } // worker_handle_task_migration
 
 
@@ -309,16 +319,20 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	// Handle a migration notification
 	if (action == FLG_MG) {
 		if (t->stride->preferred_worker != NULL) {
-			// We're the sender worker
+			// We're the sender worker.  On success the receiver owns the
+			// FLG_MG claim and will release it once its timers are attached.
 			if (t->stride->preferred_worker != w) {
-				worker_handle_task_migration(w, t);
+				(void)worker_handle_task_migration(w, t);
+			} else {
+				// Target changed back to this worker.  Nothing to move.
+				t->stride->preferred_worker = NULL;
+				task_action_done(t, FLG_MG);
 			}
-			task_action_done(t, FLG_MG);
 			return;
 		}
 
-		// We're the receiver worker
-		// Re-attach any timer nodes as needed
+		// We're the receiver worker.  Re-attach any timer nodes as needed.
+		// Releasing FLG_MG last allows the next migration to start.
 		worker_timer_update(w, &t->tm_tt);
 		worker_timer_update(w, &t->rd_tt);
 		worker_timer_update(w, &t->wr_tt);

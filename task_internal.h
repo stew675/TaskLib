@@ -45,6 +45,12 @@
 // fairly frequently, and so can cause excessive CPU cache contention misses if there are too many,
 // which will negatively impact overall performance.  Values in the low-middling 100's appear to be
 // good compromise values
+// Number of shards in the lock-free task free list.  Each shard has its own
+// tagged head on a separate cache line, so concurrent task create/free paths on
+// different CPUs do not all bounce the same cache line.  Must be a power of 2.
+#define TASK_FREE_SHARDS		16
+#define TASK_FREE_SHARD_MASK		(TASK_FREE_SHARDS - 1)
+
 #define	TASK_MAX_TFD_LOCKS		(127)
 #define TFDI_TO_LOCK_INDEX(tfdi)	(tfdi % TASK_MAX_TFD_LOCKS)
 
@@ -310,7 +316,7 @@ __attribute__ ((aligned(64))) struct task_timer tm_tt;		// 32 bytes - Timer Info
 	uint32_t		registered_fd;
 	uint32_t		listen_child;
 	_Atomic uint32_t		closed;			// Final close cleanup has run
-	uint32_t			unused_32;
+	_Atomic uint32_t		free_next;		// Next slot index on the lock-free free list
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 } __attribute__ ((aligned(64)));
@@ -398,7 +404,13 @@ _Static_assert(offsetof(struct task, meta_flags) + sizeof(uint32_t) <= 320, "tas
 _Static_assert(offsetof(struct task, tm_tt) == 320, "task timer group must start on line 5");
 _Static_assert(offsetof(struct task, task_next) + sizeof(void *) <= 384, "task timer group crosses line 5");
 _Static_assert(offsetof(struct task, rd_state) == 384, "task state group must start on line 6");
-_Static_assert(offsetof(struct task, unused_32) + sizeof(uint32_t) <= 448, "task state group crosses line 6");
+_Static_assert(offsetof(struct task, free_next) + sizeof(uint32_t) <= 448, "task state group crosses line 6");
+_Static_assert((TASK_FREE_SHARDS & TASK_FREE_SHARD_MASK) == 0, "free-list shard count must be a power of 2");
+
+// Timer keys are stored in void * keys by the paired heap.  A 32-bit void *
+// cannot represent the absolute monotonic microsecond timestamps used here, so
+// reject such builds rather than silently mis-ordering timers after ~35 minutes.
+_Static_assert(sizeof(void *) >= 8, "TaskLib requires 64-bit pointers for timer keys");
 
 _Static_assert(_Alignof(struct task_stride) == 64, "struct task_stride alignment");
 _Static_assert(sizeof(struct task_stride) == 192, "struct task_stride must be 3 cache lines");
@@ -433,6 +445,10 @@ struct cpuinfo {
 	int				num_workers;
 } __attribute__ ((aligned(32)));;
 
+struct task_free_head {
+	_Atomic uint64_t	head;		// Packed (tag << 32) | free-list head index
+} __attribute__ ((aligned(64)));
+
 struct instance {
 	uint32_t			magic;
 #define INSTANCE_MAGIC	0x487a3d67
@@ -455,7 +471,7 @@ struct instance {
 	// TFD->task pool
 	struct task			*tfd_pool;		// The total pool of tasks we can work with
 	struct task_stride		*tfd_stride;		// The "stride" portion of the task pool
-	struct task			*free_tasks;
+	struct task_free_head		free_heads[TASK_FREE_SHARDS];
 
 	uint64_t			tfd_pool_used;		// The total number of active tasks in the pool
 	uint32_t			tfd_pool_size;
@@ -629,7 +645,7 @@ void task_handle_rd_event(struct task *t);
 void worker_check_timeouts(struct worker *w);
 void worker_handle_instance(struct instance *i);
 void worker_handle_event(struct worker *w, uint32_t events);
-void worker_handle_task_migration(struct worker *w, struct task *t);
+bool worker_handle_task_migration(struct worker *w, struct task *t);
 void worker_process_one_action(struct worker *w, struct task *t, task_action_flag_t action);
 void worker_process_notifyq(struct worker *w);
 void worker_poll_listeners(struct worker *w);

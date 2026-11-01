@@ -1,0 +1,24 @@
+=== 1x500 : loadgens=1 clients/loadgen=500 dur=15s port=23501
+  lg1: IN=7061 MB/s OUT=7126 MB/s peak=7165 MB/s cpu=276% rss=17684KB
+  TOTAL IN=7061 MB/s OUT=7126 MB/s peak_out_sum=7165 MB/s
+  echoes: cpu=257% rss=180756KB voluntary_cs=3620 involuntary_cs=1940
+=== 1x1000 : loadgens=1 clients/loadgen=1000 dur=15s port=23502
+  lg1: IN=7160 MB/s OUT=7232 MB/s peak=7311 MB/s cpu=257% rss=34324KB
+  TOTAL IN=7160 MB/s OUT=7232 MB/s peak_out_sum=7311 MB/s
+  echoes: cpu=248% rss=196812KB voluntary_cs=12334 involuntary_cs=2876
+=== 1x2000 : loadgens=1 clients/loadgen=2000 dur=15s port=23503
+  lg1: IN=6820 MB/s OUT=6910 MB/s peak=6973 MB/s cpu=257% rss=67092KB
+  TOTAL IN=6820 MB/s OUT=6910 MB/s peak_out_sum=6973 MB/s
+  echoes: cpu=249% rss=228044KB voluntary_cs=7251 involuntary_cs=1456
+=== 2x1000 : loadgens=2 clients/loadgen=1000 dur=15s port=23504
+  lg1: IN=3064 MB/s OUT=3136 MB/s peak=3156 MB/s cpu=127% rss=34580KB
+  lg2: IN=3036 MB/s OUT=3106 MB/s peak=3125 MB/s cpu=129% rss=33740KB
+  TOTAL IN=6100 MB/s OUT=6242 MB/s peak_out_sum=6281 MB/s
+  echoes: cpu=250% rss=228172KB voluntary_cs=581 involuntary_cs=1068
+=== 4x1000 : loadgens=4 clients/loadgen=1000 dur=15s port=23505
+  lg1: IN=1345 MB/s OUT=1416 MB/s peak=1423 MB/s cpu=82% rss=34324KB
+  lg2: IN=1344 MB/s OUT=1418 MB/s peak=1424 MB/s cpu=69% rss=34772KB
+  lg3: IN=1341 MB/s OUT=1414 MB/s peak=1421 MB/s cpu=82% rss=34124KB
+  lg4: IN=1340 MB/s OUT=779 MB/s peak=806 MB/s cpu=82% rss=34196KB
+  TOTAL IN=5370 MB/s OUT=5027 MB/s peak_out_sum=5074 MB/s
+  echoes: cpu=245% rss=292296KB voluntary_cs=851 involuntary_cs=530

@@ -145,10 +145,10 @@ task_do_close_cb(struct task *t)
 	t->closed = 1;
 	t->tm_cancelled = 1;
 
-	cb = t->stride->close_cb;
-	cb_data = t->stride->close_cb_data;
-	t->stride->close_cb = NULL;
-	t->stride->close_cb_data = NULL;
+	cb = task_atomic_load(&t->stride->close_cb);
+	cb_data = task_atomic_load(&t->stride->close_cb_data);
+	task_atomic_store(&t->stride->close_cb, NULL);
+	task_atomic_store(&t->stride->close_cb_data, NULL);
 	tfd_unlock(t, tfdi);
 
 	// From here on the task is guaranteed to stay allocated: state is DESTROY
@@ -416,6 +416,10 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 		return NULL;
 	}
 
+	// Publish the fd before worker selection.  worker_select_io_worker()
+	// uses it for the CPU-affinity / SO_INCOMING_CPU path.
+	task_atomic_store(&t->fd, fd);
+
 	// Assign a worker
 	if (w == NULL) {
 		if ((w = worker_select_io_worker(i, t, outgoing)) == NULL) {
@@ -427,14 +431,51 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	t->worker = w;
 	t->epfd = w->gepfd;
 	t->type = type;
-	t->stride->close_cb = close_cb;
-	t->stride->close_cb_data = close_cb_data;
-	t->fd = fd;
+	task_atomic_store(&t->stride->close_cb, close_cb);
+	task_atomic_store(&t->stride->close_cb_data, close_cb_data);
 	task_atomic_inc(&w->num_tasks);
 
 	// task_get_free_tfd() already locked the task for us
 	return t;
 } // task_create
+
+
+
+// Build a stack-local iovec window covering at most maxlen bytes starting at
+// bufpos within the caller's iovec.  Used to apply the same TASK_MAX_IO_UNIT
+// fairness budget to the vector IO calls that the buffer IO calls already use.
+static int
+task_build_iov_window(const struct iovec *iov, int iovcnt, size_t bufpos,
+		      size_t maxlen, struct iovec *out)
+{
+	size_t skip = bufpos;
+	int n = 0, outcnt = 0;
+
+	while ((n < iovcnt) && (skip >= iov[n].iov_len)) {
+		skip -= iov[n].iov_len;
+		n++;
+	}
+	if (n >= iovcnt) {
+		return 0;
+	}
+
+	while ((n < iovcnt) && (maxlen > 0)) {
+		size_t len = iov[n].iov_len - skip;
+
+		if (len > maxlen) {
+			len = maxlen;
+		}
+		if (len > 0) {
+			out[outcnt].iov_base = ((char *)iov[n].iov_base) + skip;
+			out[outcnt].iov_len = len;
+			outcnt++;
+			maxlen -= len;
+		}
+		skip = 0;
+		n++;
+	}
+	return outcnt;
+} // task_build_iov_window
 
 
 
@@ -444,6 +485,7 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 	register size_t wrv_bufpos = t->wrv_bufpos, wrv_buflen = t->wrv_buflen;
 	register const struct iovec *wrv_iov = t->wrv_iov;
 	register int wrv_iovcnt = t->wrv_iovcnt;
+	register size_t max_can_do = TASK_MAX_IO_UNIT;
 	int64_t tfd = t->tfd;
 
 	if (t->wr_shut) {
@@ -458,37 +500,33 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 	// Keep trying to write until we're done, or we're blocked
 	while (wrv_bufpos < wrv_buflen) {
 		ssize_t written;
+		size_t window;
 
-		if (wrv_bufpos > 0) {
-			struct iovec iov[IOV_MAX];
-			size_t iov_pos = 0, seek_pos = 0;
-			int n = 0, iovcnt = 0;
-
-			// Seek to the current write position within the caller provided iovec
-			do {
-				if ((seek_pos + wrv_iov[n].iov_len) > wrv_bufpos) {
-					break;
-				}
-				seek_pos += wrv_iov[n].iov_len;
-			} while (++n < wrv_iovcnt);
-
-			// This must be true, otherwise our value for t->wrv_buflen is wrong/corrupted
-			assert(n < wrv_iovcnt);
-
-			// Now copy across the remainder into our stack local iov
-			iov_pos = wrv_bufpos - seek_pos;
-			iov[0].iov_len = wrv_iov[n].iov_len - iov_pos;
-			iov[0].iov_base = ((char *)wrv_iov[n].iov_base) + iov_pos;
-			for (iovcnt++, n++; n < wrv_iovcnt; n++, iovcnt++) {
-				iov[iovcnt].iov_len = wrv_iov[n].iov_len;
-				iov[iovcnt].iov_base = wrv_iov[n].iov_base;
+		// Restrict the amount that can be written in one scheduling slice
+		if (max_can_do == 0) {
+			t->wrv_bufpos = wrv_bufpos;	// Need to record bufpos for later
+			if (task_notify_action(t, FLG_WR, false, true)) {
+				return 0;
 			}
+			max_can_do = SIZE_MAX;
+		}
 
-			// We've now got a copy in our local iov of the remainder of what's left to write
-			written = writev(t->fd, iov, iovcnt);
-		} else {
-			// We have no offset.  Just use what was passed to us for speed
+		window = wrv_buflen - wrv_bufpos;
+		if (window > max_can_do) {
+			window = max_can_do;
+		}
+
+		if ((wrv_bufpos == 0) && (window == wrv_buflen)) {
+			// We have no offset and everything fits in this slice.  Just
+			// use what was passed to us for speed.
 			written = writev(t->fd, wrv_iov, wrv_iovcnt);
+		} else {
+			struct iovec iov[IOV_MAX];
+			int iovcnt = task_build_iov_window(wrv_iov, wrv_iovcnt,
+							   wrv_bufpos, window, iov);
+
+			assert(iovcnt > 0);
+			written = writev(t->fd, iov, iovcnt);
 		}
 
 		if (written < 0) {
@@ -529,6 +567,13 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 
 		// We wrote something!
 		wrv_bufpos += written;
+		if (max_can_do != SIZE_MAX) {
+			if ((size_t)written >= max_can_do) {
+				max_can_do = 0;
+			} else {
+				max_can_do -= written;
+			}
+		}
 	}
 
 	// We wrote it all.  Make the callback
@@ -707,6 +752,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 	register size_t rdv_bufpos = t->rdv_bufpos, rdv_buflen = t->rdv_buflen;
 	register const struct iovec *rdv_iov = t->rdv_iov;
 	register int rdv_iovcnt = t->rdv_iovcnt;
+	register size_t max_can_do = TASK_MAX_IO_UNIT;
 	int64_t tfd = t->tfd;
 
 	if (t->rd_shut) {
@@ -721,36 +767,35 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 	// Read what we can
 	while (rdv_bufpos < rdv_buflen) {
 		ssize_t reddin;
+		size_t window;
 
-		if (rdv_bufpos > 0) {
-			struct iovec iov[IOV_MAX];
-			size_t iov_pos = 0, seek_pos = 0;
-			int n = 0, iovcnt = 0;
-
-			// Seek to the current write position within the caller provided iovec
-			do {
-				if ((seek_pos + rdv_iov[n].iov_len) > rdv_bufpos) {
-					break;
-				}
-				seek_pos += rdv_iov[n].iov_len;
-			} while (++n < rdv_iovcnt);
-
-			// This must be true, otherwise our value for t->rdv_buflen is wrong/corrupted
-			assert(n < rdv_iovcnt);
-
-			// Now copy across the remainder into our stack local iov
-			iov_pos = rdv_bufpos - seek_pos;
-			iov[0].iov_len = rdv_iov[n].iov_len - iov_pos;
-			iov[0].iov_base = ((char *)rdv_iov[n].iov_base) + iov_pos;
-			for (iovcnt++, n++; n < rdv_iovcnt; n++, iovcnt++) {
-				iov[iovcnt].iov_len = rdv_iov[n].iov_len;
-				iov[iovcnt].iov_base = rdv_iov[n].iov_base;
+		// Restrict the amount that can be read in one scheduling slice,
+		// matching the buffer read path.
+		if (max_can_do == 0) {
+			if (queued) {
+				task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
+				return 0;
 			}
+			errno = 0;
+			return (ssize_t)rdv_bufpos;
+		}
 
-			reddin = readv(t->fd, iov, iovcnt);
-		} else {
-			// We have no offset.  Just use what was passed to us for speed
+		window = rdv_buflen - rdv_bufpos;
+		if (window > max_can_do) {
+			window = max_can_do;
+		}
+
+		if ((rdv_bufpos == 0) && (window == rdv_buflen)) {
+			// We have no offset and everything fits in this slice.  Just
+			// use what was passed to us for speed.
 			reddin = readv(t->fd, rdv_iov, rdv_iovcnt);
+		} else {
+			struct iovec iov[IOV_MAX];
+			int iovcnt = task_build_iov_window(rdv_iov, rdv_iovcnt,
+							   rdv_bufpos, window, iov);
+
+			assert(iovcnt > 0);
+			reddin = readv(t->fd, iov, iovcnt);
 		}
 
 		if (reddin < 0) {
@@ -760,7 +805,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (rdv_bufpos > 0) {
 					if (queued) {
-						task_do_readv_cb(t, tfd, (ssize_t)t->rdv_bufpos, 0);	// Unlocks task
+						task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
 						return 0;
 					}
 					errno = 0;
@@ -817,6 +862,13 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 
 		// We read something!
 		rdv_bufpos += reddin;
+		if (max_can_do != SIZE_MAX) {
+			if ((size_t)reddin >= max_can_do) {
+				max_can_do = 0;
+			} else {
+				max_can_do -= reddin;
+			}
+		}
 	}
 
 	// We read it all.  Make the callback
@@ -1091,8 +1143,11 @@ task_handle_listen_event(struct task *t)
 		// own.  The caller can distingish between the two by inspecting the tfd that
 		// arrives on the accept close callback.  If the tfd matches the accept tfd,
 		// then the close is on the accept task, otherwise it is for the new task
-		if ((t_new = task_create(i, TASK_TYPE_IO, cfd, NULL, t->stride->close_cb_data,
-					 t->stride->close_cb, false)) == NULL) {
+		void *inherited_cb_data = task_atomic_load(&t->stride->close_cb_data);
+		void (*inherited_cb)(int64_t, void *) = task_atomic_load(&t->stride->close_cb);
+
+		if ((t_new = task_create(i, TASK_TYPE_IO, cfd, NULL, inherited_cb_data,
+					 inherited_cb, false)) == NULL) {
 			// We failed to create a task structure for it :(  Inform user
 			// of the failure so they're aware of us dropping connections
 			if (t->stride->accept_cb) {
@@ -1269,8 +1324,11 @@ instance_listen_balance(struct task *t)
 		}
 
 		// Create a child task to look after the socket. Ensure to specify the worker for the new task
-		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, t->stride->close_cb_data,
-				      t->stride->close_cb, false)) == NULL) {
+		void *inherited_cb_data = task_atomic_load(&t->stride->close_cb_data);
+		void (*inherited_cb)(int64_t, void *) = task_atomic_load(&t->stride->close_cb);
+
+		if ((nt = task_create(i, TASK_TYPE_LISTEN, nfd, w, inherited_cb_data,
+				      inherited_cb, false)) == NULL) {
 			perror("instance_listen_balance->task_create");
 			close(nfd);
 			continue;
@@ -1748,10 +1806,25 @@ TASK_migrate(int64_t to_tfd, int64_t from_tfd)
 		errno = EALREADY;
 		return -1;
 	}
+
+	// Claim the migration until the worker consumes the notification.
+	// meta_flags only serialises the API call itself; active_flags survives
+	// until the worker is done and stops a second TASK_migrate() overwriting
+	// preferred_worker while the first migration is still in flight.
+	if (task_atomic_fetch_or(&from_t->active_flags, FLG_MG) & FLG_MG) {
+		task_unlock(from_t, FLG_MG);
+		errno = EINPROGRESS;
+		return -1;
+	}
+
 	from_t->stride->preferred_worker = tw;
 	bool queued = task_notify_action(from_t, FLG_MG, false, true);
 	if (!queued) {
 		from_t->stride->preferred_worker = NULL;
+		// task_notify_action() may not have reached its own rollback path
+		// (for example if the task's worker disappeared), so make sure the
+		// in-flight migration claim is always released on failure.
+		task_atomic_and(&from_t->active_flags, ~(uint32_t)FLG_MG);
 	}
 	task_unlock(from_t, FLG_MG);
 	if (!queued) {
@@ -1775,9 +1848,9 @@ TASK_close(int64_t tfd)
 
 	// The task is already marked DESTROY and cancelling by task_lookup().
 	// Cancel all timers too; the owner will do the actual teardown.
-	__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
-	__atomic_store_n(&t->rd_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
-	__atomic_store_n(&t->wr_tt.expiry_us, TIMER_TIME_CANCEL, __ATOMIC_RELAXED);
+	task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
+	task_atomic_store(&t->rd_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
+	task_atomic_store(&t->wr_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 	bool queued = task_notify_action(t, FLG_CL, true, true);
 	task_unlock(t, FLG_CL);
 
@@ -2042,8 +2115,8 @@ TASK_socket_set_close_cb(int64_t tfd, void *close_cb_data, void (*close_cb)(int6
 	}
 
 	// Set the task's close callback information
-	t->stride->close_cb = close_cb;
-	t->stride->close_cb_data = close_cb_data;
+	task_atomic_store(&t->stride->close_cb, close_cb);
+	task_atomic_store(&t->stride->close_cb_data, close_cb_data);
 	task_unlock(t, FLG_CCB);
 	return 0;
 } // TASK_socket_set_close_cb

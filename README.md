@@ -8,8 +8,11 @@ A high-performance, multi-threaded, event-driven IO library.
 
 TaskLib has no third-party dependencies. Its lock-free atomic primitives are
 implemented in `task_atomics.h` on top of the compiler's `__atomic` builtins,
-which are available in GCC 4.7+ and Clang 3.1+. A C compiler, pthreads and a
-Linux/glibc userspace (epoll, eventfd, futex, `SO_INCOMING_CPU`) are required:
+which are available in GCC 4.7+ and Clang 3.1+. A 64-bit C compiler, pthreads
+and a Linux/glibc userspace (epoll, eventfd, futex, `SO_INCOMING_CPU`) are
+required. Timer keys are absolute monotonic microsecond timestamps stored in
+`void *` keys by the paired heap, so 32-bit pointer builds are rejected at
+compile time rather than silently mis-ordering timers:
 
 ```sh
 make
@@ -21,7 +24,8 @@ variants are opt-in because they need a working ASan or profiling runtime:
 ```sh
 make asan
 make prof
-make check     # regression tests for the task-lifetime/concurrency fixes
+make check       # regression tests for the task-lifetime/concurrency fixes
+make check-asan  # the same regression tests built with AddressSanitizer
 ```
 
 ### Source layout
@@ -37,6 +41,9 @@ make check     # regression tests for the task-lifetime/concurrency fixes
 | `task_atomics.h` | `__atomic` wrappers |
 | `stewticket_thr.h` | Adaptive futex ticket lock |
 | `ph.c` / `ph.h` | Paired heap |
+
+Benchmarks and recorded comparisons against the last pre-fix revision live in
+`benchmarks/`; see `benchmarks/README.md`.
 
 ## Features
 
@@ -85,10 +92,10 @@ callback is invoked with `-1` and `errno` set, when a callback is supplied.
 Socket IO callbacks receive a `result` value:
 
 - `result > 0`: that many bytes were transferred. For reads, the operation may
-  have stopped early because the socket would block or reached EOF. Call the
-  read again for more data. For writes, this means the supplied buffer was
-  consumed in full, or that an error occurred after a partial write and the
-  remainder must be retried.
+  have stopped early because the socket would block, reached EOF, or used its
+  per-scheduling-slice IO budget. Call the read again for more data. For writes,
+  this means the supplied buffer was consumed in full, or that an error occurred
+  after a partial write and the remainder must be retried.
 - `result < 0`: the operation failed, timed out, or the task was shut down.
   `errno` is set (`ETIMEDOUT`, `EPIPE`, `EOWNERDEAD`, etc.).
 
@@ -121,6 +128,8 @@ When a timeout fires, the callback receives `result == -1` and `errno` is set to
   `TASK_instance_start()`, `TASK_instance_shutdown()`,
   `TASK_instance_wait()`, `TASK_instance_destroy()`) must not race with each
   other for the same `ti`. The application must serialize them.
+  `TASK_instance_destroy()` additionally waits for in-flight task API calls
+  that are already inside the library to finish before freeing the instance.
 - Socket, timer, connect, read, write, and close callbacks run on the task's
   owning worker thread.  If an IO call is made from that worker's thread and
   can complete immediately it runs inline (still on the owning worker).  If an
@@ -128,7 +137,9 @@ When a timeout fires, the callback receives `result == -1` and `errno` is set to
   error callback is invoked synchronously on the calling thread.  Do not block
   inside any callback.
 - The accept callback runs on the worker that accepted the connection. The new
-  task may later migrate to its preferred worker.
+  task is assigned to its selected worker at creation time, which may be a
+  different worker from the one running the callback; it does not subsequently
+  migrate from the accepting worker.
 - The blocking work callback (`work_cb_func`) runs on the instance notification
   worker, or on a thread blocked in `TASK_instance_wait()`. It does not run on
   the blocking thread.
@@ -187,9 +198,9 @@ Returns `0`, or `-1` with `errno` set.
 
 Destroys an instance. If it is still running or only created, a shutdown is
 performed first: live tasks are closed or reaped, workers are stopped and
-joined, and the instance is freed. This call is safe after
-`TASK_instance_wait()`. If a `shutdown_cb` is pending it is invoked after the
-instance is freed.
+joined, in-flight task API entry references are drained, and the instance is
+freed. This call is safe after `TASK_instance_wait()`. If a `shutdown_cb` is
+pending it is invoked after the instance is freed.
 
 Do not use `ti` after this call returns success.
 
@@ -288,8 +299,9 @@ Marks the task as a listener and starts accepting connections. When the instance
 has more than one IO worker, additional listener sockets are created so
 acceptance is distributed across workers.
 
-The task must already be bound. If `accept_cb` is NULL, accepted connections are
-immediately closed.
+The socket must already be bound; this is not checked by the library, and an
+unbound TCP socket may be auto-bound by the kernel. If `accept_cb` is NULL,
+accepted connections are immediately closed.
 
 Returns `0`, or `-1` with `errno` set.
 
@@ -338,8 +350,9 @@ Queues a migration so that the `from_tfd` task moves to the same worker as
 `to_tfd`. This can reduce cross-thread latency between related tasks.
 
 Returns `0`, or `-1` with `errno` set. `EALREADY` means both tasks already share
-a worker. `EINVAL` means `to_tfd` belongs to a different instance; `EBADF` means
-the target handle is stale or not active.
+a worker. `EINPROGRESS` means another migration for `from_tfd` is still being
+completed by its worker. `EINVAL` means `to_tfd` belongs to a different
+instance; `EBADF` means the target handle is stale or not active.
 
 ---
 

@@ -46,12 +46,14 @@ worker_timer_detach_list(struct worker *w, struct task_timer *tt)
 void
 worker_timer_attach_heap(struct worker *w, struct task_timer *tt)
 {
+	int64_t expiry_us = task_atomic_load(&tt->expiry_us);
+
 	// Okay then, it needs to go into the paired heap directly
 	if (tt->node == NULL) {
-		tt->node = pheap_insert(w->timer_queue, (void *)tt->expiry_us, (void *)tt);
+		tt->node = pheap_insert(w->timer_queue, (void *)expiry_us, (void *)tt);
 		assert(tt->node != NULL);
 	} else {
-		pheap_set_key(w->timer_queue, tt->node, (void *)tt->expiry_us);
+		pheap_set_key(w->timer_queue, tt->node, (void *)expiry_us);
 		pheap_attach_node(w->timer_queue, tt->node);
 	}
 } // worker_timer_attach_heap
@@ -72,12 +74,14 @@ worker_timer_detach_heap(struct worker *w, struct task_timer *tt)
 void
 worker_timer_update(struct worker *w, struct task_timer *tt)
 {
-	if (tt->expiry_us < 0) {
+	int64_t expiry_us = task_atomic_load(&tt->expiry_us);
+
+	if (expiry_us < 0) {
 		// Nothing to do
 		return;
 	}
 
-	if ((tt->expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
+	if ((expiry_us - w__curtime_us) < TASK_MIN_COLT_TIME_US) {
 		// It should go to the paired heap
 		if (tt->next != NULL) {
 			worker_timer_detach_list(w, tt);
@@ -174,7 +178,7 @@ task_destroy_timeouts(struct task *t)
 	}
 
 	// Destroy all timeouts
-	__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_DESTROY, __ATOMIC_RELAXED);
+	task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_DESTROY);
 	t->tm_cancelled = true;
 	if (t->tm_tt.next) {
 		worker_timer_detach_list(w, &t->tm_tt);
@@ -184,7 +188,7 @@ task_destroy_timeouts(struct task *t)
 		t->tm_tt.node = NULL;
 	}
 
-	t->wr_tt.expiry_us = TIMER_TIME_DESTROY;
+	task_atomic_store(&t->wr_tt.expiry_us, (int64_t)TIMER_TIME_DESTROY);
 	t->wt_cancelled = true;
 	if (t->wr_tt.next) {
 		worker_timer_detach_list(w, &t->wr_tt);
@@ -194,7 +198,7 @@ task_destroy_timeouts(struct task *t)
 		t->wr_tt.node = NULL;
 	}
 
-	t->rd_tt.expiry_us = TIMER_TIME_DESTROY;
+	task_atomic_store(&t->rd_tt.expiry_us, (int64_t)TIMER_TIME_DESTROY);
 	t->rt_cancelled = true;
 	if (t->rd_tt.next) {
 		worker_timer_detach_list(w, &t->rd_tt);
@@ -235,12 +239,13 @@ task_activate_rd_timeout(struct worker *w, struct task *t)
 		t->rt_cancelled = true;
 		return;
 	}
-	t->rd_tt.expiry_us = task_calculate_io_timeout(t->rd_expires_in_us);
+	int64_t expiry_us = task_calculate_io_timeout(t->rd_expires_in_us);
+	task_atomic_store(&t->rd_tt.expiry_us, expiry_us);
 	t->rd_expires_in_us = TIMER_TIME_DESTROY;
 
-	if (w__curtime_us > t->rd_tt.expiry_us) {
+	if (w__curtime_us > expiry_us) {
 		// It's already expired.  Handle that now
-		task_do_timeout_cb(t, FLG_RT, t->rd_tt.expiry_us);
+		task_do_timeout_cb(t, FLG_RT, expiry_us);
 		return;
 	}
 
@@ -258,12 +263,13 @@ task_activate_wr_timeout(struct worker *w, struct task *t)
 		t->wt_cancelled = true;
 		return;
 	}
-	t->wr_tt.expiry_us = task_calculate_io_timeout(t->wr_expires_in_us);
+	int64_t expiry_us = task_calculate_io_timeout(t->wr_expires_in_us);
+	task_atomic_store(&t->wr_tt.expiry_us, expiry_us);
 	t->wr_expires_in_us = TIMER_TIME_DESTROY;
 
-	if (w__curtime_us > t->wr_tt.expiry_us) {
+	if (w__curtime_us > expiry_us) {
 		// It's already expired.  Handle that now
-		task_do_timeout_cb(t, FLG_WT, t->wr_tt.expiry_us);
+		task_do_timeout_cb(t, FLG_WT, expiry_us);
 		return;
 	}
 

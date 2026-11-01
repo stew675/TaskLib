@@ -30,6 +30,12 @@ static __thread uint32_t	task_api_thread_shard;
 static __thread bool		task_api_thread_shard_set;
 static _Atomic uint32_t		task_api_thread_seq;
 
+// Per-slot admission gate for instance-entry references.  It lives for the
+// process lifetime so an API caller can test it without dereferencing the
+// (possibly freed) instance pointer.  create/destroy close it before draining
+// references, and create re-opens it after publishing the instance.
+static _Atomic uint32_t	task_api_slot_open[TASK_MAX_INSTANCES];
+
 // Persistent per-slot TFD generation state.  The per-instance task pool is
 // recycled when an instance is destroyed and recreated, so a generation
 // counter kept in the task slot itself would restart at 1 and a stale tfd
@@ -92,14 +98,35 @@ task_api_exit(uint32_t ti)
 	task_atomic_dec(&task_api_slot_refs[ti][task_api_thread_shard].refs);
 } // task_api_exit
 
-// Unconditional instance-entry references for APIs that take an instance
-// index rather than a tfd.  Unlike task_lookup() these are always taken, even
-// when called from one of the instance's own workers, so shutdown can drain
-// them before scanning the task pool or stopping workers.
-void
+// Instance-entry references for APIs that take an instance index rather than
+// a tfd.  The reference is only taken if the slot is published; once destroy
+// publishes INSTANCE_SLOT_BUSY new callers fail immediately instead of
+// keeping the API-reference drain permanently non-zero.
+bool
 task_instance_ref(uint32_t ti)
 {
-	task_api_enter(ti);
+	struct instance *i;
+
+	if (!__atomic_load_n(&task_api_slot_open[ti], __ATOMIC_SEQ_CST)) {
+		return false;
+	}
+
+	// Increment first, then revalidate the slot pointer.  Destroy reserves the
+	// slot (INSTANCE_SLOT_BUSY) before waiting for references, so either the
+	// revalidation sees the reservation and we drop our reference without ever
+	// dereferencing the instance, or destroy's wait observes our reference.
+	for (;;) {
+		i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
+		if ((i == NULL) || (i == INSTANCE_SLOT_BUSY)) {
+			return false;
+		}
+		task_api_enter(ti);
+		if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == i) {
+			return true;
+		}
+		task_api_exit(ti);
+		return false;
+	}
 } // task_instance_ref
 
 void
@@ -345,6 +372,8 @@ task_free(struct instance *i, struct task *t, bool published)
 	 * task_create(), where no timer can have been armed yet.
 	 */
 	if (published) {
+		assert(task_atomic_load(&t->state) == TASK_STATE_FREEING);
+		assert((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) == 0);
 		assert(t->tm_tt.node == NULL);
 		assert(t->rd_tt.node == NULL);
 		assert(t->wr_tt.node == NULL);
@@ -504,11 +533,14 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 	// clears instances[ti] and waits for this reference before freeing.
 	bool api_ref = task_api_ref_required(ti);
 	if (api_ref) {
-		task_api_enter(ti);
+		if (!task_instance_ref(ti)) {
+			errno = EBADF;
+			return NULL;
+		}
 	}
 
 	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
-	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || (i->magic != INSTANCE_MAGIC)) {
 		if (api_ref) task_api_exit(ti);
 		errno = EBADF;
 		return NULL;
@@ -660,37 +692,6 @@ task_unlock(struct task *t, register task_action_flag_t action)
 	}
 } // task_unlock
 
-
-// Claim a task for destruction from a context that does not own it (instance
-// shutdown, parent-listener teardown).  The task is marked DESTROY under its
-// TFD lock and an API reference is taken so it cannot be recycled between the
-// claim and the queued FLG_CL notification.
-bool
-task_claim_close(struct instance *i, struct task *t)
-{
-	uint32_t tfdi = TFD_TO_INDEX(task_atomic_load(&t->tfd));
-	uint32_t state;
-
-	itfd_lock(i, tfdi);
-	state = task_atomic_load(&t->state);
-	if ((state == TASK_STATE_UNUSED) || (state == TASK_STATE_FREEING) ||
-	    (task_atomic_load(&t->worker) == NULL)) {
-		itfd_unlock(i, tfdi);
-		return false;
-	}
-	if (state == TASK_STATE_ACTIVE) {
-		task_atomic_store(&t->state, TASK_STATE_DESTROY);
-		task_atomic_store(&t->rd_shut, 1);
-		task_atomic_store(&t->wr_shut, 1);
-		task_atomic_store(&t->rd_cancel, 1);
-		task_atomic_store(&t->wr_cancel, 1);
-		task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
-		task_atomic_store(&t->closed, 0);
-	}
-	task_ref(t);
-	itfd_unlock(i, tfdi);
-	return true;
-} // task_claim_close
 
 
 
@@ -1302,6 +1303,221 @@ worker_notify_queue_locked(struct worker *w, struct ntfyq *tq, struct task *t,
 
 
 
+/*
+ * Central deferred-close queue.
+ *
+ * A close request never allocates a notification node.  It pins the task with
+ * FLG_CL, marks it DESTROY, and links the slot index onto its owner worker's
+ * close list using task->free_next.  The owner drains that list at a safe
+ * point after the current epoll/poll/notify batch.  task->free_next is not the
+ * free-list link until the task is recycled, and FLG_CL prevents recycling.
+ */
+static void
+task_close_link(struct worker *w, struct task *t, uint32_t tfdi)
+{
+	worker_lock(w);
+	task_atomic_store(&t->free_next, task_atomic_load(&w->close_head));
+	task_atomic_store(&w->close_head, tfdi);
+	worker_unlock(w);
+
+	if (!lockless_worker(w)) {
+		worker_notify(w);
+	}
+} // task_close_link
+
+
+// Common close transition.  The caller holds the task's TFD lock.
+bool
+task_defer_close_locked(struct task *t, uint32_t tfdi)
+{
+	struct worker *w;
+	uint32_t state;
+
+	if (t == NULL) {
+		return false;
+	}
+
+	state = task_atomic_load(&t->state);
+	if ((state == TASK_STATE_UNUSED) || (state == TASK_STATE_FREEING)) {
+		return false;
+	}
+
+	if (state == TASK_STATE_ACTIVE) {
+		task_atomic_store(&t->state, TASK_STATE_DESTROY);
+		task_atomic_store(&t->rd_shut, 1);
+		task_atomic_store(&t->wr_shut, 1);
+		task_atomic_store(&t->rd_cancel, 1);
+		task_atomic_store(&t->wr_cancel, 1);
+		task_atomic_store(&t->closed, 0);
+	}
+
+	// Cancel the user timer immediately; IO timeouts are detached by
+	// task_do_close_cb() on the owning worker.
+	task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
+	t->tm_cancelled = 1;
+
+	if (task_atomic_load(&t->closed) != 0) {
+		return false;
+	}
+
+	// The pin is set while holding the TFD lock, so task_maybe_free() cannot
+	// recycle the slot underneath us.  A second close request is a no-op.
+	if (task_atomic_fetch_or(&t->active_flags, (uint32_t)FLG_CL) & (uint32_t)FLG_CL) {
+		return true;
+	}
+
+	w = task_atomic_load(&t->worker);
+	if (w == NULL) {
+		// Shutdown's final nuke pass will reap this slot.  It is already
+		// DESTROY and pinned, so it cannot be recycled before then.
+		return false;
+	}
+
+	task_close_link(w, t, tfdi);
+	return true;
+} // task_defer_close_locked
+
+
+// Defer a close for a task identified by its current slot index.
+bool
+task_defer_close_index(struct instance *i, uint32_t tfdi)
+{
+	struct task *t;
+	int64_t tfd;
+	bool result;
+
+	if ((i == NULL) || (tfdi >= i->tfd_pool_size)) {
+		return false;
+	}
+
+	t = i->tfd_pool + tfdi;
+	itfd_lock(i, tfdi);
+	tfd = task_atomic_load(&t->tfd);
+	if ((TFD_TO_INDEX(tfd) != tfdi) || (TFD_TO_INSTANCE(tfd) != (uint32_t)i->ti)) {
+		itfd_unlock(i, tfdi);
+		return false;
+	}
+	result = task_defer_close_locked(t, tfdi);
+	itfd_unlock(i, tfdi);
+	return result;
+} // task_defer_close_index
+
+
+// Defer a close for a live task pointer.
+bool
+task_defer_close(struct task *t)
+{
+	struct worker *w;
+	struct instance *i;
+	uint32_t tfdi;
+
+	if (t == NULL) {
+		return false;
+	}
+	w = task_atomic_load(&t->worker);
+	if (w == NULL) {
+		return false;
+	}
+	i = w->instance;
+	if (i == NULL) {
+		return false;
+	}
+	tfdi = (uint32_t)(t - i->tfd_pool);
+	if (tfdi >= i->tfd_pool_size) {
+		return false;
+	}
+	return task_defer_close_index(i, tfdi);
+} // task_defer_close
+
+
+// Re-home an already-pinned close (legacy FLG_CL notification or a migration
+// that changed the owner after the close was queued).
+bool
+task_close_forward(struct task *t)
+{
+	struct worker *w;
+	struct instance *i;
+	uint32_t tfdi;
+
+	if ((t == NULL) || (task_atomic_load(&t->state) != TASK_STATE_DESTROY) ||
+	    ((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) == 0)) {
+		return false;
+	}
+	w = task_atomic_load(&t->worker);
+	if (w == NULL) {
+		return false;
+	}
+	i = w->instance;
+	if (i == NULL) {
+		return false;
+	}
+	tfdi = (uint32_t)(t - i->tfd_pool);
+	if (tfdi >= i->tfd_pool_size) {
+		return false;
+	}
+	task_close_link(w, t, tfdi);
+	return true;
+} // task_close_forward
+
+
+// Drain a worker's deferred-close list.  This is the only normal caller of
+// task_do_close_cb(); it always runs on the owning worker.
+void
+worker_process_closes(struct worker *w)
+{
+	struct instance *i;
+	uint32_t list;
+
+	if ((w == NULL) || ((i = w->instance) == NULL)) {
+		return;
+	}
+
+	for (;;) {
+		worker_lock(w);
+		list = task_atomic_load(&w->close_head);
+		task_atomic_store(&w->close_head, TASK_CLOSE_EMPTY);
+		worker_unlock(w);
+
+		if (list == TASK_CLOSE_EMPTY) {
+			return;
+		}
+
+		while (list != TASK_CLOSE_EMPTY) {
+			uint32_t tfdi = list;
+			struct task *t;
+			struct worker *tw;
+
+			if (tfdi >= i->tfd_pool_size) {
+				assert(0);
+				return;
+			}
+			t = i->tfd_pool + tfdi;
+
+			// Read the link before close teardown can recycle the slot and
+			// overwrite free_next.
+			list = task_atomic_load(&t->free_next);
+
+			if ((task_atomic_load(&t->state) != TASK_STATE_DESTROY) ||
+			    ((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) == 0)) {
+				continue;
+			}
+
+			tw = task_atomic_load(&t->worker);
+			if (tw != w) {
+				// Migration raced with close.  Forward to the current
+				// owner; the pin keeps the slot alive.
+				if (tw != NULL) {
+					task_close_link(tw, t, tfdi);
+				}
+				continue;
+			}
+
+			task_do_close_cb(t);
+		}
+	}
+} // worker_process_closes
+
+
 // Must be called with the task lock held. 
 bool
 task_notify_action(register struct task *t, register task_action_flag_t action, bool force_close_q, bool force_q)
@@ -1316,21 +1532,15 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 		return false;
 	}
 
-	state = task_atomic_load(&t->state);
 	if (action == FLG_CL) {
-		// Close is always allowed once a task has entered DESTROY, and it is
-		// the action that performs the transition from ACTIVE.
-		if ((state == TASK_STATE_UNUSED) || (state == TASK_STATE_FREEING)) {
-			return false;
-		}
-		if (state == TASK_STATE_ACTIVE) {
-			task_atomic_store(&t->state, TASK_STATE_DESTROY);
-		}
-		task_atomic_store(&t->rd_shut, 1);
-		task_atomic_store(&t->wr_shut, 1);
-		task_atomic_store(&t->rd_cancel, 1);
-		task_atomic_store(&t->wr_cancel, 1);
-	} else if (state != TASK_STATE_ACTIVE) {
+		// Close is never queued as a notification.  This entry point exists
+		// only for callers that still hold the TFD lock; route it through the
+		// allocation-free deferred queue.
+		return task_defer_close_locked(t, TFD_TO_INDEX(task_atomic_load(&t->tfd)));
+	}
+
+	state = task_atomic_load(&t->state);
+	if (state != TASK_STATE_ACTIVE) {
 		return false;
 	}
 
@@ -1420,23 +1630,11 @@ task_notify_action(register struct task *t, register task_action_flag_t action, 
 } // task_notify_action
 
 
-// Queue a close.  If the notification pool is exhausted, perform the close
-// inline only when the caller is the owning worker.  Running teardown on a
-// foreign thread would violate the single-owner rule for epoll/timer state.
+// Queue a close.  This never allocates and never tears down inline.
 bool
 task_queue_close(struct task *t)
 {
-	if (task_notify_action(t, FLG_CL, true, true)) {
-		return true;
-	}
-
-	if (!lockless_worker(task_atomic_load(&t->worker))) {
-		return false;
-	}
-
-	task_lock(t, FLG_CL);
-	task_do_close_cb(t);
-	return true;
+	return task_defer_close(t);
 } // task_queue_close
 
 
@@ -1460,10 +1658,10 @@ worker_cleanup(struct worker *w)
 	w->freeq_locked = NULL;
 	worker_unlock(w);
 
-	// Process both lists.  The notification count is dropped *after* the
-	// action is processed so that it keeps the task alive for the duration
-	// of the callback.  That is what allows task_maybe_free() to be the only
-	// place that recycles a task.
+	// Process both lists.  At shutdown every live task is routed through the
+	// deferred close queue; teardown happens below, after the notification
+	// batch has been consumed.  The notification count is dropped *after* the
+	// close has been queued so the slot stays alive for the whole batch.
 	for (int pass = 0; pass < 2; pass++) {
 		for (tq = (pass == 0) ? owned : locked; tq != NULL; tq = tq->next) {
 			struct task *t = tq->t;
@@ -1474,18 +1672,18 @@ worker_cleanup(struct worker *w)
 			}
 
 			// The task may have migrated since this action was queued.
-			// Do not close it from the wrong thread; its new owner will
-			// process its own queued close, or the final nuke will reap it.
+			// Do not touch its new owner's state from this thread; the new
+			// owner will process its own close, or the final nuke will reap
+			// the slot.
 			if (t->worker == w) {
-				if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) && (action != FLG_CL)) {
+				if (action == FLG_CL) {
+					// Legacy close notification: move it to the close queue.
+					(void)task_close_forward(t);
+				} else {
+					// Queue the close first, then drop the action.  FLG_CL
+					// keeps the task pinned across both steps.
+					(void)task_defer_close(t);
 					task_action_done(t, action);
-				} else if ((action & (FLG_RT | FLG_WT)) == 0) {
-					// At shutdown everything still queued is closed.
-					task_lock(t, FLG_CL);
-					if ((action & FLG_CL) == 0) {
-						task_action_done(t, action);
-					}
-					task_do_close_cb(t);
 				}
 			}
 
@@ -1499,6 +1697,9 @@ worker_cleanup(struct worker *w)
 			}
 		}
 	}
+
+	// Now run teardown for everything queued above.
+	worker_process_closes(w);
 
 	// Notification batches are deliberately *not* freed here.  During
 	// shutdown another worker may still notify a task owned by this worker;
@@ -1526,6 +1727,11 @@ worker_destroy(struct worker *w)
 		}
 		w->started = 0;
 	}
+
+	// A worker must never be destroyed with a deferred close still pinned:
+	// that task would have no route to teardown.  worker_cleanup() drains the
+	// list, and the final instance nuke is the only other escape hatch.
+	assert(task_atomic_load(&w->close_head) == TASK_CLOSE_EMPTY);
 
 	// Remove from instance's list of IO workers
 	if (w->type == WORKER_TYPE_IO) {
@@ -1852,6 +2058,7 @@ worker_create(struct instance *i, int worker_type)
 	w->affined_cpu = -1;
 	w->gepfd = -1;
 	w->evfd = -1;
+	task_atomic_store(&w->close_head, TASK_CLOSE_EMPTY);
 	pthread_mutex_init(&w->lock, &attr);
 
 	// Now initialise the worker state
@@ -1958,16 +2165,10 @@ void
 instance_queue_shutdown(struct instance *i)
 {
 	for (uint32_t n = 0; n < i->tfd_pool_size; n++) {
-		struct task *t = i->tfd_pool + n;
-
-		if (!task_claim_close(i, t)) {
-			continue;
-		}
-		// If the notification cannot be queued the task is left for the
-		// final nuke pass; task_unref() lets it be recycled if it was already
-		// closed by the time we got here.
-		task_notify_action(t, FLG_CL, true, true);
-		task_unref(t);
+		// Close requests are allocation-free and pin DESTROY tasks.  If a
+		// task cannot be queued because its worker is already gone, the
+		// final nuke pass reaps it.
+		(void)task_defer_close_index(i, n);
 	}
 } // instance_queue_shutdown
 
@@ -2443,6 +2644,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	}
 
 	__atomic_store_n(&instances[ti], i, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&task_api_slot_open[ti], 1, __ATOMIC_SEQ_CST);
 	pthread_mutexattr_destroy(&attr);
 
 	return i;
@@ -2474,10 +2676,13 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 		return -1;
 	}
 
-	task_instance_ref((uint32_t)ti);
+	if (!task_instance_ref((uint32_t)ti)) {
+		errno = EBADF;
+		return -1;
+	}
 	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
 		goto out;
 	}
@@ -2646,9 +2851,9 @@ TASK_instance_destroy(int32_t ti)
 		return -1;
 	}
 
-	i = instances[ti];
+	i = __atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if (i == NULL) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY)) {
 		errno = EBADF;
 		pthread_mutex_unlock(&creation_lock);
 		return -1;
@@ -2679,10 +2884,12 @@ TASK_instance_destroy(int32_t ti)
 	__atomic_store_n(&i->state, INSTANCE_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
 	instance_unlock(i);
 
-	// Publish the removal before waiting.  New task API calls will now fail
-	// without dereferencing the instance, while callers that already entered
-	// hold an api_slot_ref that keeps it alive until task_unlock().
-	__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
+	// Reserve the slot before waiting.  New task API calls observe the busy
+	// sentinel and fail without taking an API reference, while callers that
+	// already entered hold a reference that keeps the instance alive until
+	// task_unlock().
+	__atomic_store_n(&task_api_slot_open[ti], 0, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&instances[ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
 
 	// Drain instance-entry references before scanning the task pool.  This is
 	// what lets TASK_socket_create(), TASK_timeout_create(),
@@ -2708,6 +2915,7 @@ TASK_instance_destroy(int32_t ti)
 	instance_nuke_tasks(i);
 
 	instance_destroy(i);
+	__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
 	pthread_mutex_unlock(&creation_lock);
 
 	if (shutdown_cb) {
@@ -2729,9 +2937,9 @@ TASK_instance_wait(int32_t ti)
 		return -1;
 	}
 
-	i = instances[ti];
+	i = __atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
 		return -1;
 	}
@@ -2811,9 +3019,9 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 		return -1;
 	}
 
-	i = instances[ti];
+	i = __atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if (i == NULL) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY)) {
 		errno = EBADF;
 		return -1;
 	}
@@ -2835,8 +3043,10 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 	__atomic_store_n(&i->state, INSTANCE_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
 	instance_unlock(i);
 
-	// Let any creation-style API call publish its task before the shutdown
-	// scan decides which tasks are live.
+	// Stop admitting new entry references, then let every creation-style API
+	// call that already entered publish its task before the shutdown scan
+	// decides which tasks are live.
+	__atomic_store_n(&task_api_slot_open[ti], 0, __ATOMIC_SEQ_CST);
 	instance_wait_api_refs((uint32_t)ti);
 
 	// Queue the closes first, then stop the workers.  worker_cleanup() will
@@ -2862,9 +3072,9 @@ TASK_instance_start(int32_t ti)
 		return -1;
 	}
 
-	i = instances[ti];
+	i = __atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
 		return -1;
 	}
@@ -2989,7 +3199,13 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 
 TASK_instance_create_error:
 	if (i) {
+		uint32_t fail_ti = (uint32_t)i->ti;
+
+		__atomic_store_n(&task_api_slot_open[fail_ti], 0, __ATOMIC_SEQ_CST);
+		__atomic_store_n(&instances[fail_ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
+		instance_wait_api_refs(fail_ti);
 		instance_destroy(i);
+		__atomic_store_n(&instances[fail_ti], NULL, __ATOMIC_SEQ_CST);
 	}
 	pthread_mutex_unlock(&creation_lock);
 	return -1;

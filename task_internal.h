@@ -381,6 +381,7 @@ __attribute__ ((aligned(64))) _Atomic uint32_t started;	// Thread has been creat
 	void				(*work_cb_func)(int32_t ti, void *work_cb_data);
 	void				*work_cb_data;
 	struct task			**poll_tasks;	// Listener snapshot for poll()
+	_Atomic uint32_t		close_head;	// Deferred-close list (tfdi link via free_next)
 
 	// Put this all by itself at the end
 __attribute__ ((aligned(64))) pthread_mutex_t lock;
@@ -563,6 +564,14 @@ extern pthread_mutex_t	creation_lock;
 // The non-existent TFD Identifier
 #define TFD_NONE 		(int64_t)(0xffffffffffffffff)
 
+// Sentinel for the per-worker deferred-close list head.
+#define TASK_CLOSE_EMPTY	(0xffffffffu)
+
+// A reserved instance slot.  instance_create()/destroy() publish this while
+// they own the slot but are not holding creation_lock.  APIs treat it as
+// "instance is being created/destroyed" and must not touch the pointer.
+#define INSTANCE_SLOT_BUSY	((struct instance *)(uintptr_t)1)
+
 
 
 //----------------------------------------------------------------------------------------------//
@@ -570,7 +579,7 @@ extern pthread_mutex_t	creation_lock;
 //----------------------------------------------------------------------------------------------//
 
 void task_dump(struct task *t);
-void task_instance_ref(uint32_t ti);
+bool task_instance_ref(uint32_t ti);
 void task_instance_unref(uint32_t ti);
 int64_t get_time_us(time_precision_t prec);
 void worker_timer_attach_list(struct worker *w, struct task_timer *tt);
@@ -589,7 +598,6 @@ void task_action_done(struct task *t, task_action_flag_t action);
 bool task_action_is_meta(task_action_flag_t action);
 struct task * task_lookup(int64_t tfd, task_action_flag_t action);
 void task_unlock(struct task *t, task_action_flag_t action);
-bool task_claim_close(struct instance *i, struct task *t);
 bool task_claim_listen_child(struct instance *i, struct task *c, int64_t parent_tfd);
 void task_nuke(struct instance *i, uint32_t tfdi);
 struct task * task_get_free_task(struct instance *i);
@@ -607,6 +615,11 @@ struct ntfyq * worker_notify_get_free_ntfyq(struct worker *w);
 struct ntfyq * worker_notify_reserve_locked(struct worker *w);
 void worker_notify_queue_locked(struct worker *w, struct ntfyq *tq, struct task *t, task_action_flag_t action);
 bool task_queue_close(struct task *t);
+bool task_defer_close(struct task *t);
+bool task_defer_close_locked(struct task *t, uint32_t tfdi);
+bool task_defer_close_index(struct instance *i, uint32_t tfdi);
+bool task_close_forward(struct task *t);
+void worker_process_closes(struct worker *w);
 bool task_notify_action(struct task *t, task_action_flag_t action, bool force_close_q, bool force_q);
 int64_t task_calculate_io_timeout(int64_t us_from_now);
 void task_activate_rd_timeout(struct worker *w, struct task *t);

@@ -515,30 +515,20 @@ TASK_timeout_destroy(int64_t tfd)
 	t->tm_cancelled = 1;
 	__atomic_store_n(&t->tm_tt.expiry_us, TIMER_TIME_DESTROY, __ATOMIC_RELAXED);
 
-	bool queued;
 	if (t->type == TASK_TYPE_TIMER) {
 		// Standalone timer tasks have no fd or other owner, so destroy the
 		// task itself.  For socket-backed tasks this behaves as a cancel.
-		task_atomic_store(&t->state, TASK_STATE_DESTROY);
-		task_atomic_store(&t->closed, 0);
-		queued = task_notify_action(t, FLG_CL, true, true);
-		task_unlock(t, FLG_TD);
-		if (!queued) {
-			if (!lockless_worker(task_atomic_load(&t->worker))) {
-				errno = ENOMEM;
-				return -1;
-			}
-			task_lock(t, FLG_CL);
-			task_do_close_cb(t);
-		}
+		// The request is asynchronous; close_cb is the barrier after which
+		// no timeout callback may start.
+		(void)task_defer_close_locked(t, TFD_TO_INDEX(task_atomic_load(&t->tfd)));
 	} else {
-		queued = task_notify_action(t, FLG_TM, false, true);
-		task_unlock(t, FLG_TD);
-		if (!queued) {
+		if (!task_notify_action(t, FLG_TM, false, true)) {
+			task_unlock(t, FLG_TD);
 			errno = EOWNERDEAD;
 			return -1;
 		}
 	}
+	task_unlock(t, FLG_TD);
 	return 0;
 } // TASK_timeout_destroy
 
@@ -613,10 +603,13 @@ TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data,
 		return -1;
 	}
 
-	task_instance_ref((uint32_t)ti);
+	if (!task_instance_ref((uint32_t)ti)) {
+		errno = EBADF;
+		return -1;
+	}
 	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if ((i == NULL) || i->magic != INSTANCE_MAGIC) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || i->magic != INSTANCE_MAGIC) {
 		errno = EINVAL;
 		goto out;
 	}
@@ -639,12 +632,9 @@ TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data,
 	t->tm_cancelled = 0;
 
 	if (!task_notify_action(t, FLG_TM, false, true)) {
-		task_atomic_store(&t->state, TASK_STATE_DESTROY);
-		task_atomic_store(&t->closed, 0);
-		if (!task_queue_close(t)) {
-			errno = ENOMEM;
-			goto out;
-		}
+		// The timer action could not be queued (normally because the
+		// instance is shutting down).  The close queue is allocation-free.
+		(void)task_queue_close(t);
 		errno = EOWNERDEAD;
 		goto out;
 	}

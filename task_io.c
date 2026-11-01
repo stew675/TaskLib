@@ -1183,11 +1183,9 @@ task_handle_listen_event(struct task *t)
 	return;
 
 task_handle_listen_event_fail:
-	// Major accept failure.  Cancel the accept task
-	// Inform user that accept is now failing/gone
-	task_lock(t, FLG_CL);
+	// Major accept failure.  Request a deferred close on the owning worker.
 	task_atomic_store(&t->rd_state, TASK_READ_STATE_IDLE);
-	task_do_close_cb(t);	// Unlocks task
+	(void)task_defer_close(t);
 } // task_handle_listen_event
 
 
@@ -1875,21 +1873,12 @@ TASK_close(int64_t tfd)
 	task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 	task_atomic_store(&t->rd_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 	task_atomic_store(&t->wr_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
-	bool queued = task_notify_action(t, FLG_CL, true, true);
-	task_unlock(t, FLG_CL);
 
-	if (!queued) {
-		// Out of notification nodes.  Inline teardown is only legal on the
-		// owning worker; a foreign caller reports ENOMEM and leaves the task
-		// in DESTROY for shutdown to reap rather than corrupting the owner's
-		// timer/epoll state.
-		if (!lockless_worker(task_atomic_load(&t->worker))) {
-			errno = ENOMEM;
-			return -1;
-		}
-		task_lock(t, FLG_CL);
-		task_do_close_cb(t);
-	}
+	// Close is allocation-free and always deferred to the owning worker.
+	// The lookup holds the TFD lock, so the transition/enqueue is atomic with
+	// respect to task_maybe_free() and other close requests.
+	(void)task_defer_close_locked(t, TFD_TO_INDEX(task_atomic_load(&t->tfd)));
+	task_unlock(t, FLG_CL);
 	return 0;
 } // TASK_close
 
@@ -2196,10 +2185,13 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 		return -1;
 	}
 
-	task_instance_ref((uint32_t)ti);
+	if (!task_instance_ref((uint32_t)ti)) {
+		errno = EBADF;
+		return -1;
+	}
 	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EINVAL;
 		goto out;
 	}
@@ -2265,10 +2257,13 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 		return -1;
 	}
 
-	task_instance_ref((uint32_t)ti);
+	if (!task_instance_ref((uint32_t)ti)) {
+		errno = EBADF;
+		return -1;
+	}
 	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
-	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
+	if ((i == NULL) || (i == INSTANCE_SLOT_BUSY) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EINVAL;
 		goto out;
 	}

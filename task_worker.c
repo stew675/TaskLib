@@ -253,6 +253,11 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	// If this worker does not match the task's worker, then that's probably because
 	// the task recently migrated.  Send the notification to the correct worker
 	if(t->worker != w) {
+		if (action == FLG_CL) {
+			// Close is deferred to the current owner's close queue.
+			(void)task_close_forward(t);
+			return;
+		}
 		// Forward the action directly to the correct worker.  Pass the
 		// force_close_q flag to allow FLG_CL actions through even when
 		// the task is in DESTROY state
@@ -306,8 +311,9 @@ worker_process_one_action(register struct worker *w, register struct task *t, re
 	}
 
 	if (action == FLG_CL) {
-		// task_do_close_cb() also shuts down any child listeners
-		task_do_close_cb(t);	// FLG_CL is always reset by task_do_close_cb
+		// Deferred close: link the pinned task onto this worker's close
+		// queue.  It will be torn down after the current batch completes.
+		(void)task_close_forward(t);
 		return;
 	}
 
@@ -412,8 +418,12 @@ worker_process_notifyq(register struct worker *w)
 				w->freeq = tq;
 			}
 
-			// If Task is not in the Active State, drop the action
-			if ((task_atomic_load(&t->state) != TASK_STATE_ACTIVE) && (action != FLG_CL)) {
+			// Flush legacy close notifications into the allocation-free
+			// deferred close queue.  Everything else follows the normal
+			// action path.
+			if (action == FLG_CL) {
+				(void)task_close_forward(t);
+			} else if (task_atomic_load(&t->state) != TASK_STATE_ACTIVE) {
 				task_action_done(t, action);
 			} else {
 				worker_process_one_action(w, t, action);
@@ -492,7 +502,11 @@ get_next_epoll_timeout_ms(struct worker *w)
 
 	worker_check_timeouts(w);	// Updates the worker time for us
 
-	// If we have tasks in the notifyq's to process, don't wait in epoll()
+	// If we have tasks in the notifyq's or the deferred-close queue to
+	// process, don't wait in epoll()
+	if (task_atomic_load(&w->close_head) != TASK_CLOSE_EMPTY) {
+		return 0;
+	}
 	if (w->notifyq_head != NULL) {
 		return 0;
 	}
@@ -624,6 +638,7 @@ worker_loop_io(void *arg)
 			worker_poll_listeners(w);
 		}
 		worker_process_notifyq(w);
+		worker_process_closes(w);
 
 		// The instance worker is responsible for draining blocking-worker
 		// notifications and reaping idle blocking workers.  Do it every

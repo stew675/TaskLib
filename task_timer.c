@@ -585,16 +585,35 @@ TASK_timeout_set(int64_t tfd, int64_t us_from_now, void *timeout_cb_data,
 		void (*timeout_cb)(int64_t tfd, int64_t lateness_us, void *timeout_cb_data))
 {
 	register struct task *t = task_lookup(tfd, FLG_TS);
+	int64_t old_expiry;
+	void (*old_cb)(int64_t tfd, int64_t lateness_us, void *data);
+	void *old_cb_data;
+	uint32_t old_cancelled;
+	bool queued;
 
 	if (t == NULL) return -1;	// errno already set
 
+	old_expiry = task_atomic_load(&t->tm_tt.expiry_us);
+	old_cb = t->tm_cb;
+	old_cb_data = t->tm_cb_data;
+	old_cancelled = task_atomic_load(&t->tm_cancelled);
+
 	us_from_now = (us_from_now < 0) ? 0 : us_from_now;
 	us_from_now = (us_from_now > TASK_TIMEOUT_ONE_YEAR) ? TASK_TIMEOUT_ONE_YEAR : us_from_now;
-	__atomic_store_n(&t->tm_tt.expiry_us, get_time_us(TASK_TIME_PRECISE) + us_from_now, __ATOMIC_RELAXED);
+	task_atomic_store(&t->tm_tt.expiry_us, get_time_us(TASK_TIME_PRECISE) + us_from_now);
 	t->tm_cb = timeout_cb;
 	t->tm_cb_data = timeout_cb_data;
-	t->tm_cancelled = 0;
-	bool queued = task_notify_action(t, FLG_TM, false, true);
+	task_atomic_store(&t->tm_cancelled, 0);
+	queued = task_notify_action(t, FLG_TM, false, true);
+	if (!queued) {
+		// The notification could not be queued (allocation failure).  Put
+		// the previous timer state back rather than leaving a new expiry
+		// with no FLG_TM action to attach/replace it.
+		task_atomic_store(&t->tm_tt.expiry_us, old_expiry);
+		t->tm_cb = old_cb;
+		t->tm_cb_data = old_cb_data;
+		task_atomic_store(&t->tm_cancelled, old_cancelled);
+	}
 	task_unlock(t, FLG_TS);
 	if (!queued) {
 		errno = EOWNERDEAD;

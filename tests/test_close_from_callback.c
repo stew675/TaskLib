@@ -44,6 +44,9 @@ accept_cb(int64_t tfd, void *data)
 {
 	if (tfd >= 0) {
 		int64_t listener = (int64_t)(intptr_t)data;
+
+		/* Accepted tasks no longer inherit the listener's close callback. */
+		(void)TASK_socket_set_close_cb(tfd, NULL, close_cb);
 		(void)TASK_close(tfd);
 		(void)TASK_close(listener);
 	}

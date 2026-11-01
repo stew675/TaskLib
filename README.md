@@ -8,7 +8,9 @@ A high-performance, multi-threaded, event-driven IO library.
 
 TaskLib has no third-party dependencies. Its lock-free atomic primitives are
 implemented in `task_atomics.h` on top of the compiler's `__atomic` builtins,
-which are available in GCC 4.7+ and Clang 3.1+. A 64-bit C compiler, pthreads
+which are available in GCC 4.7+ and Clang 3.1+. The sources also use C11
+_Atomic/_Static_assert/aligned_alloc, so build with a C11-capable compiler. A
+64-bit C compiler, pthreads
 and a Linux/glibc userspace (epoll, eventfd, futex, `SO_INCOMING_CPU`) are
 required. Timer keys are absolute monotonic microsecond timestamps stored in
 `void *` keys by the paired heap, so 32-bit pointer builds are rejected at
@@ -126,7 +128,9 @@ callback will take the same lock.
 
 The connect callback receives `1` on success and `-1` on failure, with `errno`
 set. The accept callback receives a new `tfd` on success and `-1` if the library
-could not allocate a task for the connection.
+could not allocate a task for the connection. Accepted connections do not
+inherit the listener's `close_cb` or `accept_cb`; set a per-connection close
+callback from the accept callback if one is required.
 
 ### Timeouts
 
@@ -144,8 +148,11 @@ Timer and IO cancellation/destruction are requests, not barriers. A callback
 may already have been selected when the request is made. The task close
 callback (`close_cb`, or the instance `shutdown_cb` during shutdown) is the
 synchronisation point after which no further callback for that task may start.
-Do not free user context from `TASK_timeout_cancel()`/`TASK_timeout_destroy()`
-alone.
+Close waits for in-flight task APIs that already acquired the task and, for a
+listener, for every child listener to finish teardown before invoking
+`close_cb`. A call that is made after the handle is already closed/stale may
+report an error without an ordering relationship to `close_cb`. Do not free
+user context from `TASK_timeout_cancel()`/`TASK_timeout_destroy()` alone.
 
 ### Threading model
 
@@ -165,10 +172,12 @@ alone.
   lock is only used to reserve/publish/retire a slot, never while waiting for
   workers or API references.
 - `TASK_instance_wait()` and `TASK_instance_destroy()` called from a callback
-  running on that instance's own worker fail with `EDEADLK`. Other lifecycle
-  calls that find the instance already shutting down or being destroyed fail
-  with `EBADF`/`EOWNERDEAD` rather than waiting. Do not call lifecycle APIs from
-  callbacks unless the call is documented as non-blocking.
+  running on that instance's own worker fail with `EDEADLK`. This includes IO
+  workers, blocking workers (`work_func`), and callbacks invoked by
+  `TASK_instance_wait()`. Other lifecycle calls that find the instance already
+  shutting down or being destroyed fail with `EBADF`/`EOWNERDEAD` rather than
+  waiting. Do not call lifecycle APIs from callbacks unless the call is
+  documented as non-blocking.
 - Socket, timer, connect, read, write, and close callbacks run on the task's
   owning worker thread.  If an IO call is made from that worker's thread and
   can complete immediately it runs inline (still on the owning worker).  If an
@@ -178,7 +187,8 @@ alone.
 - The accept callback runs on the worker that accepted the connection. The new
   task is assigned to its selected worker at creation time, which may be a
   different worker from the one running the callback; it does not subsequently
-  migrate from the accepting worker.
+  migrate from the accepting worker. Accepted tasks do not inherit the
+  listener's close or accept callbacks.
 - The blocking work callback (`work_cb_func`) runs on the instance notification
   worker, or on a thread blocked in `TASK_instance_wait()`. It does not run on
   the blocking thread.
@@ -211,6 +221,7 @@ Lock order (do not create a reverse edge):
 
 ```text
 creation_lock (slot reservation/publish only; never across a wait)
+    -> instance->start_lock (created-worker publication/start only)
     -> instance->lock (worker state lists)
     -> tfd_lock (hash-sharded task lock)
     -> worker->lock (notification/close queues)
@@ -220,7 +231,9 @@ creation_lock (slot reservation/publish only; never across a wait)
 
 `tfd_lock` may be held while taking `worker->lock`. `worker->lock` is released
 before taking `tfd_lock` in drain paths. `listeners_lock` is never held while
-taking `tfd_lock` or `worker->lock`.
+taking `tfd_lock` or `worker->lock`. Nested TFD locks are not permitted; code
+that must close a child listener after failing to arm it queues that work only
+after dropping the parent TFD lock.
 
 ---
 
@@ -372,6 +385,7 @@ Creates a socket owned by the task library and returns its `tfd`, or `-1` with
 The socket is non-blocking. Send and receive buffer sizes are configured from
 the instance settings. `close_cb`, if supplied, is invoked when the task closes
 (unless the instance is shutting down or the task is a child listener).
+Connections accepted through a listener do not inherit this callback.
 
 ### `int64_t TASK_socket_register(int32_t ti, int sock, void *close_cb_data, void (*close_cb)(int64_t tfd, void *close_cb_data))`
 
@@ -397,14 +411,22 @@ Returns `0`, or `-1` with `errno` set.
 
 Marks the task as a listener and starts accepting connections. When the instance
 has more than one IO worker, additional listener sockets are created so
-acceptance is distributed across workers.
+acceptance is distributed across workers.  Listener arming is done from the
+calling thread but the software epoll state is published before the kernel
+registration, so an owning worker cannot drop the initial one-shot accept
+event.
 
-The socket must already be bound; this is not checked by the library, and an
-unbound TCP socket may be auto-bound by the kernel. If `accept_cb` is NULL,
-accepted connections are immediately closed.
+If the socket is not already bound, `listen()` auto-binds it; the assigned
+local address is read afterwards and propagated to all child listeners. If
+`accept_cb` is NULL, accepted connections are immediately closed.
 
 Returns `0`, or `-1` with `errno` set. `EINPROGRESS` means a migration for the
 task is still in flight; retry after it completes.
+
+Child listener clones bind to the address assigned to the parent. For an
+unbound socket this address is read after `listen()` has auto-bound the port,
+so all clones share the same port. The listener's `close_cb` is deferred until
+all child listeners have closed.
 
 ### `void TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64_t expires_in_us, void *connect_cb_data, void (*connect_cb)(int64_t tfd, int result, void *connect_cb_data))`
 
@@ -429,7 +451,9 @@ Requests an asynchronous close for the task. The close callback, if registered,
 runs once before the task slot is recycled. Pending IO callbacks are cancelled.
 Timers are cancelled and destroyed. `TASK_close()` does not wait for teardown,
 and a callback may already be in flight when it returns; `close_cb` is the
-barrier after which no further callback for the task may start.
+barrier after which no further callback for the task may start. Close defers
+the callback until APIs that acquired the task have finished and, for a
+listener, until all child listeners have closed.
 
 For a task created with `TASK_socket_register()`, the descriptor is removed from
 epoll but not closed. For a timeout-only task, the task is freed after close

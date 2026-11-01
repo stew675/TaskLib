@@ -636,6 +636,7 @@ worker_loop_io(void *arg)
 	struct worker *w = (struct worker *)arg;
 
 	__thr_current_worker = w;
+	__thr_current_instance = w->instance;
 	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 
 	while((worker_state_t)task_atomic_load(&w->state) == WORKER_STATE_RUNNING) {
@@ -671,6 +672,7 @@ worker_loop_blocking(void *arg)
 	struct worker *w = (struct worker *)arg;
 
 	__thr_current_worker = NULL;
+	__thr_current_instance = w->instance;
 	w__curtime_us = get_time_us(TASK_TIME_PRECISE);
 
 	while ((task_atomic_load(&w->state) == WORKER_STATE_IDLE) ||

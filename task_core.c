@@ -2,6 +2,7 @@
 
 // Per-library global state
 __thread struct worker	*__thr_current_worker = NULL;
+__thread struct instance	*__thr_current_instance = NULL;
 __thread int64_t		w__curtime_us = 0;
 
 struct instance		*instances[TASK_MAX_INSTANCES];
@@ -190,7 +191,7 @@ task_dump(struct task *t)
 		fprintf(stderr, "CONNECT, State = ");
 		break;
 	case	TASK_TYPE_LISTEN:
-		if (t->listen_child) {
+		if (task_atomic_load(&t->listen_child) & TASK_LISTEN_CHILD) {
 			fprintf(stderr, "LISTEN_CHILD, State = ");
 		} else {
 			fprintf(stderr, "LISTEN_PARENT, State = ");
@@ -459,7 +460,7 @@ task_maybe_free(struct task *t)
 	    (task_atomic_load(&t->notifyqlen) != 0) ||
 	    (task_atomic_load(&t->notifyqlen_locked) != 0) ||
 	    (task_atomic_load(&t->api_refs) != 0) ||
-	    (task_atomic_load(&t->closed) == 0) ||
+	    ((task_atomic_load(&t->closed) & TASK_CLOSED_DONE) == 0) ||
 	    (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) ||
 	    (task_atomic_load(&t->wr_state) != TASK_WRITE_STATE_IDLE)) {
 		itfd_unlock(i, tfdi);
@@ -689,6 +690,7 @@ task_unlock(struct task *t, register task_action_flag_t action)
 		itfd_unlock(i, tfdi);
 	}
 	if ((refs == 0) && (task_atomic_load(&t->state) == TASK_STATE_DESTROY)) {
+		task_close_refs_drained(t);
 		task_maybe_free(t);
 	}
 
@@ -702,16 +704,16 @@ task_unlock(struct task *t, register task_action_flag_t action)
 
 
 bool
-task_claim_listen_child(struct instance *i, struct task *c, int64_t parent_tfd)
+task_claim_listen_child(struct instance *i, struct task *c, struct task *parent)
 {
 	uint32_t tfdi = TFD_TO_INDEX(task_atomic_load(&c->tfd));
 
 	itfd_lock(i, tfdi);
 	if ((task_atomic_load(&c->worker) == NULL) ||
 	    (task_atomic_load(&c->type) != TASK_TYPE_LISTEN) ||
-	    (c->listen_child == 0) ||
+	    ((task_atomic_load(&c->listen_child) & TASK_LISTEN_CHILD) == 0) ||
 	    (task_atomic_load(&c->state) != TASK_STATE_ACTIVE) ||
-	    (c->stride->parent_tfd != parent_tfd)) {
+	    ((struct task *)task_atomic_load(&c->stride->parent) != parent)) {
 		itfd_unlock(i, tfdi);
 		return false;
 	}
@@ -1328,6 +1330,220 @@ task_close_link(struct worker *w, struct task *t, uint32_t tfdi)
 } // task_close_link
 
 
+// Requeue a task whose close teardown is complete but whose close callback is
+// still waiting for API references or listener children.  Safe to call from
+// any thread: the link is only made while the target worker is still able to
+// drain its close queue.  During shutdown the task is left pinned for the
+// final nuke pass.
+bool
+task_close_requeue(struct task *t)
+{
+	struct worker *w = task_atomic_load(&t->worker);
+	struct instance *i;
+	uint32_t tfdi;
+	bool linked = false;
+
+	if ((t == NULL) || (w == NULL)) {
+		return false;
+	}
+	i = w->instance;
+	if (i == NULL) {
+		return false;
+	}
+	tfdi = TFD_TO_INDEX(task_atomic_load(&t->tfd));
+	if (tfdi >= i->tfd_pool_size) {
+		return false;
+	}
+
+	worker_lock(w);
+	if ((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) &&
+	    ((instance_state_t)task_atomic_load(&i->state) <= INSTANCE_STATE_RUNNING) &&
+	    ((worker_state_t)task_atomic_load(&w->state) <= WORKER_STATE_RUNNING)) {
+		task_atomic_store(&t->free_next, task_atomic_load(&w->close_head));
+		task_atomic_store(&w->close_head, tfdi);
+		linked = true;
+	}
+	worker_unlock(w);
+
+	if (linked && !lockless_worker(w)) {
+		worker_notify(w);
+	}
+	return linked;
+} // task_close_requeue
+
+
+// True when close teardown has run, no API reference is in flight, and every
+// listener child (if this is a parent listener) has closed.  Caller holds the
+// TFD lock.
+static bool
+task_close_ready_locked(struct task *t)
+{
+	if ((task_atomic_load(&t->state) != TASK_STATE_DESTROY) ||
+	    ((task_atomic_load(&t->closed) & TASK_CLOSED_DONE) == 0) ||
+	    (task_atomic_load(&t->api_refs) != 0)) {
+		return false;
+	}
+
+	if ((task_atomic_load(&t->type) == TASK_TYPE_LISTEN) &&
+	    ((task_atomic_load(&t->listen_child) & TASK_LISTEN_CHILD) == 0) &&
+	    (task_atomic_load(&t->migrations) != 0)) {
+		return false;
+	}
+
+	return true;
+} // task_close_ready_locked
+
+
+// Ask the owning worker to attempt final close completion.  Any thread.
+void
+task_close_schedule(struct task *t)
+{
+	struct worker *w;
+	uint32_t tfdi;
+	bool schedule = false;
+
+	if (t == NULL) {
+		return;
+	}
+	w = task_atomic_load(&t->worker);
+	if ((w == NULL) || (w->instance == NULL)) {
+		return;
+	}
+	tfdi = TFD_TO_INDEX(task_atomic_load(&t->tfd));
+	itfd_lock(w->instance, tfdi);
+	if ((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) &&
+	    ((task_atomic_load(&t->closed) & TASK_CLOSED_DONE) != 0) &&
+	    ((task_atomic_load(&t->closed) & TASK_CLOSED_SCHEDULED) == 0)) {
+		task_atomic_or(&t->closed, TASK_CLOSED_SCHEDULED);
+		schedule = true;
+	}
+	itfd_unlock(w->instance, tfdi);
+
+	if (schedule) {
+		(void)task_close_requeue(t);
+	}
+} // task_close_schedule
+
+
+// Called when the last API reference is dropped.  May run on any thread.
+void
+task_close_refs_drained(struct task *t)
+{
+	if ((task_atomic_load(&t->state) == TASK_STATE_DESTROY) &&
+	    ((task_atomic_load(&t->closed) & TASK_CLOSED_DONE) != 0)) {
+		task_close_schedule(t);
+	}
+} // task_close_refs_drained
+
+
+// Capture a ready close callback and clear its pending state.  Caller holds
+// the TFD lock.
+static bool
+task_close_take_ready_locked(struct task *t, void (**cb)(int64_t, void *), void **cb_data)
+{
+	if (!task_close_ready_locked(t)) {
+		return false;
+	}
+	*cb = task_atomic_load(&t->stride->close_cb);
+	*cb_data = task_atomic_load(&t->stride->close_cb_data);
+	task_atomic_store(&t->stride->close_cb, NULL);
+	task_atomic_store(&t->stride->close_cb_data, NULL);
+	task_atomic_and(&t->closed, ~(TASK_CLOSED_CB_PENDING | TASK_CLOSED_SCHEDULED));
+	return true;
+}
+
+
+// Complete close processing on the owning worker.  Invokes the user close
+// callback (if any) only after every in-flight API reference and every child
+// listener has gone away, then drops the FLG_CL pin.  If completion is not yet
+// possible the task is requeued so the last reference/child can trigger it.
+void
+task_close_finish_or_schedule(struct task *t)
+{
+	void (*cb)(int64_t tfd, void *close_cb_data) = NULL;
+	void *cb_data = NULL;
+	int64_t tfd;
+	uint32_t tfdi;
+	bool ready = false, schedule = false;
+
+	if (t == NULL) {
+		return;
+	}
+	tfd = task_atomic_load(&t->tfd);
+	tfdi = TFD_TO_INDEX(tfd);
+
+	tfd_lock(t, tfdi);
+	if ((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) == 0) {
+		tfd_unlock(t, tfdi);
+		return;
+	}
+
+	ready = task_close_take_ready_locked(t, &cb, &cb_data);
+	if (!ready && ((task_atomic_load(&t->closed) & TASK_CLOSED_SCHEDULED) == 0)) {
+		task_atomic_or(&t->closed, TASK_CLOSED_SCHEDULED);
+		schedule = true;
+	}
+	tfd_unlock(t, tfdi);
+
+	if (ready) {
+		if ((cb != NULL) &&
+		    ((instance_state_t)task_atomic_load(&t->worker->instance->state) !=
+		     INSTANCE_STATE_SHUTTING_DOWN)) {
+			errno = 0;
+			cb(tfd, cb_data);
+		}
+		task_action_done(t, FLG_CL);
+		return;
+	}
+
+	if (schedule) {
+		(void)task_close_requeue(t);
+	}
+} // task_close_finish_or_schedule
+
+
+// A close-queue completion attempt for an already torn-down task.  If it is
+// not ready, clear the scheduled flag so a later API-reference drain or child
+// completion can schedule another attempt.
+void
+task_close_completion_attempt(struct task *t)
+{
+	void (*cb)(int64_t tfd, void *close_cb_data) = NULL;
+	void *cb_data = NULL;
+	int64_t tfd;
+	uint32_t tfdi;
+	bool ready;
+
+	if (t == NULL) {
+		return;
+	}
+	tfd = task_atomic_load(&t->tfd);
+	tfdi = TFD_TO_INDEX(tfd);
+
+	tfd_lock(t, tfdi);
+	if ((task_atomic_load(&t->active_flags) & (uint32_t)FLG_CL) == 0) {
+		tfd_unlock(t, tfdi);
+		return;
+	}
+
+	ready = task_close_take_ready_locked(t, &cb, &cb_data);
+	if (!ready) {
+		task_atomic_and(&t->closed, ~TASK_CLOSED_SCHEDULED);
+	}
+	tfd_unlock(t, tfdi);
+
+	if (ready) {
+		if ((cb != NULL) &&
+		    ((instance_state_t)task_atomic_load(&t->worker->instance->state) !=
+		     INSTANCE_STATE_SHUTTING_DOWN)) {
+			errno = 0;
+			cb(tfd, cb_data);
+		}
+		task_action_done(t, FLG_CL);
+	}
+} // task_close_completion_attempt
+
+
 // Common close transition.  The caller holds the task's TFD lock.
 bool
 task_defer_close_locked(struct task *t, uint32_t tfdi)
@@ -1358,7 +1574,7 @@ task_defer_close_locked(struct task *t, uint32_t tfdi)
 	task_atomic_store(&t->tm_tt.expiry_us, (int64_t)TIMER_TIME_CANCEL);
 	t->tm_cancelled = 1;
 
-	if (task_atomic_load(&t->closed) != 0) {
+	if (task_atomic_load(&t->closed) & TASK_CLOSED_DONE) {
 		return false;
 	}
 
@@ -2373,6 +2589,7 @@ instance_destroy(struct instance *i)
 		i->evfd = -1;
 	}
 	pthread_mutex_destroy(&i->listeners_lock);
+	pthread_mutex_destroy(&i->start_lock);
 	pthread_mutex_destroy(&i->lock);
 	pthread_mutex_destroy(&i->cpulock);
 	if (i->io_workers) {
@@ -2388,8 +2605,10 @@ instance_destroy(struct instance *i)
 		i->tfd_stride = NULL;
 	}
 #ifndef USE_TICKET_LOCKS
-	for (uint32_t n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
-		pthread_mutex_destroy(&(i->tfd_locks[n].lock));
+	if (i->tfd_locks_real) {
+		for (uint32_t n = 0; n < TASK_MAX_TFD_LOCKS + 1; n++) {
+			pthread_mutex_destroy(&(i->tfd_locks[n].lock));
+		}
 	}
 #endif
 	if (i->tfd_locks_real) {
@@ -2606,6 +2825,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	pthread_mutex_init(&i->lock, &attr);
 	pthread_mutex_init(&i->listeners_lock, &attr);
 	pthread_mutex_init(&i->cpulock, &attr);
+	pthread_mutex_init(&i->start_lock, &attr);
 
 	TAILQ_INIT(&i->workers_created);
 	TAILQ_INIT(&i->workers_running);
@@ -2693,6 +2913,7 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	struct worker *w;
 	int do_start = 0;
 	int result = -1;
+	int start_locked = 0;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
@@ -2737,6 +2958,11 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 
 	// We need to hold onto the instance lock while checking, so we cheat
 	// a bit with worker states here, instead of using worker_set_state()
+	//
+	// start_lock keeps a concurrent TASK_instance_start() from missing a new
+	// created worker (and therefore never starting the queued work).
+	pthread_mutex_lock(&i->start_lock);
+	start_locked = 1;
 	instance_lock(i);
 
 	task_atomic_store(&i->curtime_us, get_time_us(TASK_TIME_PRECISE));
@@ -2829,6 +3055,9 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	result = 0;
 
 out:
+	if (start_locked) {
+		pthread_mutex_unlock(&i->start_lock);
+	}
 	task_instance_unref((uint32_t)ti);
 	return result;
 } // TASK_do_blocking_work
@@ -2878,6 +3107,11 @@ TASK_instance_destroy(int32_t ti)
 	// worker that is currently executing this call.
 	if ((__thr_current_worker != NULL) && (__thr_current_worker->instance != NULL) &&
 	    (__thr_current_worker->instance->ti == ti)) {
+		errno = EDEADLK;
+		return -1;
+	}
+
+	if ((__thr_current_instance != NULL) && (__thr_current_instance->ti == ti)) {
 		errno = EDEADLK;
 		return -1;
 	}
@@ -2966,6 +3200,10 @@ TASK_instance_wait(int32_t ti)
 		errno = EDEADLK;
 		return -1;
 	}
+	if ((__thr_current_instance != NULL) && (__thr_current_instance->ti == ti)) {
+		errno = EDEADLK;
+		return -1;
+	}
 
 	i = __atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
@@ -2980,6 +3218,9 @@ TASK_instance_wait(int32_t ti)
 	    INSTANCE_STATE_CREATED) {
 		return 0;
 	}
+
+	struct instance *saved_instance = __thr_current_instance;
+	__thr_current_instance = i;
 
 	for (;;) {
 		worker_handle_instance(i);
@@ -3034,6 +3275,7 @@ TASK_instance_wait(int32_t ti)
 		shutdown_cb(ti, shutdown_data);
 	}
 
+	__thr_current_instance = saved_instance;
 	return 0;
 } // TASK_instance_wait
 
@@ -3114,12 +3356,22 @@ TASK_instance_start(int32_t ti)
 		return -1;
 	}
 
+	// Serialise created-worker publication with TASK_do_blocking_work().
+	// Without this, a blocking worker inserted just after the loop below
+	// could be left CREATED forever and its queued work would never run.
+	pthread_mutex_lock(&i->start_lock);
+	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+		pthread_mutex_unlock(&i->start_lock);
+		errno = EOWNERDEAD;
+		return -1;
+	}
 
 	// Start all workers waiting to start.  A failed pthread_create() used
 	// to be silently ignored, leaving a partially running instance.  Report
 	// it; TASK_instance_destroy() can still stop and reap whatever started.
 	while ((w = TAILQ_FIRST(&i->workers_created))) {
 		if (worker_start(w) < 0) {
+			pthread_mutex_unlock(&i->start_lock);
 			errno = ECHILD;
 			return -1;
 		}
@@ -3129,12 +3381,14 @@ TASK_instance_start(int32_t ti)
 	instance_lock(i);
 	if (instance_assign_worker(i) < 0) {
 		instance_unlock(i);
+		pthread_mutex_unlock(&i->start_lock);
 		errno = ECHILD;
 		return -1;
 	}
 	w = (struct worker *)task_atomic_load(&i->instance_worker);
 	task_atomic_store(&i->state, INSTANCE_STATE_RUNNING);
 	instance_unlock(i);
+	pthread_mutex_unlock(&i->start_lock);
 
 	// Wake the newly assigned instance worker.  Notifications that arrived
 	// before it was assigned only wrote i->evfd, which no worker monitors.

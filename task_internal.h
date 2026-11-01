@@ -60,7 +60,9 @@
 // than the adaptive pthread mutexes, but performance is terrible if the worker threads ever get
 // context switched by the Linux scheduler. It is slightly easier however to gather profiling
 // statistics about the time spent in TFD locks with gprof using ticketlocks
+#ifndef TASK_NO_TICKET_LOCKS
 #define USE_TICKET_LOCKS
+#endif
 
 #ifdef USE_TICKET_LOCKS
 typedef struct {
@@ -131,6 +133,17 @@ enum {
 	TIMER_TIME_CANCEL = -1
 };
 
+/* listen_child state bits */
+#define TASK_LISTEN_CHILD		0x00000001u	// This task is a per-worker listener clone
+
+/* closed state bits.  TASK_CLOSED_DONE means the fd/timer/callback teardown
+ * has run.  FLG_CL is retained until the close callback (if any) and any
+ * listener children have completed, so close_cb is the last callback for the
+ * task and its listener tree. */
+#define TASK_CLOSED_DONE		0x00000001u
+#define TASK_CLOSED_CB_PENDING		0x00000002u
+#define TASK_CLOSED_SCHEDULED		0x00000004u
+
 // The below are activity reference bits. The system works a bit like reference counting
 // except there's a limit to the number of references, and each reference is exclusive.
 // Doing it this way, protected by mutexes, is WAY faster than using atomic counters plus
@@ -199,7 +212,7 @@ __attribute__ ((aligned(64))) void	*accept_cb_data;
 	void				*close_cb_data;		//  User data to pass to the close callback
 	void				(*close_cb)(int64_t tfd, void *close_cb_data);
 	struct worker			*preferred_worker;	// To initiate task io worker migration
-	int64_t				parent_tfd;		// Parent listener TFD for child listeners
+	_Atomic(struct task *)		parent;			// Parent listener for child listeners
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 } __attribute__ ((aligned(64)));
@@ -269,7 +282,7 @@ __attribute__ ((aligned(64))) struct task_timer rd_tt;		// 32 bytes - RD Timeout
 	size_t				rdv_buflen;
 	size_t				rdv_bufpos;
 	int32_t				rdv_iovcnt;
-	uint32_t			migrations;		// Number of times the task has migrated
+	uint32_t			migrations;		// Migration count, or live child count for a listener parent
 
 	//===================================  64 BYTE BOUNDARY    =====================================//
 
@@ -314,7 +327,7 @@ __attribute__ ((aligned(64))) struct task_timer tm_tt;		// 32 bytes - Timer Info
 	_Atomic uint32_t		tm_cancelled;
 	uint32_t		in_epoll;
 	uint32_t		registered_fd;
-	uint32_t		listen_child;
+	_Atomic uint32_t	listen_child;
 	_Atomic uint32_t		closed;			// Final close cleanup has run
 	_Atomic uint32_t		free_next;		// Next slot index on the lock-free free list
 
@@ -416,7 +429,7 @@ _Static_assert(sizeof(void *) >= 8, "TaskLib requires 64-bit pointers for timer 
 _Static_assert(_Alignof(struct task_stride) == 64, "struct task_stride alignment");
 _Static_assert(sizeof(struct task_stride) == 192, "struct task_stride must be 3 cache lines");
 _Static_assert(offsetof(struct task_stride, accept_cb_data) == 128, "task_stride callback group must start on line 2");
-_Static_assert(offsetof(struct task_stride, parent_tfd) + sizeof(int64_t) <= sizeof(struct task_stride), "task_stride callback group crosses line 2");
+_Static_assert(offsetof(struct task_stride, parent) + sizeof(struct task *) <= sizeof(struct task_stride), "task_stride callback group crosses line 2");
 
 _Static_assert(_Alignof(struct worker) == 64, "struct worker alignment");
 _Static_assert(sizeof(struct worker) % 64 == 0, "struct worker must be cache-line sized");
@@ -465,6 +478,7 @@ struct instance {
 	instance_state_t		state;
 	pthread_t			thr;
 	pthread_mutex_t			lock;
+	pthread_mutex_t			start_lock;	// Serialises created-worker start/publish
 	int				evfd;
 	int32_t				ti;
 
@@ -527,6 +541,7 @@ struct instance {
 
 // The current IO worker.  MUST BE NULL if current thread is not an IO worker
 extern __thread struct worker	*__thr_current_worker;
+extern __thread struct instance	*__thr_current_instance;
 extern __thread	int64_t		w__curtime_us;
 
 extern struct instance		*instances[TASK_MAX_INSTANCES];
@@ -596,11 +611,16 @@ void task_remove_list(struct task **head, struct task *t);
 void task_init(struct instance *i, struct task *t);
 void task_free(struct instance *i, struct task *t, bool published);
 void task_maybe_free(struct task *t);
+void task_close_refs_drained(struct task *t);
+void task_close_schedule(struct task *t);
+void task_close_finish_or_schedule(struct task *t);
+void task_close_completion_attempt(struct task *t);
+bool task_close_requeue(struct task *t);
 void task_action_done(struct task *t, task_action_flag_t action);
 bool task_action_is_meta(task_action_flag_t action);
 struct task * task_lookup(int64_t tfd, task_action_flag_t action);
 void task_unlock(struct task *t, task_action_flag_t action);
-bool task_claim_listen_child(struct instance *i, struct task *c, int64_t parent_tfd);
+bool task_claim_listen_child(struct instance *i, struct task *c, struct task *parent);
 void task_nuke(struct instance *i, uint32_t tfdi);
 struct task * task_get_free_task(struct instance *i);
 int get_cpu_of_sock(struct instance *i, int sock);
@@ -634,7 +654,7 @@ void task_cancel_read(struct task *t);
 void task_do_close_cb(struct task *t);
 void task_do_readv_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno);
 void task_do_read_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno);
-void task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno);
+void task_do_accept_cb(struct task *t, int64_t tfd, int cb_errno, void *cb_data, void (*cb)(int64_t tfd, void *cb_data));
 void task_do_writev_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno);
 void task_do_write_cb(struct task *t, int64_t tfd, ssize_t result, int cb_errno);
 void task_do_connect_cb(struct task *t, int64_t tfd, int result, int cb_errno);
@@ -673,7 +693,11 @@ void * worker_loop_io(void *arg);
 void * worker_loop_blocking(void *arg);
 int worker_start(struct worker *w);
 struct worker * worker_create(struct instance *i, int worker_type);
-void instance_listen_balance(struct task *t);
+void instance_listen_balance(struct task *parent, struct task **failed,
+			     const struct sockaddr_storage *addr, socklen_t addrlen,
+			     void *accept_cb_data,
+			     void (*accept_cb)(int64_t tfd, void *accept_cb_data),
+			     uint32_t reservations);
 void instance_reap_workers(struct instance *i);
 void instance_queue_shutdown(struct instance *i);
 void instance_nuke_tasks(struct instance *i);
@@ -735,6 +759,7 @@ static inline void
 task_unref(struct task *t)
 {
 	if (__atomic_sub_fetch(&t->api_refs, 1, __ATOMIC_SEQ_CST) == 0) {
+		task_close_refs_drained(t);
 		task_maybe_free(t);
 	}
 } // task_unref

@@ -2091,7 +2091,7 @@ worker_create(struct instance *i, int worker_type)
 		} else {
 			// Register worker notification event fd against the worker epoll fd
 			// Do not use EPOLLET here since we don't do selective re-arming
-			struct epoll_event ev = {.data.ptr = NULL, .events = EPOLLIN };
+			struct epoll_event ev = {.data.u64 = TASK_EPOLL_EVENTFD, .events = EPOLLIN };
 
 			if (epoll_ctl(w->gepfd, EPOLL_CTL_ADD, w->evfd, &ev) < 0) {
 				// epoll_ctl will set errno

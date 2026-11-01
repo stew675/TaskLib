@@ -567,6 +567,10 @@ extern pthread_mutex_t	creation_lock;
 // Sentinel for the per-worker deferred-close list head.
 #define TASK_CLOSE_EMPTY	(0xffffffffu)
 
+// Epoll cookie used for the worker's own eventfd.  A valid TFD never has bit
+// 63 set, so UINT64_MAX is unambiguous.
+#define TASK_EPOLL_EVENTFD	((uint64_t)TFD_NONE)
+
 // A reserved instance slot.  instance_create()/destroy() publish this while
 // they own the slot but are not holding creation_lock.  APIs treat it as
 // "instance is being created/destroyed" and must not touch the pointer.
@@ -666,6 +670,7 @@ void worker_process_notifyq(struct worker *w);
 void worker_poll_listeners(struct worker *w);
 int get_next_epoll_timeout_ms(struct worker *w);
 void worker_handle_task_event(struct task *t, uint32_t revents);
+struct task * worker_event_task(struct instance *i, uint64_t cookie);
 void * worker_loop_io(void *arg);
 void * worker_loop_blocking(void *arg);
 int worker_start(struct worker *w);

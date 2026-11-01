@@ -197,7 +197,7 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	// epoll set while t->worker points at the new worker.
 	if (task_atomic_load(&t->fd) >= 0) {
 		int was_in_epoll = task_atomic_load(&t->in_epoll);
-		struct epoll_event ev = { .data.ptr = t, .events = t->events };
+		struct epoll_event ev = { .data.u64 = (uint64_t)task_atomic_load(&t->tfd), .events = t->events };
 
 		if (was_in_epoll) {
 			epoll_ctl(t->epfd, EPOLL_CTL_DEL, task_atomic_load(&t->fd), NULL);
@@ -464,29 +464,35 @@ worker_poll_listeners(register struct worker *w)
 	register struct task *t;
 	register int numfds;
 
-	// Take a snapshot of the listener list.  A listener callback may close
-	// (and therefore remove) itself, so the list must not be walked while
-	// callbacks run.
+	// Take a snapshot of the listener list and pin every entry.  A listener
+	// callback may close (and therefore remove/recycle) itself, so the list
+	// must not be walked while callbacks run and the snapshot must keep each
+	// task alive until its callback returns.
 	pthread_mutex_lock(&i->listeners_lock);
 	for (numfds = 0, t = w->listeners; (numfds < w->max_pollfds) && (t != NULL); numfds++, t = t->task_next) {
 		w->poll_tasks[numfds] = t;
+		task_ref(t);
 	}
 	pthread_mutex_unlock(&i->listeners_lock);
 
 	for (int n = 0; n < numfds; n++) {
-		w->pollfds[n].fd = w->poll_tasks[n]->fd;
+		w->pollfds[n].fd = task_atomic_load(&w->poll_tasks[n]->fd);
 		w->pollfds[n].events = POLLIN;
 		w->pollfds[n].revents = 0;
 	}
 
 	if (poll(w->pollfds, numfds, 0) <= 0) {
+		for (int n = 0; n < numfds; n++) {
+			task_unref(w->poll_tasks[n]);
+		}
 		return;
 	}
 
 	for (int n = 0; n < numfds; n++) {
 		if (w->pollfds[n].revents & POLLIN) {
-			task_handle_listen_event(w->poll_tasks[n]);	// Unlocks the task for us
+			task_handle_listen_event(w->poll_tasks[n]);
 		}
+		task_unref(w->poll_tasks[n]);
 	}
 } // worker_poll_listeners
 
@@ -768,26 +774,55 @@ worker_do_io_epoll(register struct worker *w)
 		}
 	}
 
-	// Scan through the list of all the events we've received
+	// Scan through the list of all the events we've received.  Epoll events
+	// carry a generation-tagged TFD cookie, never a raw task pointer, so a
+	// stale event for a recycled slot is rejected rather than delivered to the
+	// new occupant.
 	for (int n = 0; n < nfds; n++) {
-		register struct task *t = (struct task *)w->events[n].data.ptr;
-		register uint32_t revents = w->events[n].events;
+		uint64_t cookie = w->events[n].data.u64;
+		uint32_t revents = w->events[n].events;
+		struct task *t;
 
-		// Handle non-IO items first
-		if (t == NULL) {
+		if (cookie == TASK_EPOLL_EVENTFD) {
 			worker_handle_event(w, revents);
 			continue;
 		}
 
-		// Hold a reference for the duration of the event handling.  A
-		// callback (or a listener accept failure) is allowed to close the
-		// task, and this keeps the slot from being recycled until we are
-		// done with it.
-		task_ref(t);
-		if (((task_atomic_load(&t->state) == TASK_STATE_ACTIVE) && task_atomic_load(&t->in_epoll))) {
+		t = worker_event_task((struct instance *)w->instance, cookie);
+		if (t == NULL) {
+			continue;	// stale cookie for a recycled slot
+		}
+		if ((task_atomic_load(&t->state) == TASK_STATE_ACTIVE) &&
+		    task_atomic_load(&t->in_epoll)) {
 			worker_handle_task_event(t, revents);
 		}
 		task_unref(t);
 	}
 } // worker_do_epoll
+
+
+// Resolve an epoll cookie to a pinned task.  The reference is taken before the
+// generation validation so task_init()'s preserved api_refs always has a
+// matching unref, exactly like task_lookup()'s lock-free path.
+struct task *
+worker_event_task(struct instance *i, uint64_t cookie)
+{
+	uint32_t tfdi;
+	struct task *t;
+
+	if ((i == NULL) || (cookie == TASK_EPOLL_EVENTFD)) {
+		return NULL;
+	}
+	tfdi = TFD_TO_INDEX((int64_t)cookie);
+	if (tfdi >= i->tfd_pool_size) {
+		return NULL;
+	}
+	t = i->tfd_pool + tfdi;
+	task_ref(t);
+	if (task_atomic_load(&t->tfd) != (int64_t)cookie) {
+		task_unref(t);
+		return NULL;
+	}
+	return t;
+} // worker_event_task
 

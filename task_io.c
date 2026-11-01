@@ -8,9 +8,9 @@ task_create_event_flag(struct task *t, uint32_t flags)
 {
 	int res;
 #ifdef USE_EPOLLONESHOT
-	struct epoll_event ev = { .data.ptr = t, .events = (EPOLLONESHOT | EPOLLRDHUP | flags) };
+	struct epoll_event ev = { .data.u64 = (uint64_t)task_atomic_load(&t->tfd), .events = (EPOLLONESHOT | EPOLLRDHUP | flags) };
 #else
-	struct epoll_event ev = { .data.ptr = t, .events = (EPOLLRDHUP | flags) };
+	struct epoll_event ev = { .data.u64 = (uint64_t)task_atomic_load(&t->tfd), .events = (EPOLLRDHUP | flags) };
 #endif
 
 	if ((res = epoll_ctl(t->epfd, EPOLL_CTL_ADD, t->fd, &ev)) < 0) {
@@ -45,7 +45,7 @@ task_raise_event_flag(register struct task *t, register uint32_t flags)
 {
 	if (task_atomic_load(&t->in_epoll)) {
 		register uint32_t events = task_atomic_load(&t->events) | flags;
-		struct epoll_event ev = { .data.ptr = t, .events = events };
+		struct epoll_event ev = { .data.u64 = (uint64_t)task_atomic_load(&t->tfd), .events = events };
 		int res;
 
 		if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {
@@ -75,7 +75,7 @@ task_lower_event_flag(register struct task *t, register uint32_t flags)
 			return 0;
 		}
 #endif
-		{	struct epoll_event ev = {.data.ptr = t, .events = events };
+		{	struct epoll_event ev = {.data.u64 = (uint64_t)task_atomic_load(&t->tfd), .events = events };
 			register int res;
 
 			if ((res = epoll_ctl(t->epfd, EPOLL_CTL_MOD, t->fd, &ev)) == 0) {

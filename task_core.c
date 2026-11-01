@@ -2398,12 +2398,6 @@ instance_destroy(struct instance *i)
 	memset(i, 0, sizeof(struct instance));
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
-	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-		if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == i) {
-			__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
-			break;
-		}
-	}
 	free(i);
 } // instance_destroy
 
@@ -2556,16 +2550,22 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
 
-	// Find an unused instance
+	// Reserve an empty slot under the global lock, then construct the
+	// instance without holding it.  The BUSY sentinel makes the slot
+	// unavailable to another creator and unhittable by API callers.
+	pthread_mutex_lock(&creation_lock);
 	for (ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-		if (instances[ti]) {
-			continue;
+		if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == NULL) {
+			__atomic_store_n(&instances[ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
+			break;
 		}
-		break;
 	}
+	pthread_mutex_unlock(&creation_lock);
 
 	if (ti >= TASK_MAX_INSTANCES) {
-		goto instance_creation_fail;
+		errno = ENOSPC;
+		pthread_mutexattr_destroy(&attr);
+		return NULL;
 	}
 
 	size_t sz;
@@ -2643,14 +2643,23 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
+	pthread_mutex_lock(&creation_lock);
 	__atomic_store_n(&instances[ti], i, __ATOMIC_SEQ_CST);
 	__atomic_store_n(&task_api_slot_open[ti], 1, __ATOMIC_SEQ_CST);
+	pthread_mutex_unlock(&creation_lock);
 	pthread_mutexattr_destroy(&attr);
 
 	return i;
 
 instance_creation_fail:
-	instance_destroy(i);
+	if (i) {
+		instance_destroy(i);
+	}
+	pthread_mutex_lock(&creation_lock);
+	if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == INSTANCE_SLOT_BUSY) {
+		__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
+	}
+	pthread_mutex_unlock(&creation_lock);
 	pthread_mutexattr_destroy(&attr);
 	return NULL;
 } // instance_create
@@ -2843,13 +2852,23 @@ int
 TASK_instance_destroy(int32_t ti)
 {
 	struct instance *i;
+	void (*shutdown_cb)(intptr_t ti, void *data);
+	void *shutdown_data;
 
-	pthread_mutex_lock(&creation_lock);
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
-		pthread_mutex_unlock(&creation_lock);
 		return -1;
 	}
+
+	// Destroying the instance from one of its own workers would wait for the
+	// worker that is currently executing this call.
+	if ((__thr_current_worker != NULL) && (__thr_current_worker->instance != NULL) &&
+	    (__thr_current_worker->instance->ti == ti)) {
+		errno = EDEADLK;
+		return -1;
+	}
+
+	pthread_mutex_lock(&creation_lock);
 
 	i = __atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
@@ -2873,37 +2892,25 @@ TASK_instance_destroy(int32_t ti)
 		return -1;
 	}
 
-	// Save the shutdown notification before the instance is freed
-	void (*shutdown_cb)(intptr_t ti, void *data) = i->shutdown_cb;
-	void *shutdown_data = i->shutdown_data;
-	bool need_queue;
+	// Save the shutdown notification before the instance is freed and reserve
+	// the slot so no new API caller can find the instance.
+	shutdown_cb = i->shutdown_cb;
+	shutdown_data = i->shutdown_data;
+	__atomic_store_n(&task_api_slot_open[ti], 0, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&instances[ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
+	pthread_mutex_unlock(&creation_lock);
 
 	instance_lock(i);
-	need_queue = ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) !=
-		      INSTANCE_STATE_SHUTTING_DOWN);
 	__atomic_store_n(&i->state, INSTANCE_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
 	instance_unlock(i);
 
-	// Reserve the slot before waiting.  New task API calls observe the busy
-	// sentinel and fail without taking an API reference, while callers that
-	// already entered hold a reference that keeps the instance alive until
-	// task_unlock().
-	__atomic_store_n(&task_api_slot_open[ti], 0, __ATOMIC_SEQ_CST);
-	__atomic_store_n(&instances[ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
-
-	// Drain instance-entry references before scanning the task pool.  This is
-	// what lets TASK_socket_create(), TASK_timeout_create(),
-	// TASK_socket_register() and TASK_do_blocking_work() finish publishing a
-	// task before shutdown decides which tasks to close.
+	// Drain entry references before scanning the pool.  Creation-style APIs
+	// that already entered get to publish their task first.
 	instance_wait_api_refs((uint32_t)ti);
 
 	// Queue closes before stopping the workers so every close is processed by
-	// the task's owning worker.  If a shutdown is already in progress the
-	// closes were queued by TASK_instance_shutdown().
-	if (need_queue) {
-		instance_queue_shutdown(i);
-	}
-
+	// the task's owning worker.  Deferred close is idempotent.
+	instance_queue_shutdown(i);
 	instance_shutdown_workers(i);
 	instance_wait_workers(i);
 
@@ -2913,9 +2920,12 @@ TASK_instance_destroy(int32_t ti)
 
 	instance_reap_workers(i);
 	instance_nuke_tasks(i);
-
 	instance_destroy(i);
-	__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
+
+	pthread_mutex_lock(&creation_lock);
+	if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == INSTANCE_SLOT_BUSY) {
+		__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
+	}
 	pthread_mutex_unlock(&creation_lock);
 
 	if (shutdown_cb) {
@@ -2934,6 +2944,12 @@ TASK_instance_wait(int32_t ti)
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
+		return -1;
+	}
+
+	if ((__thr_current_worker != NULL) && (__thr_current_worker->instance != NULL) &&
+	    (__thr_current_worker->instance->ti == ti)) {
+		errno = EDEADLK;
 		return -1;
 	}
 
@@ -3120,15 +3136,13 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	struct instance *i = NULL;
 	int num_io_to_spawn = 0;
 
-	pthread_mutex_lock(&creation_lock);
-
 	if ((num_workers_io < 0) || (max_blocking_workers < 0) ||
 	    (max_tasks == 0) || (tcp_sndbuf_size < 0)) {
 		errno = EINVAL;
-		pthread_mutex_unlock(&creation_lock);
 		return -1;
 	}
 
+	pthread_mutex_lock(&creation_lock);
 	if (!initialised) {
 		struct sigaction sa[1];
 		int32_t ti;
@@ -3144,7 +3158,8 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		memset(sa, 0, sizeof(struct sigaction));
 		sa->sa_handler = SIG_IGN;
 		if (sigaction(SIGPIPE, sa, NULL) < 0) {
-			goto TASK_instance_create_error;
+			pthread_mutex_unlock(&creation_lock);
+			return -1;
 		}
 
 		for(ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
@@ -3152,6 +3167,7 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		}
 		initialised = true;
 	}
+	pthread_mutex_unlock(&creation_lock);
 
 	// If we're not asked to spawn any io workers then
 	// we need to auto-detect how many threads to start
@@ -3166,9 +3182,11 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 		num_io_to_spawn = num_workers_io;
 	}
 
+	// instance_create() reserves and publishes a slot without holding
+	// creation_lock across allocation or worker creation.
 	if ((i = instance_create(num_io_to_spawn, max_blocking_workers, max_tasks)) == NULL) {
 		errno = ENOMEM;
-		goto TASK_instance_create_error;
+		return -1;
 	}
 	i->flags = flags;
 
@@ -3190,24 +3208,32 @@ TASK_instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_
 	i->num_workers_io = nio;
 
 	if (i->num_workers_io == 0) {
-		errno = ENOMEM;
-		goto TASK_instance_create_error;
-	}
+		// The instance is published, so abort through the same teardown
+		// path destroy uses, without holding creation_lock across waits.
+		uint32_t ti = (uint32_t)i->ti;
 
-	pthread_mutex_unlock(&creation_lock);
-	return i->ti;
+		pthread_mutex_lock(&creation_lock);
+		__atomic_store_n(&task_api_slot_open[ti], 0, __ATOMIC_SEQ_CST);
+		__atomic_store_n(&instances[ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
+		pthread_mutex_unlock(&creation_lock);
 
-TASK_instance_create_error:
-	if (i) {
-		uint32_t fail_ti = (uint32_t)i->ti;
-
-		__atomic_store_n(&task_api_slot_open[fail_ti], 0, __ATOMIC_SEQ_CST);
-		__atomic_store_n(&instances[fail_ti], INSTANCE_SLOT_BUSY, __ATOMIC_SEQ_CST);
-		instance_wait_api_refs(fail_ti);
+		instance_wait_api_refs(ti);
+		instance_shutdown_workers(i);
+		instance_wait_workers(i);
+		instance_wait_api_refs(ti);
+		instance_reap_workers(i);
+		instance_nuke_tasks(i);
 		instance_destroy(i);
-		__atomic_store_n(&instances[fail_ti], NULL, __ATOMIC_SEQ_CST);
+
+		pthread_mutex_lock(&creation_lock);
+		if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == INSTANCE_SLOT_BUSY) {
+			__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
+		}
+		pthread_mutex_unlock(&creation_lock);
+		errno = ENOMEM;
+		return -1;
 	}
-	pthread_mutex_unlock(&creation_lock);
-	return -1;
+
+	return i->ti;
 } // TASK_instance_create
 

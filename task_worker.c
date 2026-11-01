@@ -534,14 +534,18 @@ worker_handle_task_event(struct task *t, uint32_t revents)
 
 	// Handle ERROR/HUP events first
 	if (revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-		// Shutdown both connection sides and force an IO event
-		// which should make a system call to detect what happened
+		// ERROR/HUP means the connection is finished, but the peer may have
+		// queued data before the error or FIN.  Never pre-set rd_shut: let
+		// the read path drain data and observe EOF/error from the syscall.
 		if (revents & (EPOLLERR | EPOLLHUP)) {
 worker_do_io_epoll_fail:
-			task_atomic_store(&t->rd_shut, 1);
+			// The write side must observe the failure immediately.  The
+			// read side is deliberately left open until read() returns 0
+			// or an error.
 			task_atomic_store(&t->wr_shut, 1);
 			task_atomic_store(&t->in_epoll, 0);
 			epoll_ctl(t->epfd, EPOLL_CTL_DEL, t->fd, NULL);
+			task_atomic_store(&t->events, 0);
 			if (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) {
 				handled = true;
 				task_handle_rd_event(t);
@@ -553,21 +557,23 @@ worker_do_io_epoll_fail:
 				handled = true;
 				task_handle_wr_event(t);
 			}
-			if (!handled) {
-				task_notify_action(t, FLG_CL, true, true);
-			}
+			// If nobody was waiting, leave the task active.  A later read
+			// must still be allowed to drain data that arrived with the
+			// FIN/error; the user owns the eventual close.
+			(void)handled;
 			return;
 		}
 
-		// Must be a RDHUP then
-		task_atomic_store(&t->rd_shut, 1);
+		// Must be a RDHUP then.  Lower the event flags and drive the read
+		// path, which will see the queued bytes and then EOF.  Do not set
+		// rd_shut from the event hint.
 		if (task_atomic_load(&t->rd_state) != TASK_READ_STATE_IDLE) {
 			task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
 			task_handle_rd_event(t);
 			return;
 		}
-		task_lower_event_flag(t, EPOLLRDHUP);
-		revents &= ~(EPOLLRDHUP);
+		task_lower_event_flag(t, EPOLLIN | EPOLLRDHUP);
+		revents &= ~(EPOLLRDHUP | EPOLLIN);
 		if (revents == 0) {
 			return;
 		}

@@ -1789,7 +1789,7 @@ TASK_migrate(int64_t to_tfd, int64_t from_tfd)
 		return -1;
 	}
 	to_t = i->tfd_pool + to_tfdi;
-	if ((__atomic_load_n(&to_t->tfd, __ATOMIC_RELAXED) != to_tfd) ||
+	if ((task_atomic_load(&to_t->tfd) != to_tfd) ||
 	    (task_atomic_load(&to_t->state) != TASK_STATE_ACTIVE)) {
 		task_unlock(from_t, FLG_MG);
 		errno = EBADF;
@@ -1804,6 +1804,15 @@ TASK_migrate(int64_t to_tfd, int64_t from_tfd)
 	if (from_t->worker == tw) {
 		task_unlock(from_t, FLG_MG);
 		errno = EALREADY;
+		return -1;
+	}
+
+	// Listener tasks own a per-worker distribution socket.  Moving only the
+	// parent would leave its old worker without a listener and give the target
+	// worker two, so listener migration is not supported.
+	if (task_atomic_load(&from_t->type) == TASK_TYPE_LISTEN) {
+		task_unlock(from_t, FLG_MG);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -1891,16 +1900,20 @@ TASK_socket_shutdown(int64_t tfd, int how)
 		return -1;
 	}
 
-	if (how == SHUT_RD) {
-		t->rd_shut = true;
-	} else if (how == SHUT_WR) {
-		t->wr_shut = true;
-	} else if (how == SHUT_RDWR) {
-		t->rd_shut = true;
-		t->wr_shut = true;
-	}
 	res = shutdown(t->fd, how);
+	if (res == 0) {
+		if (how == SHUT_RD) {
+			t->rd_shut = true;
+		} else if (how == SHUT_WR) {
+			t->wr_shut = true;
+		} else if (how == SHUT_RDWR) {
+			t->rd_shut = true;
+			t->wr_shut = true;
+		}
+	}
+	int err = errno;
 	task_unlock(t, FLG_SD);
+	errno = err;
 	return res;
 } // TASK_socket_shutdown
 
@@ -1915,6 +1928,17 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	register struct instance *i;
 
 	if (t == NULL) return -1;	// errno already set
+
+	// A migration already claimed or in flight can move t->worker and the
+	// listener list entry from under us.  Refuse the listen rather than race
+	// worker-side migration.  TASK_migrate() cannot start a new migration
+	// while we hold the TFD lock.
+	if (task_atomic_load(&t->active_flags) & FLG_MG) {
+		task_unlock(t, FLG_LI);
+		errno = EINPROGRESS;
+		return -1;
+	}
+
 	w = t->worker;
 	i = w->instance;
 
@@ -1970,41 +1994,32 @@ TASK_socket_listen(int64_t tfd, void *accept_cb_data, void (*accept_cb)(int64_t 
 	// Listeners do not have IO timeouts.  Make sure of it
 	t->rd_expires_modified = 0;
 
-	// Add to the listeners list before the fd is armed.  Any worker polling
-	// the list will then find a fully initialised listener.
-	pthread_mutex_lock(&i->listeners_lock);
-	t->task_next = w->listeners;
-	w->listeners = t;
-	pthread_mutex_unlock(&i->listeners_lock);
-
-	// Now apply the listener to all IO workers
-	instance_listen_balance(t);
-
-	// Arm the parent listener last so no worker can accept before setup is
-	// complete.
+	// Arm the parent listener before publishing it to the other workers or
+	// adding it to the poll list.  This keeps a failed listen from accepting
+	// connections that would then have to be rolled back.
 	if (task_raise_event_flag(t, EPOLLIN) < 0) {
 		int err = errno;
-
-		pthread_mutex_lock(&i->listeners_lock);
-		task_remove_list(&w->listeners, t);
-		pthread_mutex_unlock(&i->listeners_lock);
 
 		// Roll the parent back to a plain IO task before dropping FLG_LI.
 		task_atomic_store(&t->type, TASK_TYPE_IO);
 		task_atomic_store(&t->rd_state, TASK_READ_STATE_IDLE);
 		t->stride->accept_cb = NULL;
 		t->stride->accept_cb_data = NULL;
-
-		// Keep a reference across task_unlock() and close the children after
-		// releasing the parent TFD lock: child TFD locks may hash to the same
-		// lock index as the parent's and ticket locks are not recursive.
-		task_ref(t);
 		task_unlock(t, FLG_LI);
-		task_shutdown_listen_children(t);
-		task_unref(t);
 		errno = err;
 		return -1;
 	}
+
+	// The listener is fully initialised and armed.  Add it to the worker's
+	// poll list only now, so a poll-list walk cannot observe a half-built or
+	// failed listener.
+	pthread_mutex_lock(&i->listeners_lock);
+	t->task_next = w->listeners;
+	w->listeners = t;
+	pthread_mutex_unlock(&i->listeners_lock);
+
+	// Now apply the listener to all IO workers.
+	instance_listen_balance(t);
 
 	// Release the FLG_LI flag.  The TASK_READ_STATE_LISTEN flag protects us now
 	task_unlock(t, FLG_LI);
@@ -2131,24 +2146,25 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 	struct instance *i;
 	struct task *t;
 	int sock;
-	int64_t tfd;
+	int64_t result = -1;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances[ti];
+	task_instance_ref((uint32_t)ti);
+	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EINVAL;
-		return -1;
+		goto out;
 	}
 
-
-	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_SHUTTING_DOWN) {
 		errno = EOWNERDEAD;
-		return -1;
+		goto out;
 	}
 
 	// Only create sockets for supported domains
@@ -2159,17 +2175,17 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 		break;
 	default:
 		errno = EINVAL;
-		return -1;
+		goto out;
 	}
 
 	// Create a socket.  Must be non-blocking so we always turn that on here
 	if ((sock = socket(domain, type | SOCK_NONBLOCK, protocol)) < 0) {
-		return -1;
+		goto out;
 	}
 
 	if (sock_set_nonblocking(sock) < 0) {
 		close(sock);
-		return -1;
+		goto out;
 	}
 	if (sock_set_sndbuf(i, sock) < 0) {
 		perror("sock_set_sndbuf");
@@ -2180,10 +2196,13 @@ TASK_socket_create(int32_t ti, int domain, int type, int protocol, void *close_c
 
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, true)) == NULL) {
 		close(sock);
-		return -1;
+		goto out;
 	}
-	tfd = t->tfd;
-	return tfd;
+	result = t->tfd;
+
+out:
+	task_instance_unref((uint32_t)ti);
+	return result;
 } // TASK_socket_create
 
 
@@ -2194,28 +2213,29 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 {
 	struct instance *i;
 	struct task *t;
-	int64_t tfd;
+	int64_t result = -1;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances[ti];
+	task_instance_ref((uint32_t)ti);
+	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EINVAL;
-		return -1;
+		goto out;
 	}
 
-
-	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_SHUTTING_DOWN) {
 		errno = EOWNERDEAD;
-		return -1;
+		goto out;
 	}
 
 	if (sock_set_nonblocking(sock) < 0) {
-		return -1;
+		goto out;
 	}
 	if (sock_set_sndbuf(i, sock) < 0) {
 		perror("sock_set_sndbuf");
@@ -2226,11 +2246,14 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 
 	// task_create() will return the task as already locked
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, false)) == NULL) {
-		return -1;
+		goto out;
 	}
-	tfd = t->tfd;
 	t->registered_fd = true;	// Mark it as registered so it isn't closed by task_do_close_cb()
+	result = t->tfd;
 	errno = 0;
-	return tfd;
+
+out:
+	task_instance_unref((uint32_t)ti);
+	return result;
 } // TASK_register_fd
 

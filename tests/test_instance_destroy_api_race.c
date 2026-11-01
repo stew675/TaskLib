@@ -4,12 +4,13 @@
  * memory.  Destruction now clears instances[ti] and drains API entry
  * references before freeing. */
 #include "task_lib.h"
+#include <stdatomic.h>
 #include <pthread.h>
 
 #define N	64
 
 static int32_t ti;
-static int64_t fds[N];
+static _Atomic int64_t fds[N];
 static _Atomic int stop;
 
 static void *
@@ -17,9 +18,9 @@ user(void *arg)
 {
 	unsigned seed = (unsigned)(uintptr_t)arg;
 
-	while (!__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
+	while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
 		int i = rand_r(&seed) % N;
-		int64_t t = __atomic_load_n(&fds[i], __ATOMIC_RELAXED);
+		int64_t t = atomic_load_explicit(&fds[i], memory_order_relaxed);
 
 		if (t > 0) {
 			/* These may fail while destruction is in progress, but they
@@ -55,7 +56,7 @@ main(void)
 
 	/* Destroy while the users are still calling task APIs. */
 	if (TASK_instance_destroy(ti) < 0) {
-		__atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
+		atomic_store_explicit(&stop, 1, memory_order_relaxed);
 		for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
 		return 1;
 	}
@@ -63,13 +64,13 @@ main(void)
 	/* Stale handles must now fail without touching the freed instance. */
 	for (int i = 0; i < N; i++) {
 		if (TASK_socket_get_fd(fds[i]) >= 0) {
-			__atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
+			atomic_store_explicit(&stop, 1, memory_order_relaxed);
 			for (int j = 0; j < 4; j++) pthread_join(th[j], NULL);
 			return 1;
 		}
 	}
 
-	__atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
+	atomic_store_explicit(&stop, 1, memory_order_relaxed);
 	for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
 	return 0;
 }

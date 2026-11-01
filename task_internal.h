@@ -570,6 +570,8 @@ extern pthread_mutex_t	creation_lock;
 //----------------------------------------------------------------------------------------------//
 
 void task_dump(struct task *t);
+void task_instance_ref(uint32_t ti);
+void task_instance_unref(uint32_t ti);
 int64_t get_time_us(time_precision_t prec);
 void worker_timer_attach_list(struct worker *w, struct task_timer *tt);
 void worker_timer_detach_list(struct worker *w, struct task_timer *tt);

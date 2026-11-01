@@ -30,12 +30,38 @@ static __thread uint32_t	task_api_thread_shard;
 static __thread bool		task_api_thread_shard_set;
 static _Atomic uint32_t		task_api_thread_seq;
 
+// Persistent per-slot TFD generation state.  The per-instance task pool is
+// recycled when an instance is destroyed and recreated, so a generation
+// counter kept in the task slot itself would restart at 1 and a stale tfd
+// could alias a task in the replacement instance.  These counters survive
+// instance destruction (the tables are retained for the process lifetime)
+// so the documented "134 million reuses of this slot" generation window is
+// preserved across instance lifetimes as well.
+struct tfd_generation_state {
+	uint32_t			*gens;
+	uint32_t			capacity;
+};
+static struct tfd_generation_state	task_tfd_generations[TASK_MAX_INSTANCES];
+
+static uint32_t
+task_next_generation(struct instance *i, uint32_t tfdi)
+{
+	struct tfd_generation_state *g = &task_tfd_generations[i->ti];
+	uint32_t generation;
+
+	assert(g->gens != NULL);
+	assert(tfdi < g->capacity);
+
+	generation = __atomic_add_fetch(&g->gens[tfdi], 1, __ATOMIC_RELAXED);
+	return generation & TFD_ITERATION_MASK;
+} // task_next_generation
+
 static inline uint32_t
 task_api_shard(void)
 {
 	if (!task_api_thread_shard_set) {
 		task_api_thread_shard =
-			__atomic_fetch_add(&task_api_thread_seq, 1, __ATOMIC_RELAXED) &
+			__atomic_fetch_add(TASK_ATOMIC_PTR(&task_api_thread_seq), 1, __ATOMIC_RELAXED) &
 			TASK_API_REF_SHARD_MASK;
 		task_api_thread_shard_set = true;
 	}
@@ -65,6 +91,22 @@ task_api_exit(uint32_t ti)
 {
 	task_atomic_dec(&task_api_slot_refs[ti][task_api_thread_shard].refs);
 } // task_api_exit
+
+// Unconditional instance-entry references for APIs that take an instance
+// index rather than a tfd.  Unlike task_lookup() these are always taken, even
+// when called from one of the instance's own workers, so shutdown can drain
+// them before scanning the task pool or stopping workers.
+void
+task_instance_ref(uint32_t ti)
+{
+	task_api_enter(ti);
+} // task_instance_ref
+
+void
+task_instance_unref(uint32_t ti)
+{
+	task_api_exit(ti);
+} // task_instance_unref
 
 // Lock-free free-list head encoding.  The tag makes the pop/push pair
 // ABA-safe; task->free_next stores the next slot index rather than a pointer
@@ -245,7 +287,7 @@ void
 task_init(struct instance *i, struct task *t)
 {
 	uint32_t tfdi = (uint32_t)(t - i->tfd_pool);
-	uint32_t iteration = (TFD_TO_ITERATION(task_atomic_load(&t->tfd)) + 1) & TFD_ITERATION_MASK;
+	uint32_t iteration = task_next_generation(i, tfdi);
 	size_t tail_off = offsetof(struct task, addrlen);
 
 	// Initialise the fields that can be read lock-free by task_lookup() and
@@ -315,12 +357,12 @@ task_free(struct instance *i, struct task *t, bool published)
 	// concurrently.
 	for (;;) {
 		uint32_t shard = tfdi & TASK_FREE_SHARD_MASK;
-		uint64_t head = __atomic_load_n(&i->free_heads[shard].head, __ATOMIC_ACQUIRE);
+		uint64_t head = __atomic_load_n(TASK_ATOMIC_PTR(&i->free_heads[shard].head), __ATOMIC_ACQUIRE);
 		uint64_t new_head;
 
 		task_atomic_store(&t->free_next, (uint32_t)head);
 		new_head = task_free_pack(tfdi, task_free_tag(head) + 1);
-		if (__atomic_compare_exchange_n(&i->free_heads[shard].head, &head, new_head, false,
+		if (__atomic_compare_exchange_n(TASK_ATOMIC_PTR(&i->free_heads[shard].head), &head, new_head, false,
 						__ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
 			break;
 		}
@@ -448,7 +490,7 @@ task_lookup(register int64_t tfd, register task_action_flag_t action)
 		task_api_enter(ti);
 	}
 
-	i = (struct instance *)task_atomic_load(&instances[ti]);
+	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		if (api_ref) task_api_exit(ti);
 		errno = EBADF;
@@ -702,7 +744,7 @@ task_get_free_task(struct instance *i)
 	}
 
 	if (!task_free_thread_shard_set) {
-		task_free_thread_shard = __atomic_fetch_add(&task_free_thread_seq, 1, __ATOMIC_RELAXED) &
+		task_free_thread_shard = __atomic_fetch_add(TASK_ATOMIC_PTR(&task_free_thread_seq), 1, __ATOMIC_RELAXED) &
 					 TASK_FREE_SHARD_MASK;
 		task_free_thread_shard_set = true;
 	}
@@ -711,7 +753,7 @@ task_get_free_task(struct instance *i)
 		uint32_t shard = (task_free_thread_shard + scanned) & TASK_FREE_SHARD_MASK;
 
 		for (;;) {
-			uint64_t head = __atomic_load_n(&i->free_heads[shard].head, __ATOMIC_ACQUIRE);
+			uint64_t head = __atomic_load_n(TASK_ATOMIC_PTR(&i->free_heads[shard].head), __ATOMIC_ACQUIRE);
 			uint32_t tfdi = task_free_idx(head);
 			uint32_t next;
 			uint64_t new_head;
@@ -727,7 +769,7 @@ task_get_free_task(struct instance *i)
 			t = i->tfd_pool + tfdi;
 			next = task_atomic_load(&t->free_next);
 			new_head = task_free_pack(next, task_free_tag(head) + 1);
-			if (__atomic_compare_exchange_n(&i->free_heads[shard].head, &head, new_head,
+			if (__atomic_compare_exchange_n(TASK_ATOMIC_PTR(&i->free_heads[shard].head), &head, new_head,
 							false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
 				assert(task_atomic_load(&t->state) == TASK_STATE_UNUSED);
 				task_atomic_store(&t->state, TASK_STATE_ACTIVE);
@@ -1574,6 +1616,16 @@ worker_set_state(struct worker *w, worker_state_t new_state)
 
 	instance_lock(i);
 
+	// A blocking worker may finish work while shutdown is moving it to
+	// WORKER_STATE_SHUTTING_DOWN.  Do not let its normal IDLE/NOTIFYING
+	// transition pull it back off the shutdown list; the worker loop will
+	// observe SHUTTING_DOWN and proceed to DEAD instead.
+	if (((new_state == WORKER_STATE_IDLE) ||
+	     (new_state == WORKER_STATE_NOTIFYING)) &&
+	    (task_atomic_load(&w->state) == WORKER_STATE_SHUTTING_DOWN)) {
+		instance_unlock(i);
+		return;
+	}
 
 	// If new state is same as old state, we have nothing to do
 	if (w->state == new_state) {
@@ -1603,7 +1655,9 @@ worker_set_state(struct worker *w, worker_state_t new_state)
 		TAILQ_REMOVE(&i->workers_created, w, list);
 		break;
 	case WORKER_STATE_IDLE:
-		i->num_blocking_idle--;
+		if (i->num_blocking_idle > 0) {
+			i->num_blocking_idle--;
+		}
 		TAILQ_REMOVE(&i->workers_idle, w, list);
 		break;
 	case WORKER_STATE_RUNNING:
@@ -1950,7 +2004,8 @@ instance_wait_api_refs(uint32_t ti)
 		uint64_t total = 0;
 
 		for (uint32_t shard = 0; shard < TASK_API_REF_SHARDS; shard++) {
-			total += task_atomic_load(&task_api_slot_refs[ti][shard].refs);
+			total += __atomic_load_n(TASK_ATOMIC_PTR(&task_api_slot_refs[ti][shard].refs),
+					      __ATOMIC_SEQ_CST);
 		}
 		if (total == 0) {
 			return;
@@ -1965,48 +2020,88 @@ instance_wait_api_refs(uint32_t ti)
 void
 instance_shutdown_workers(struct instance *i)
 {
-	struct worker_list workers_to_shutdown;
+	struct worker_list *lists[] = {
+		&i->workers_created,
+		&i->workers_running,
+		&i->workers_blocking,
+		&i->workers_idle,
+		&i->workers_notify,
+	};
+	struct worker **notify = NULL;
+	size_t num_notify = 0, notify_capacity = 0;
+	bool notify_under_lock = false;
 	struct worker *w;
+	size_t count = 0;
 
 	instance_lock(i);
 
-	// Move all workers to shutdown scan list
-	TAILQ_INIT(&workers_to_shutdown);
-	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_created, list);
-	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_running, list);
-	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_blocking, list);
-	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_idle, list);
-	TAILQ_CONCAT(&workers_to_shutdown, &i->workers_notify, list);
-
-	while ((w = TAILQ_FIRST(&workers_to_shutdown))) {
-		bool notify = true;
-
-		TAILQ_REMOVE(&workers_to_shutdown, w, list);
-
-		if ((w->state == WORKER_STATE_CREATED) && !w->started) {
-			// The thread was never created, so there is nothing to wake.
-			// Move it straight to DEAD so the shutdown waiter does not
-			// block forever.
-			task_atomic_store(&w->old_state, (uint32_t)task_atomic_load(&w->state));
-			task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_DEAD));
-			if ((w->type == WORKER_TYPE_BLOCKING) &&
-			    (i->num_blocking_workers > 0)) {
-				i->num_blocking_workers--;
-			}
-			TAILQ_INSERT_TAIL(&i->workers_dead, w, list);
-			notify = false;
-		} else {
-			task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_SHUTTING_DOWN));
-			TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
-		}
-
-		if (notify) {
-			instance_unlock(i);
-			worker_notify(w);
-			instance_lock(i);
+	// Count first so we can keep the list transition atomic with respect to
+	// worker_set_state().  Never move unprocessed workers to an untracked
+	// local list: a worker can finish blocking work and transition itself to
+	// IDLE/NOTIFYING while the instance lock is dropped.
+	for (size_t n = 0; n < sizeof(lists) / sizeof(lists[0]); n++) {
+		TAILQ_FOREACH(w, lists[n], list) {
+			count++;
 		}
 	}
+	if (count > 0) {
+		notify_capacity = count;
+		notify = malloc(notify_capacity * sizeof(*notify));
+		if (notify == NULL) {
+			// Notification is safe under the instance lock: worker eventfds
+			// are non-blocking (or an eventfd write cannot block in practice).
+			notify_under_lock = true;
+		}
+	}
+
+	for (size_t n = 0; n < sizeof(lists) / sizeof(lists[0]); n++) {
+		struct worker_list *list = lists[n];
+
+		while ((w = TAILQ_FIRST(list))) {
+			bool wake = true;
+
+			TAILQ_REMOVE(list, w, list);
+
+			if (list == &i->workers_idle) {
+				if (i->num_blocking_idle > 0) {
+					i->num_blocking_idle--;
+				}
+			}
+
+			if ((task_atomic_load(&w->state) == WORKER_STATE_CREATED) && !w->started) {
+				// The thread was never created, so there is nothing to wake.
+				// Move it straight to DEAD so the shutdown waiter does not
+				// block forever.
+				task_atomic_store(&w->old_state, (uint32_t)WORKER_STATE_CREATED);
+				task_atomic_store(&w->state, (uint32_t)WORKER_STATE_DEAD);
+				if ((w->type == WORKER_TYPE_BLOCKING) &&
+				    (i->num_blocking_workers > 0)) {
+					i->num_blocking_workers--;
+				}
+				TAILQ_INSERT_TAIL(&i->workers_dead, w, list);
+				wake = false;
+			} else {
+				task_atomic_store(&w->state, (uint32_t)WORKER_STATE_SHUTTING_DOWN);
+				TAILQ_INSERT_TAIL(&i->workers_shutdown, w, list);
+			}
+
+			if (!wake) {
+				continue;
+			}
+			if (notify_under_lock) {
+				worker_notify(w);
+			} else {
+				notify[num_notify++] = w;
+			}
+		}
+	}
+
 	instance_unlock(i);
+
+	for (size_t n = 0; n < num_notify; n++) {
+		worker_notify(notify[n]);
+	}
+	free(notify);
 } // instance_shutdown_workers
 
 
@@ -2063,8 +2158,8 @@ instance_destroy(struct instance *i)
 	i->magic = INSTANCE_MAGIC;
 	i->state = INSTANCE_STATE_FREE;
 	for (uint32_t ti = 0; ti < TASK_MAX_INSTANCES; ti++) {
-		if (task_atomic_load(&instances[ti]) == i) {
-			task_atomic_store(&instances[ti], NULL);
+		if (__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST) == i) {
+			__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
 			break;
 		}
 	}
@@ -2098,6 +2193,25 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 
 	i->tfd_pool_used = 0;
 	i->tfd_pool_size = pool_size;
+
+	// Grow the persistent per-slot generation table if necessary.  The table is
+	// intentionally not freed with the instance: keeping it alive preserves
+	// tfd uniqueness across destroy/recreate cycles that reuse the same ti.
+	{
+		struct tfd_generation_state *g = &task_tfd_generations[i->ti];
+
+		if (g->capacity < pool_size) {
+			uint32_t *ng = realloc(g->gens, (size_t)pool_size * sizeof(*ng));
+
+			if (ng == NULL) {
+				return -1;
+			}
+			memset(ng + g->capacity, 0,
+			       (size_t)(pool_size - g->capacity) * sizeof(*ng));
+			g->gens = ng;
+			g->capacity = pool_size;
+		}
+	}
 
 	// Allocate the "stride" task area before the "active" area
 	num_pages = pool_size * sizeof(struct task_stride);
@@ -2135,7 +2249,7 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 		free_head[shard] = tfdi;
 	}
 	for (uint32_t shard = 0; shard < TASK_FREE_SHARDS; shard++) {
-		__atomic_store_n(&i->free_heads[shard].head,
+		__atomic_store_n(TASK_ATOMIC_PTR(&i->free_heads[shard].head),
 				 task_free_pack(free_head[shard], 0), __ATOMIC_RELEASE);
 	}
 
@@ -2230,14 +2344,21 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 	i->num_cpus_seen = 0;
 	if (num_workers_io > 1) {
 		i->num_cpus = get_nprocs_conf();
-		if ((i->num_cpus > 0) && ((i->cpus = calloc(i->num_cpus, sizeof(struct cpuinfo))))) {
-			int rows = (num_workers_io + i->num_cpus - 1) / i->num_cpus;
+		if (i->num_cpus > 0) {
+			size_t cpus_size = (size_t)i->num_cpus * sizeof(struct cpuinfo);
 
-			i->num_cpu_rows = rows;
-			for (int n = 0; n < i->num_cpus; n++) {
-				i->cpus[n].workers = (struct worker **)calloc(rows, sizeof(struct worker *));
-				if (i->cpus[n].workers == NULL) {
-					goto instance_creation_fail;
+			cpus_size = (cpus_size + 31) & ~(size_t)31;
+			i->cpus = aligned_alloc(32, cpus_size);
+			if (i->cpus != NULL) {
+				int rows = (num_workers_io + i->num_cpus - 1) / i->num_cpus;
+
+				memset(i->cpus, 0, cpus_size);
+				i->num_cpu_rows = rows;
+				for (int n = 0; n < i->num_cpus; n++) {
+					i->cpus[n].workers = (struct worker **)calloc(rows, sizeof(struct worker *));
+					if (i->cpus[n].workers == NULL) {
+						goto instance_creation_fail;
+					}
 				}
 			}
 		}
@@ -2249,7 +2370,7 @@ instance_create(int num_workers_io, int max_blocking_workers, uint32_t max_tasks
 		goto instance_creation_fail;
 	}
 
-	task_atomic_store(&instances[ti], i);
+	__atomic_store_n(&instances[ti], i, __ATOMIC_SEQ_CST);
 
 	return i;
 
@@ -2272,28 +2393,39 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	struct instance *i;
 	struct worker *w;
 	int do_start = 0;
+	int result = -1;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances[ti];
+	task_instance_ref((uint32_t)ti);
+	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
 	if ((i == NULL) || (i->magic != INSTANCE_MAGIC)) {
 		errno = EBADF;
-		return -1;
+		goto out;
 	}
 
-	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_SHUTTING_DOWN) {
 		errno = EOWNERDEAD;
-		return -1;
+		goto out;
 	}
 
+	if (work_func == NULL) {
+		errno = EINVAL;
+		goto out;
+	}
 
 	// If we're not allowed to spawn blocking workers then we
 	// have to do it ourselves.  This is NOT ideal at all!!
 	if (i->max_blocking_workers == 0) {
+		// Do not keep an instance reference across user work: the user code
+		// must be able to call back into the instance without deadlocking a
+		// concurrent shutdown drain.
+		task_instance_unref((uint32_t)ti);
 		work_func(work_data);
 		if (work_cb_func) {
 			work_cb_func(ti, work_cb_data);
@@ -2305,15 +2437,17 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	// a bit with worker states here, instead of using worker_set_state()
 	instance_lock(i);
 
-	i->curtime_us = get_time_us(TASK_TIME_PRECISE);
+	task_atomic_store(&i->curtime_us, get_time_us(TASK_TIME_PRECISE));
 
-	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_SHUTTING_DOWN) {
 		instance_unlock(i);
 		errno = EOWNERDEAD;
-		return -1;
+		goto out;
 	}
 
-	if (i->state == INSTANCE_STATE_RUNNING) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_RUNNING) {
 		do_start = 1;
 	}
 
@@ -2330,7 +2464,9 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 		// consistent with the list it is actually on.  The worker thread
 		// is blocked on read(evfd) and will see WORKER_STATE_BLOCKING
 		// when the notification wakes it.
-		i->num_blocking_idle--;
+		if (i->num_blocking_idle > 0) {
+			i->num_blocking_idle--;
+		}
 		TAILQ_REMOVE(&i->workers_idle, w, list);
 		task_atomic_store(&w->old_state, (uint32_t)task_atomic_load(&w->state));
 		task_atomic_store(&w->state, (uint32_t)(WORKER_STATE_BLOCKING));
@@ -2349,7 +2485,7 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 		if (i->num_blocking_workers >= i->max_blocking_workers) {
 			instance_unlock(i);
 			errno = EAGAIN;
-			return -1;
+			goto out;
 		}
 		// Pre-increment the blocking count before we release the lock
 		i->num_blocking_workers++;
@@ -2361,11 +2497,13 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 		if ((w = worker_create(i, WORKER_TYPE_BLOCKING)) == NULL) {
 			instance_lock(i);
 			// Release our pre-increment of i->num_blocking_workers
-			i->num_blocking_workers--;
+			if (i->num_blocking_workers > 0) {
+				i->num_blocking_workers--;
+			}
 			instance_unlock(i);
 
 			errno = EAGAIN;
-			return -1;
+			goto out;
 		}
 	}
 
@@ -2382,11 +2520,15 @@ TASK_do_blocking_work(int32_t ti, void *work_data, void (*work_func)(void *work_
 	if (do_start) {
 		if (worker_start(w) < 0) {
 			errno = EAGAIN;
-			return -1;
+			goto out;
 		}
 	}
 
-	return 0;
+	result = 0;
+
+out:
+	task_instance_unref((uint32_t)ti);
+	return result;
 } // TASK_do_blocking_work
 
 
@@ -2455,14 +2597,24 @@ TASK_instance_destroy(int32_t ti)
 	// Save the shutdown notification before the instance is freed
 	void (*shutdown_cb)(intptr_t ti, void *data) = i->shutdown_cb;
 	void *shutdown_data = i->shutdown_data;
-	bool need_queue = (((instance_state_t)task_atomic_load(&i->state) != INSTANCE_STATE_SHUTTING_DOWN));
+	bool need_queue;
 
-	task_atomic_store(&i->state, INSTANCE_STATE_SHUTTING_DOWN);
+	instance_lock(i);
+	need_queue = ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) !=
+		      INSTANCE_STATE_SHUTTING_DOWN);
+	__atomic_store_n(&i->state, INSTANCE_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
+	instance_unlock(i);
 
 	// Publish the removal before waiting.  New task API calls will now fail
 	// without dereferencing the instance, while callers that already entered
 	// hold an api_slot_ref that keeps it alive until task_unlock().
-	task_atomic_store(&instances[ti], NULL);
+	__atomic_store_n(&instances[ti], NULL, __ATOMIC_SEQ_CST);
+
+	// Drain instance-entry references before scanning the task pool.  This is
+	// what lets TASK_socket_create(), TASK_timeout_create(),
+	// TASK_socket_register() and TASK_do_blocking_work() finish publishing a
+	// task before shutdown decides which tasks to close.
+	instance_wait_api_refs((uint32_t)ti);
 
 	// Queue closes before stopping the workers so every close is processed by
 	// the task's owning worker.  If a shutdown is already in progress the
@@ -2474,7 +2626,7 @@ TASK_instance_destroy(int32_t ti)
 	instance_shutdown_workers(i);
 	instance_wait_workers(i);
 
-	// All worker-held references are gone now.  Wait for the remaining public
+	// All worker-held references are gone now.  Wait for any remaining public
 	// API entry references before the instance and its worker state are freed.
 	instance_wait_api_refs((uint32_t)ti);
 
@@ -2512,7 +2664,8 @@ TASK_instance_wait(int32_t ti)
 
 
 	// Nothing has been started yet, so there is nothing to wait for
-	if (i->state == INSTANCE_STATE_CREATED) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_CREATED) {
 		return 0;
 	}
 
@@ -2555,6 +2708,7 @@ TASK_instance_wait(int32_t ti)
 	}
 
 	// Reap any workers still about
+	instance_wait_api_refs((uint32_t)ti);
 	instance_reap_workers(i);
 
 	// If user wanted to be notified that we just shutdown
@@ -2591,13 +2745,21 @@ TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intp
 		return -1;
 	}
 
-	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+	instance_lock(i);
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_SHUTTING_DOWN) {
+		instance_unlock(i);
 		return 0;
 	}
 
-	task_atomic_store(&i->state, INSTANCE_STATE_SHUTTING_DOWN);
 	i->shutdown_cb = shutdown_cb;
 	i->shutdown_data = shutdown_data;
+	__atomic_store_n(&i->state, INSTANCE_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
+	instance_unlock(i);
+
+	// Let any creation-style API call publish its task before the shutdown
+	// scan decides which tasks are live.
+	instance_wait_api_refs((uint32_t)ti);
 
 	// Queue the closes first, then stop the workers.  worker_cleanup() will
 	// process the queued closes on each task's owning thread.

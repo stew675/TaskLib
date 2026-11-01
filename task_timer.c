@@ -606,27 +606,29 @@ TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data,
 {
 	struct instance *i;
 	struct task *t;
+	int64_t result = -1;
 
 	if ((ti < 0) || (ti >= TASK_MAX_INSTANCES)) {
 		errno = ERANGE;
 		return -1;
 	}
 
-	i = instances[ti];
+	task_instance_ref((uint32_t)ti);
+	i = (struct instance *)__atomic_load_n(&instances[ti], __ATOMIC_SEQ_CST);
 
 	if ((i == NULL) || i->magic != INSTANCE_MAGIC) {
 		errno = EINVAL;
-		return -1;
+		goto out;
 	}
 
-
-	if (((instance_state_t)task_atomic_load(&i->state) == INSTANCE_STATE_SHUTTING_DOWN)) {
+	if ((instance_state_t)__atomic_load_n(&i->state, __ATOMIC_SEQ_CST) ==
+	    INSTANCE_STATE_SHUTTING_DOWN) {
 		errno = EOWNERDEAD;
-		return -1;
+		goto out;
 	}
 
 	if ((t = task_create(i, TASK_TYPE_TIMER, -1, NULL, NULL, NULL, false)) == NULL) {
-		return -1;
+		goto out;
 	}
 
 	us_from_now = (us_from_now < 0) ? 0 : us_from_now;
@@ -641,12 +643,16 @@ TASK_timeout_create(int32_t ti, int64_t us_from_now, void *timeout_cb_data,
 		task_atomic_store(&t->closed, 0);
 		if (!task_queue_close(t)) {
 			errno = ENOMEM;
-			return -1;
+			goto out;
 		}
 		errno = EOWNERDEAD;
-		return -1;
+		goto out;
 	}
-	return task_atomic_load(&t->tfd);
+	result = task_atomic_load(&t->tfd);
+
+out:
+	task_instance_unref((uint32_t)ti);
+	return result;
 } // TASK_timeout_create
 
 

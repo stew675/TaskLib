@@ -2,6 +2,7 @@
  * covers the stack-local iovec windowing used by readv/writev and the partial
  * readv result handling. */
 #include "task_lib.h"
+#include <stdatomic.h>
 
 #define IOVS		3
 #define CHUNK		40000
@@ -44,7 +45,7 @@ issue_read(void)
 	}
 
 	if (cnt == 0) {
-		__atomic_store_n(&rd_done, 1, __ATOMIC_RELEASE);
+		atomic_store_explicit(&rd_done, 1, memory_order_release);
 		return;
 	}
 
@@ -62,14 +63,14 @@ readv_cb(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result,
 	(void)data;
 
 	if (result < 0) {
-		__atomic_store_n(&failed, 1, __ATOMIC_RELEASE);
-		__atomic_store_n(&rd_done, 1, __ATOMIC_RELEASE);
+		atomic_store_explicit(&failed, 1, memory_order_release);
+		atomic_store_explicit(&rd_done, 1, memory_order_release);
 		return;
 	}
 
 	rd_consumed += (size_t)result;
 	if (rd_consumed >= TOTAL) {
-		__atomic_store_n(&rd_done, 1, __ATOMIC_RELEASE);
+		atomic_store_explicit(&rd_done, 1, memory_order_release);
 		return;
 	}
 	issue_read();
@@ -85,10 +86,10 @@ writev_cb(int64_t tfd, const struct iovec *iov, int iovcnt, ssize_t result,
 	(void)data;
 
 	if (result < 0) {
-		__atomic_store_n(&failed, 1, __ATOMIC_RELEASE);
+		atomic_store_explicit(&failed, 1, memory_order_release);
 	} else {
 		wr_result = (size_t)result;
-		__atomic_store_n(&wr_done, 1, __ATOMIC_RELEASE);
+		atomic_store_explicit(&wr_done, 1, memory_order_release);
 	}
 }
 
@@ -124,16 +125,16 @@ main(void)
 	TASK_socket_writev(wr_tfd, wr_iov, IOVS, TASK_TIMEOUT_ONE_SEC, NULL, writev_cb);
 
 	for (int i = 0; i < 500; i++) {
-		if (__atomic_load_n(&rd_done, __ATOMIC_ACQUIRE) &&
-		    __atomic_load_n(&wr_done, __ATOMIC_ACQUIRE)) {
+		if (atomic_load_explicit(&rd_done, memory_order_acquire) &&
+		    atomic_load_explicit(&wr_done, memory_order_acquire)) {
 			break;
 		}
 		usleep(10000);
 	}
 
-	int failed_flag = __atomic_load_n(&failed, __ATOMIC_ACQUIRE);
-	int done = __atomic_load_n(&rd_done, __ATOMIC_ACQUIRE) &&
-		   __atomic_load_n(&wr_done, __ATOMIC_ACQUIRE);
+	int failed_flag = atomic_load_explicit(&failed, memory_order_acquire);
+	int done = atomic_load_explicit(&rd_done, memory_order_acquire) &&
+		   atomic_load_explicit(&wr_done, memory_order_acquire);
 	int ok = 0;
 
 	if (!failed_flag && done && (rd_consumed == TOTAL) && (wr_result == TOTAL)) {

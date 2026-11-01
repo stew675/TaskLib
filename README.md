@@ -74,8 +74,9 @@ library unchanged. Do not construct or modify it.
 A `tfd` is valid from creation until the task is closed or destroyed. Stale
 handles are rejected with `EBADF` or `EOWNERDEAD`. The same value is passed to
 callbacks, so it can be compared against the value stored by the application.
-The generation field is 27 bits, so a handle that is retained across more than
-134 million reuses of the same pool slot can eventually alias a new task.
+The generation field is 27 bits. Generation counters are retained across
+instance destruction/recreation, so a handle can eventually alias a new task
+after more than 134 million reuses of the same pool slot.
 
 ### Return values and errors
 
@@ -128,8 +129,10 @@ When a timeout fires, the callback receives `result == -1` and `errno` is set to
   `TASK_instance_start()`, `TASK_instance_shutdown()`,
   `TASK_instance_wait()`, `TASK_instance_destroy()`) must not race with each
   other for the same `ti`. The application must serialize them.
-  `TASK_instance_destroy()` additionally waits for in-flight task API calls
-  that are already inside the library to finish before freeing the instance.
+  Creation-style APIs that take a `ti` are also instance-entry references;
+  `TASK_instance_shutdown()` and `TASK_instance_destroy()` drain them before
+  scanning the task pool and stopping workers. `TASK_instance_wait()` drains
+  remaining API references before reaping workers.
 - Socket, timer, connect, read, write, and close callbacks run on the task's
   owning worker thread.  If an IO call is made from that worker's thread and
   can complete immediately it runs inline (still on the owning worker).  If an
@@ -174,8 +177,9 @@ Returns `0`, or `-1` with `errno` set.
 
 ### `int TASK_instance_shutdown(int32_t ti, void *shutdown_data, void (*shutdown_cb)(intptr_t ti, void *shutdown_data))`
 
-Requests a graceful shutdown. The instance stops accepting new tasks, queues a
-close for every live task, and stops its workers. Close callbacks are suppressed
+Requests a graceful shutdown. The instance stops accepting new tasks, waits for
+in-flight creation-style APIs to finish publishing their tasks, queues a close
+for every live task, and stops its workers. Close callbacks are suppressed
 during shutdown.
 
 The `shutdown_cb`, if supplied, is stored and invoked later by
@@ -188,9 +192,9 @@ Returns `0`, or `-1` with `errno` set.
 
 ### `int TASK_instance_wait(int32_t ti)`
 
-Waits for the instance to finish shutting down. Workers are reaped and the
-stored `shutdown_cb` is invoked. If the instance was created but never started,
-this returns immediately.
+Waits for the instance to finish shutting down. In-flight API entry references
+are drained, workers are reaped, and the stored `shutdown_cb` is invoked. If the
+instance was created but never started, this returns immediately.
 
 Returns `0`, or `-1` with `errno` set.
 
@@ -303,7 +307,8 @@ The socket must already be bound; this is not checked by the library, and an
 unbound TCP socket may be auto-bound by the kernel. If `accept_cb` is NULL,
 accepted connections are immediately closed.
 
-Returns `0`, or `-1` with `errno` set.
+Returns `0`, or `-1` with `errno` set. `EINPROGRESS` means a migration for the
+task is still in flight; retry after it completes.
 
 ### `void TASK_socket_connect(int64_t tfd, struct sockaddr *addr, socklen_t addrlen, int64_t expires_in_us, void *connect_cb_data, void (*connect_cb)(int64_t tfd, int result, void *connect_cb_data))`
 
@@ -316,9 +321,9 @@ connect the task behaves as a regular IO task.
 
 ### `int TASK_socket_shutdown(int64_t tfd, int how)`
 
-Calls `shutdown()` on the underlying socket and marks the matching read and/or
-write side as shut for the library. Valid values are `SHUT_RD`, `SHUT_WR`, and
-`SHUT_RDWR`.
+Calls `shutdown()` on the underlying socket and, only if it succeeds, marks the
+matching read and/or write side as shut for the library. Valid values are
+`SHUT_RD`, `SHUT_WR`, and `SHUT_RDWR`.
 
 Returns the result of `shutdown()`, or `-1` with `errno` set.
 
@@ -352,7 +357,9 @@ Queues a migration so that the `from_tfd` task moves to the same worker as
 Returns `0`, or `-1` with `errno` set. `EALREADY` means both tasks already share
 a worker. `EINPROGRESS` means another migration for `from_tfd` is still being
 completed by its worker. `EINVAL` means `to_tfd` belongs to a different
-instance; `EBADF` means the target handle is stale or not active.
+instance, or that `from_tfd` is a listener task (listener migration is not
+supported because per-worker listener distribution would not be preserved);
+`EBADF` means the target handle is stale or not active.
 
 ---
 
@@ -420,8 +427,9 @@ synchronously on the caller thread.
 If the instance has not been started yet, the work is queued on a created worker
 and runs when `TASK_instance_start()` is called.
 
-Returns `0`, or `-1` with `errno` set. `EAGAIN` means the blocking worker limit
-was reached. `EOWNERDEAD` means the instance is shutting down.
+Returns `0`, or `-1` with `errno` set. `EINVAL` means `work_func` is NULL.
+`EAGAIN` means the blocking worker limit was reached. `EOWNERDEAD` means the
+instance is shutting down.
 
 ---
 

@@ -9,7 +9,7 @@ worker_handle_instance(struct instance *i)
 {
 	// Process blocking worker callbacks
 	task_atomic_store(&i->curtime_us, get_time_us(TASK_TIME_COARSE));
-	if (!TAILQ_EMPTY(&i->workers_notify)) {
+	{
 		struct worker *w;
 
 		instance_lock(i);

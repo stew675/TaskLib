@@ -28,21 +28,34 @@
 
 #include <stdint.h>
 
+/*
+ * Clang rejects passing pointers to _Atomic-qualified objects to the
+ * __atomic_* builtins, while GCC accepts them.  Strip the _Atomic qualifier
+ * for the builtin call; the object is still accessed with atomic semantics.
+ * The conditional expression performs an lvalue-to-rvalue conversion, which
+ * drops the qualifier while working for integer, object-pointer and
+ * function-pointer scalars alike.
+ */
+#define	TASK_ATOMIC_TYPE(p)	__typeof__(1 ? (p)[0] : (p)[0])
+#define	TASK_ATOMIC_PTR(p)	\
+	(((union { __typeof__(p) _atomic_ptr; TASK_ATOMIC_TYPE(p) *_plain_ptr; }) \
+	  { ._atomic_ptr = (p) })._plain_ptr)
+
 /* Acquire/release atomic load/store.  Works with any integer or pointer type. */
-#define	task_atomic_load(p)		__atomic_load_n((p), __ATOMIC_ACQUIRE)
-#define	task_atomic_store(p, v)		__atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define	task_atomic_load(p)		__atomic_load_n(TASK_ATOMIC_PTR(p), __ATOMIC_ACQUIRE)
+#define	task_atomic_store(p, v)		__atomic_store_n(TASK_ATOMIC_PTR(p), (v), __ATOMIC_RELEASE)
 
 /* Full-barrier atomic read-modify-write operations. */
-#define	task_atomic_inc(p)		((void)__atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST))
-#define	task_atomic_dec(p)		((void)__atomic_sub_fetch((p), 1, __ATOMIC_SEQ_CST))
-#define	task_atomic_add(p, v)		((void)__atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST))
-#define	task_atomic_sub(p, v)		((void)__atomic_sub_fetch((p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_inc(p)		((void)__atomic_add_fetch(TASK_ATOMIC_PTR(p), 1, __ATOMIC_SEQ_CST))
+#define	task_atomic_dec(p)		((void)__atomic_sub_fetch(TASK_ATOMIC_PTR(p), 1, __ATOMIC_SEQ_CST))
+#define	task_atomic_add(p, v)		((void)__atomic_add_fetch(TASK_ATOMIC_PTR(p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_sub(p, v)		((void)__atomic_sub_fetch(TASK_ATOMIC_PTR(p), (v), __ATOMIC_SEQ_CST))
 
 /* Atomic bit set/clear/test-and-set.  These are used for the per-task state
  * words that may be touched from both a worker and an API caller. */
-#define	task_atomic_or(p, v)		((void)__atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST))
-#define	task_atomic_and(p, v)		((void)__atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST))
-#define	task_atomic_fetch_or(p, v)	__atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
-#define	task_atomic_fetch_and(p, v)	__atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
+#define	task_atomic_or(p, v)		((void)__atomic_fetch_or(TASK_ATOMIC_PTR(p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_and(p, v)		((void)__atomic_fetch_and(TASK_ATOMIC_PTR(p), (v), __ATOMIC_SEQ_CST))
+#define	task_atomic_fetch_or(p, v)	__atomic_fetch_or(TASK_ATOMIC_PTR(p), (v), __ATOMIC_SEQ_CST)
+#define	task_atomic_fetch_and(p, v)	__atomic_fetch_and(TASK_ATOMIC_PTR(p), (v), __ATOMIC_SEQ_CST)
 
 #endif	// __TASK_ATOMICS_H_

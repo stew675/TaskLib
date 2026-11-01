@@ -3,13 +3,14 @@
  * A concurrent timer update or close could then corrupt the heap.  This test
  * also stresses the rule that only one migration may be in flight per task. */
 #include "task_lib.h"
+#include <stdatomic.h>
 #include <pthread.h>
 
 #define N		128
 #define RUN_SECONDS	3
 
 static int32_t ti;
-static int64_t fds[N];
+static _Atomic int64_t fds[N];
 static _Atomic int stop;
 static _Atomic unsigned long migrations;
 
@@ -26,15 +27,15 @@ mover(void *arg)
 {
 	unsigned seed = (unsigned)(uintptr_t)arg;
 
-	while (!__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
+	while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
 		int i = rand_r(&seed) % N;
 		int j = rand_r(&seed) % N;
-		int64_t from = __atomic_load_n(&fds[i], __ATOMIC_RELAXED);
-		int64_t to = __atomic_load_n(&fds[j], __ATOMIC_RELAXED);
+		int64_t from = atomic_load_explicit(&fds[i], memory_order_relaxed);
+		int64_t to = atomic_load_explicit(&fds[j], memory_order_relaxed);
 
 		if ((from > 0) && (to > 0) && (from != to)) {
 			if (TASK_migrate(to, from) == 0) {
-				__atomic_add_fetch(&migrations, 1, __ATOMIC_RELAXED);
+				atomic_fetch_add_explicit(&migrations, 1, memory_order_relaxed);
 			}
 			(void)TASK_timeout_set(from, (seed & 1) ? 1000 : 10000000,
 					       NULL, tm_cb);
@@ -51,15 +52,15 @@ closer(void *arg)
 {
 	unsigned seed = (unsigned)(uintptr_t)arg;
 
-	while (!__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
+	while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
 		int i = rand_r(&seed) % N;
-		int64_t old = __atomic_exchange_n(&fds[i], -1, __ATOMIC_RELAXED);
+		int64_t old = atomic_exchange_explicit(&fds[i], -1, memory_order_relaxed);
 
 		if (old > 0) {
 			(void)TASK_close(old);
 			int64_t nfd = TASK_socket_create(ti, AF_INET, SOCK_STREAM, 0, NULL, NULL);
 			if (nfd > 0) {
-				__atomic_store_n(&fds[i], nfd, __ATOMIC_RELAXED);
+				atomic_store_explicit(&fds[i], nfd, memory_order_relaxed);
 			}
 		}
 		usleep(20);
@@ -87,11 +88,11 @@ main(void)
 	pthread_create(&th[3], NULL, closer, (void *)(uintptr_t)4);
 
 	sleep(RUN_SECONDS);
-	__atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
+	atomic_store_explicit(&stop, 1, memory_order_relaxed);
 	for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
 
 	for (int i = 0; i < N; i++) {
-		int64_t t = __atomic_exchange_n(&fds[i], -1, __ATOMIC_RELAXED);
+		int64_t t = atomic_exchange_explicit(&fds[i], -1, memory_order_relaxed);
 		if (t > 0) (void)TASK_close(t);
 	}
 
@@ -99,5 +100,5 @@ main(void)
 	TASK_instance_wait(ti);
 	TASK_instance_destroy(ti);
 
-	return (__atomic_load_n(&migrations, __ATOMIC_RELAXED) > 0) ? 0 : 1;
+	return (atomic_load_explicit(&migrations, memory_order_relaxed) > 0) ? 0 : 1;
 }

@@ -435,7 +435,7 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	task_atomic_store(&t->stride->close_cb_data, close_cb_data);
 	__atomic_add_fetch(&w->num_tasks, 1, __ATOMIC_RELAXED);
 
-	// task_get_free_tfd() already locked the task for us
+	// task_get_free_task() has already published the slot as ACTIVE.
 	return t;
 } // task_create
 
@@ -490,7 +490,7 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 
 	if (t->wr_shut) {
 		if (queued) {
-			task_do_writev_cb(t, tfd, -1, EPIPE);	// Unlocks task
+			task_do_writev_cb(t, tfd, -1, EPIPE);	
 			return 0;
 		}
 		errno = EPIPE;
@@ -552,14 +552,14 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 				// much that was.  They'll have to catch the error on their next write
 				errno = 0;
 				if (queued) {
-					task_do_writev_cb(t, tfd, (ssize_t)wrv_bufpos, 0);	// Unlocks task
+					task_do_writev_cb(t, tfd, (ssize_t)wrv_bufpos, 0);
 					return 0;
 				}
 				return (ssize_t)wrv_bufpos;
 			}
 
 			if (queued) {
-				task_do_writev_cb(t, tfd, -1, errno);	// Unlocks task
+				task_do_writev_cb(t, tfd, -1, errno);
 				return 0;
 			}
 			return -1;
@@ -578,7 +578,7 @@ task_write_vector(register struct task *t, register bool wr_expires_modified, re
 
 	// We wrote it all.  Make the callback
 	if (queued) {
-		task_do_writev_cb(t, tfd, (ssize_t)wrv_bufpos, 0);	// Unlocks task
+		task_do_writev_cb(t, tfd, (ssize_t)wrv_bufpos, 0);
 		return 0;
 	}
 	errno = 0;
@@ -598,7 +598,7 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 
 	if (t->wr_shut) {
 		if (queued) {
-			task_do_write_cb(t, tfd, -1, EPIPE);	// Unlocks task
+			task_do_write_cb(t, tfd, -1, EPIPE);
 			return 0;
 		}
 		errno = EPIPE;
@@ -646,7 +646,7 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 				// If we had written something before the error.  Inform caller of how
 				// much that was.  They'll have to catch the error on their next write
 				if (queued) {
-					task_do_write_cb(t, tfd, (ssize_t)wr_bufpos, 0);	// Unlocks task
+					task_do_write_cb(t, tfd, (ssize_t)wr_bufpos, 0);
 					return 0;
 				}
 				errno = 0;
@@ -654,7 +654,7 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 			}
 
 			if (queued) {
-				task_do_write_cb(t, tfd, -1, errno);	// Unlocks task
+				task_do_write_cb(t, tfd, -1, errno);
 				return 0;
 			}
 			return -1;
@@ -667,7 +667,7 @@ task_write_buffer(register struct task *t, register bool wr_expires_modified, re
 
 	// We read it all.  Make the callback
 	if (queued) {
-		task_do_write_cb(t, tfd, (ssize_t)wr_bufpos, 0);	// Unlocks task
+		task_do_write_cb(t, tfd, (ssize_t)wr_bufpos, 0);
 		return 0;
 	}
 	errno = 0;
@@ -704,9 +704,9 @@ task_handle_connect_event(struct task *t)
 	}
 
 	if (errno != 0) {
-		task_do_connect_cb(t, t->tfd, -1, errno);	// Unlocks task
+		task_do_connect_cb(t, t->tfd, -1, errno);
 	} else {
-		task_do_connect_cb(t, t->tfd, 1, 0);	// Unlocks task
+		task_do_connect_cb(t, t->tfd, 1, 0);
 	}
 } // task_handle_connect_event
 
@@ -741,7 +741,7 @@ task_handle_connecting_action(register struct task *t, register bool wr_expires_
 	}
 
 	// Connect failure of some kind. Notify the caller
-	task_do_connect_cb(t, t->tfd, -1, errno);	// Unlocks task
+	task_do_connect_cb(t, t->tfd, -1, errno);
 } // task_handle_connecting_action
 
 
@@ -757,7 +757,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 
 	if (t->rd_shut) {
 		if (queued) {
-			task_do_readv_cb(t, tfd, -1, EPIPE);	// Unlocks task
+			task_do_readv_cb(t, tfd, -1, EPIPE);	
 			return 0;
 		}
 		errno = EPIPE;
@@ -773,7 +773,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 		// matching the buffer read path.
 		if (max_can_do == 0) {
 			if (queued) {
-				task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
+				task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	
 				return 0;
 			}
 			errno = 0;
@@ -805,7 +805,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (rdv_bufpos > 0) {
 					if (queued) {
-						task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
+						task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	
 						return 0;
 					}
 					errno = 0;
@@ -829,7 +829,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 
 			// Some other read or event flag raise error.
 			if (queued) {
-				task_do_readv_cb(t, tfd, -1, errno);	// Unlocks task
+				task_do_readv_cb(t, tfd, -1, errno);	
 				return 0;
 			}
 			return -1;
@@ -844,7 +844,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 			// condition will have to get picked up on the next read attempt
 			if (rdv_bufpos > 0) {
 				if (queued) {
-					task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
+					task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	
 					return 0;
 				}
 				errno = 0;
@@ -853,7 +853,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 
 			// We got nothing at all.
 			if (queued) {
-				task_do_readv_cb(t, tfd, -1, EPIPE);	// Unlocks task
+				task_do_readv_cb(t, tfd, -1, EPIPE);	
 				return 0;
 			}
 			errno = EPIPE;
@@ -873,7 +873,7 @@ task_read_vector(register struct task *t, register bool rd_expires_modified, reg
 
 	// We read it all.  Make the callback
 	if (queued) {
-		task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	// Unlocks task
+		task_do_readv_cb(t, tfd, (ssize_t)rdv_bufpos, 0);	
 		return 0;
 	}
 	errno = 0;
@@ -893,7 +893,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 
 	if (t->rd_shut) {
 		if (queued) {
-			task_do_read_cb(t, tfd, -1, EPIPE);		// Unlocks task
+			task_do_read_cb(t, tfd, -1, EPIPE);		
 			return 0;
 		}
 		errno = EPIPE;
@@ -908,7 +908,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 		// Restrict the amount that can be read in one go for fairness
 		if (max_can_do == 0) {
 			if (queued) {
-				task_do_read_cb(t, tfd, (ssize_t)rd_bufpos, 0);	// Unlocks task
+				task_do_read_cb(t, tfd, (ssize_t)rd_bufpos, 0);	
 				return 0;
 			}
 			errno = 0;
@@ -928,7 +928,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 				// Do not raise EPOLLIN again until user asks us to read more
 				if (rd_bufpos > 0) {
 					if (queued) {
-						task_do_read_cb(t, tfd, (ssize_t)rd_bufpos, 0);	// Unlocks task
+						task_do_read_cb(t, tfd, (ssize_t)rd_bufpos, 0);	
 						return 0;
 					}
 					errno = 0;
@@ -951,7 +951,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 
 			// Some other read or event flag raise error.
 			if (queued) {
-				task_do_read_cb(t, tfd, -1, errno);	// Unlocks task
+				task_do_read_cb(t, tfd, -1, errno);	
 				return 0;
 			}
 			return -1;
@@ -966,7 +966,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 			// condition will have to get picked up on the next read attempt
 			if (rd_bufpos > 0) {
 				if (queued) {
-					task_do_read_cb(t, tfd, (ssize_t)rd_bufpos, 0);	// Unlocks task
+					task_do_read_cb(t, tfd, (ssize_t)rd_bufpos, 0);	
 					return 0;
 				}
 				errno = 0;
@@ -975,7 +975,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 
 			// We got nothing at all.
 			if (queued) {
-				task_do_read_cb(t, tfd, -1, EPIPE);		// Unlocks task
+				task_do_read_cb(t, tfd, -1, EPIPE);		
 				return 0;
 			}
 			errno = EPIPE;
@@ -989,7 +989,7 @@ task_read_buffer(register struct task *t, register bool rd_expires_modified, reg
 
 	// We read it all.  Make the callback
 	if (queued) {
-		task_do_read_cb(t, tfd, rd_bufpos, 0);		// Unlocks task
+		task_do_read_cb(t, tfd, rd_bufpos, 0);		
 		return 0;
 	}
 	errno = 0;
@@ -1199,11 +1199,11 @@ task_handle_wr_event(struct task *t)
 
 	// Write stuff out as needed
 	if (task_atomic_load(&t->wr_state) == TASK_WRITE_STATE_BUFFER) {
-		task_write_buffer(t, t->wr_expires_modified, true);	// Unlocks the task for us
+		task_write_buffer(t, t->wr_expires_modified, true);	
 	} else if (task_atomic_load(&t->wr_state) == TASK_WRITE_STATE_VECTOR) {
-		task_write_vector(t, t->wr_expires_modified, true);	// Unlocks the task for us
+		task_write_vector(t, t->wr_expires_modified, true);	
 	} else if (task_atomic_load(&t->wr_state) == TASK_WRITE_STATE_CONNECT) {
-		task_handle_connect_event(t);				// Unlocks the task for us
+		task_handle_connect_event(t);				
 	} else {
 		// Do nothing
 	}
@@ -1220,11 +1220,11 @@ task_handle_rd_event(struct task *t)
 
 	// Read in whatever as directed
 	if (task_atomic_load(&t->rd_state) == TASK_READ_STATE_BUFFER) {
-		task_read_buffer(t, t->rd_expires_modified, true);	// Unlocks the task for us
+		task_read_buffer(t, t->rd_expires_modified, true);	
 	} else if (task_atomic_load(&t->rd_state) == TASK_READ_STATE_VECTOR) {
-		task_read_vector(t, t->rd_expires_modified, true);	// Unlocks the task for us
+		task_read_vector(t, t->rd_expires_modified, true);	
 	} else if (task_atomic_load(&t->rd_state) == TASK_READ_STATE_LISTEN) {
-		task_handle_listen_event(t);				// Unlocks the task for us
+		task_handle_listen_event(t);				
 	} else {
 		// Do nothing
 	}
@@ -2284,7 +2284,7 @@ TASK_socket_register(int32_t ti, int sock, void *close_cb_data,
 		perror("sock_set_rcvbuf");
 	}
 
-	// task_create() will return the task as already locked
+	// task_create() returns an ACTIVE task ready for use.
 	if ((t = task_create(i, TASK_TYPE_IO, sock, NULL, close_cb_data, close_cb, false)) == NULL) {
 		goto out;
 	}

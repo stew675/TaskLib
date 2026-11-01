@@ -78,6 +78,21 @@ The generation field is 27 bits. Generation counters are retained across
 instance destruction/recreation, so a handle can eventually alias a new task
 after more than 134 million reuses of the same pool slot.
 
+### Limits and process-wide effects
+
+- At most `TASK_MAX_INSTANCES` (16) instances may exist in a process.
+- `max_tasks` is validated with checked 64-bit arithmetic. Oversized values are
+  rejected with `EINVAL`/`ENOMEM` instead of wrapping to a small pool.
+- `num_workers_io` and `max_blocking_workers` must be non-negative. `0` IO
+  workers selects an automatic count; `0` blocking workers means
+  `TASK_do_blocking_work()` runs synchronously on the caller.
+- The library ignores `SIGPIPE` process-wide the first time an instance is
+  created. Install application signal handling before creating an instance if a
+  different disposition is required.
+- Library-created file descriptors (sockets, epoll, eventfd, accepted sockets)
+  are `CLOEXEC` by default. Externally registered fds are not modified beyond
+  making them non-blocking and applying buffer sizes.
+
 ### Return values and errors
 
 Functions that return `int` return `0` on success and `-1` on failure, with
@@ -101,6 +116,13 @@ Socket IO callbacks receive a `result` value:
   `errno` is set (`ETIMEDOUT`, `EPIPE`, `EOWNERDEAD`, etc.).
 
 IO callbacks are not invoked with `result == 0`.
+
+Callbacks may run before the API call that initiated the operation returns.
+This can happen when the call is made from the owning worker and completes
+inline, when validation fails, or when another thread's worker processes the
+operation immediately. Do not assume that the call has returned before its
+callback runs, and do not hold an application lock across an API call if the
+callback will take the same lock.
 
 The connect callback receives `1` on success and `-1` on failure, with `errno`
 set. The accept callback receives a new `tfd` on success and `-1` if the library
@@ -136,10 +158,17 @@ alone.
   `TASK_instance_start()`, `TASK_instance_shutdown()`,
   `TASK_instance_wait()`, `TASK_instance_destroy()`) must not race with each
   other for the same `ti`. The application must serialize them.
-  Creation-style APIs that take a `ti` are also instance-entry references;
+  Creation-style APIs that take a `ti` are instance-entry references;
   `TASK_instance_shutdown()` and `TASK_instance_destroy()` drain them before
   scanning the task pool and stopping workers. `TASK_instance_wait()` drains
-  remaining API references before reaping workers.
+  remaining API references before reaping workers. The global instance-slot
+  lock is only used to reserve/publish/retire a slot, never while waiting for
+  workers or API references.
+- `TASK_instance_wait()` and `TASK_instance_destroy()` called from a callback
+  running on that instance's own worker fail with `EDEADLK`. Other lifecycle
+  calls that find the instance already shutting down or being destroyed fail
+  with `EBADF`/`EOWNERDEAD` rather than waiting. Do not call lifecycle APIs from
+  callbacks unless the call is documented as non-blocking.
 - Socket, timer, connect, read, write, and close callbacks run on the task's
   owning worker thread.  If an IO call is made from that worker's thread and
   can complete immediately it runs inline (still on the owning worker).  If an
@@ -155,6 +184,43 @@ alone.
   the blocking thread.
 - `shutdown_cb` runs on the thread that calls `TASK_instance_wait()` or
   `TASK_instance_destroy()`.
+
+### Lifetime and synchronisation model
+
+The lifetime rules are deliberately strict because event dispatch, timers,
+listeners, and foreign API callers can all reference the same task:
+
+- A task slot is pinned while any API reference, notification, activity flag
+  (including a pending close), IO reservation, timer node, epoll dispatch
+  reference, or listener poll-snapshot reference exists.
+- `task_maybe_free()` is the only normal recycle point. It runs after close
+  teardown has cleared the activity flags and marked the task closed.
+- All close requests are deferred to the owning worker's close queue. Close
+  does not allocate memory, never runs inline from epoll/poll/foreign callbacks,
+  and always leaves the task on a path to eventual teardown (or the shutdown
+  nuke pass).
+- Epoll events carry a generation-tagged TFD cookie, not a raw task pointer.
+  Dispatch pins the slot, revalidates the cookie generation, and drops stale
+  events for recycled slots. Listener poll snapshots pin every copied listener
+  for the duration of the callback.
+- Timer callbacks revalidate task state, armed expiry, and cancellation under
+  the TFD lock immediately before invocation. A callback already past that
+  check may be in flight; the close callback is the user-visible barrier.
+
+Lock order (do not create a reverse edge):
+
+```text
+creation_lock (slot reservation/publish only; never across a wait)
+    -> instance->lock (worker state lists)
+    -> tfd_lock (hash-sharded task lock)
+    -> worker->lock (notification/close queues)
+    -> listeners_lock
+    -> cpulock
+```
+
+`tfd_lock` may be held while taking `worker->lock`. `worker->lock` is released
+before taking `tfd_lock` in drain paths. `listeners_lock` is never held while
+taking `tfd_lock` or `worker->lock`.
 
 ---
 
@@ -201,7 +267,8 @@ Returns `0`, or `-1` with `errno` set.
 
 Waits for the instance to finish shutting down. In-flight API entry references
 are drained, workers are reaped, and the stored `shutdown_cb` is invoked. If the
-instance was created but never started, this returns immediately.
+instance was created but never started, this returns immediately. Calling this
+from the instance's own worker returns `-1` with `errno == EDEADLK`.
 
 Returns `0`, or `-1` with `errno` set.
 
@@ -213,7 +280,9 @@ joined, in-flight task API entry references are drained, and the instance is
 freed. This call is safe after `TASK_instance_wait()`. If a `shutdown_cb` is
 pending it is invoked after the instance is freed.
 
-Do not use `ti` after this call returns success.
+Calling this from the instance's own worker returns `-1` with
+`errno == EDEADLK`; other lifecycle calls racing the destruction observe
+`EBADF`/`EOWNERDEAD`. Do not use `ti` after this call returns success.
 
 Returns `0`, or `-1` with `errno` set.
 
@@ -309,9 +378,12 @@ the instance settings. `close_cb`, if supplied, is invoked when the task closes
 Registers an externally created file descriptor with the instance and returns a
 `tfd`, or `-1` with `errno` set.
 
-The descriptor is made non-blocking. The library does not close it on task
+The descriptor is made non-blocking and the instance's configured send and
+receive buffer sizes are applied to it. The library does not close it on task
 close; it only removes it from the worker's epoll set. The application remains
-responsible for the descriptor itself.
+responsible for the descriptor itself (including closing it after the task's
+close callback has run). Use `TASK_socket_create()` if the library should own
+the descriptor.
 
 ### `int TASK_socket_bind(int64_t tfd, struct sockaddr *addr, socklen_t addrlen)`
 
@@ -353,14 +425,19 @@ Returns the result of `shutdown()`, or `-1` with `errno` set.
 
 ### `int TASK_close(int64_t tfd)`
 
-Queues a close for the task. The close callback, if registered, runs once before
-the task slot is recycled. Pending IO callbacks are cancelled. Timers are
-cancelled and destroyed.
+Requests an asynchronous close for the task. The close callback, if registered,
+runs once before the task slot is recycled. Pending IO callbacks are cancelled.
+Timers are cancelled and destroyed. `TASK_close()` does not wait for teardown,
+and a callback may already be in flight when it returns; `close_cb` is the
+barrier after which no further callback for the task may start.
 
 For a task created with `TASK_socket_register()`, the descriptor is removed from
-epoll but not closed. For a timeout-only task, the task is freed.
+epoll but not closed. For a timeout-only task, the task is freed after close
+processing.
 
-Close callbacks are suppressed when the instance is shutting down.
+Close callbacks are suppressed when the instance is shutting down. During
+shutdown, release per-task application state from the instance `shutdown_cb`
+instead.
 
 Returns `0`, or `-1` with `errno` set.
 

@@ -114,3 +114,17 @@ Per-thread allocator throughput stays flat instead of collapsing as thread count
 grows. The reported `getfd`/`read` phase-7 values are slightly below the
 pre-phase-7 run on this host, within normal microbenchmark variance; the API
 entry admission check remains cheap and uncontended.
+
+## Phase 8 final validation
+
+Final code after the TSan fixes was re-measured:
+
+| File | Description |
+| --- | --- |
+| `micro_phase8.txt` | final allocator/API microbenchmarks |
+| `http_phase8.txt` | final HTTP echo suite |
+
+The final allocator microbenchmark remains flat across 1-8 threads and the HTTP
+suite is within normal run-to-run variance of `http_phase7.txt` (for example
+4x1000: 5471/5760 MB/s final versus 5446/5734 MB/s in phase 7). No correctness
+regressions were observed.

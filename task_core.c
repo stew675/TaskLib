@@ -10,10 +10,11 @@ size_t			__page_size;
 pthread_mutex_t		creation_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Per-instance slot API-entry references.  A lookup increments the reference
-// for the instance index *before* it dereferences instances[ti], and keeps it
-// until task_unlock().  TASK_instance_destroy() clears instances[ti] and then
-// waits for these references to drain before freeing the instance, so an API
-// call that raced with destruction cannot touch freed instance memory.
+// for the instance index, revalidates the slot pointer, and keeps it until
+// task_unlock().  TASK_instance_destroy() reserves instances[ti] with
+// INSTANCE_SLOT_BUSY and then waits for these references to drain before
+// freeing the instance, so an API call that raced with destruction cannot
+// touch freed instance memory.
 // The counters are sharded so unrelated API-calling threads do not all bounce
 // one per-instance cache line.  Each thread sticks to one shard; destruction
 // scans all shards, which is a cold path.
@@ -330,7 +331,13 @@ task_init(struct instance *i, struct task *t)
 	task_atomic_store(&t->notifyqlen, 0);
 	// api_refs is intentionally preserved so a stale task_ref() always has a
 	// matching task_unref().
-	memset((char *)t + tail_off, 0, sizeof(struct task) - tail_off);
+	//
+	// free_next is excluded from the bulk clear: a task_get_free_task() that
+	// loses the pop CAS may still have speculatively loaded this slot's link
+	// before the slot was re-pushed.  Its read is atomic, so the corresponding
+	// write must be atomic too.
+	memset((char *)t + tail_off, 0, offsetof(struct task, free_next) - tail_off);
+	task_atomic_store(&t->free_next, TASK_FREE_EMPTY);
 	memset(i->tfd_stride + tfdi, 0, sizeof(struct task_stride));
 
 	t->stride = i->tfd_stride + tfdi;

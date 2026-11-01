@@ -307,11 +307,11 @@ __attribute__ ((aligned(64))) struct task_timer tm_tt;		// 32 bytes - Timer Info
 	_Atomic uint32_t		wr_shut;
 	_Atomic uint32_t		rd_cancel;
 	_Atomic uint32_t		wr_cancel;
-	uint32_t		rt_cancelled;
-	uint32_t		wt_cancelled;
+	_Atomic uint32_t		rt_cancelled;
+	_Atomic uint32_t		wt_cancelled;
 	uint32_t		rd_expires_modified;
 	uint32_t		wr_expires_modified;
-	uint32_t		tm_cancelled;
+	_Atomic uint32_t		tm_cancelled;
 	uint32_t		in_epoll;
 	uint32_t		registered_fd;
 	uint32_t		listen_child;
@@ -442,7 +442,6 @@ typedef enum {
 struct cpuinfo {
 	bool				seen;
 	struct worker			**workers;
-	int				worker_pos;
 	int				num_workers;
 } __attribute__ ((aligned(32)));;
 
@@ -487,7 +486,6 @@ struct instance {
 	uint32_t			cur_io_worker;
 	uint32_t			num_workers_io;
 
-	uint64_t			max_tcp_mem;
 	uint64_t			per_task_sndbuf;
 
 	// Protects every worker's listeners list and listener migration
@@ -495,10 +493,8 @@ struct instance {
 
 	// CPU/Worker Affinity Fields
 	pthread_mutex_t			cpulock;
-	int				worker_offset;
 	bool				all_cpus_seen;
 	bool				all_io_workers_affined;
-	int				num_io_workers_affined;
 	int				num_cpu_rows;
 	int				num_cpus_seen;
 	int				num_cpus;

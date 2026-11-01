@@ -8,7 +8,16 @@ static int32_t ti;
 static _Atomic ssize_t last_result;
 static _Atomic int last_errno;
 static _Atomic int done;
+static _Atomic int closed;
 static char buf[64];
+
+static void
+close_cb(int64_t tfd, void *data)
+{
+	(void)tfd;
+	(void)data;
+	atomic_store(&closed, 1);
+}
 
 static void
 read_cb(int64_t tfd, void *b, ssize_t result, void *data)
@@ -67,8 +76,9 @@ run_case(int close_peer, int prefill)
 	int e;
 
 	if (make_tcp_pair(&managed, &peer) < 0) return -1;
-	tfd = TASK_socket_register(ti, managed, NULL, NULL);
+	tfd = TASK_socket_register(ti, managed, NULL, close_cb);
 	if (tfd < 0) return -1;
+	atomic_store(&closed, 0);
 
 	atomic_store(&done, 0);
 	atomic_store(&last_result, -2);
@@ -114,7 +124,10 @@ run_case(int close_peer, int prefill)
 	}
 
 	(void)TASK_close(tfd);
-	usleep(50000);
+	for (int n = 0; n < 500 && !atomic_load(&closed); n++) {
+		usleep(1000);
+	}
+	if (!atomic_load(&closed)) return -1;
 	if (!prefill) close(peer);
 	close(managed);
 	return 0;

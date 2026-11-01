@@ -48,7 +48,7 @@
 // Number of shards in the lock-free task free list.  Each shard has its own
 // tagged head on a separate cache line, so concurrent task create/free paths on
 // different CPUs do not all bounce the same cache line.  Must be a power of 2.
-#define TASK_FREE_SHARDS		16
+#define TASK_FREE_SHARDS		64
 #define TASK_FREE_SHARD_MASK		(TASK_FREE_SHARDS - 1)
 
 #define	TASK_MAX_TFD_LOCKS		(127)
@@ -474,7 +474,9 @@ struct instance {
 	struct task_stride		*tfd_stride;		// The "stride" portion of the task pool
 	struct task_free_head		free_heads[TASK_FREE_SHARDS];
 
-	uint64_t			tfd_pool_used;		// The total number of active tasks in the pool
+	// tfd_pool_used is retained for source compatibility but is no longer
+	// maintained on the hot allocation path.
+	uint64_t			tfd_pool_used;
 	uint32_t			tfd_pool_size;
 
 	tfd_lock_t			*tfd_locks_real;

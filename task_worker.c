@@ -227,8 +227,8 @@ worker_handle_task_migration(struct worker *w, struct task *t)
 	// has been detached.  Queued notifications still sitting on the old
 	// worker are forwarded by worker_process_one_action() once they run.
 	task_atomic_store(&t->worker, tw);
-	task_atomic_dec(&w->num_tasks);
-	task_atomic_inc(&tw->num_tasks);
+	__atomic_sub_fetch(&w->num_tasks, 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&tw->num_tasks, 1, __ATOMIC_RELAXED);
 
 	// All queued notifications automatically get forwarded to the new task worker
 

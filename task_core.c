@@ -360,9 +360,8 @@ task_free(struct instance *i, struct task *t, bool published)
 	uint32_t tfdi = TFD_TO_INDEX(task_atomic_load(&t->tfd));
 
 	if (w) {
-		task_atomic_dec(&w->num_tasks);
+		__atomic_sub_fetch(&w->num_tasks, 1, __ATOMIC_RELAXED);
 	}
-	task_atomic_dec(&i->tfd_pool_used);
 
 	/*
 	 * A published slot is only ever recycled after close has completed.
@@ -739,7 +738,6 @@ task_nuke(struct instance *i, uint32_t tfdi)
 		t->fd = -1;
 	}
 	task_init(i, t);
-	task_atomic_dec(&i->tfd_pool_used);
 } // task_nuke
 
 
@@ -755,11 +753,9 @@ task_get_free_task(struct instance *i)
 		return NULL;
 	}
 
-	// Also ensure we're not at our max open tfd limit
-	if ((uint64_t)task_atomic_load(&i->tfd_pool_used) > (uint64_t)(i->tfd_pool_size * 0.8)) {
-		errno = EMFILE;
-		return NULL;
-	}
+	// The inventory of the sharded free list is the authoritative bound; the
+	// old advisory tfd_pool_used/*0.8 check required a contended seq_cst RMW
+	// on every allocate/free and has been removed.
 
 	if (!task_free_thread_shard_set) {
 		task_free_thread_shard = __atomic_fetch_add(TASK_ATOMIC_PTR(&task_free_thread_seq), 1, __ATOMIC_RELAXED) &
@@ -791,7 +787,6 @@ task_get_free_task(struct instance *i)
 							false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
 				assert(task_atomic_load(&t->state) == TASK_STATE_UNUSED);
 				task_atomic_store(&t->state, TASK_STATE_ACTIVE);
-				task_atomic_inc(&i->tfd_pool_used);
 				return t;
 			}
 		}
@@ -1718,6 +1713,7 @@ worker_destroy(struct worker *w)
 
 	if (w == NULL) return;
 	i = w->instance;
+	bool was_started = w->started;
 
 	// Make sure the thread has actually exited before freeing its state.
 	// The self-join guard covers the hard-shutdown path.
@@ -1728,10 +1724,16 @@ worker_destroy(struct worker *w)
 		w->started = 0;
 	}
 
-	// A worker must never be destroyed with a deferred close still pinned:
-	// that task would have no route to teardown.  worker_cleanup() drains the
-	// list, and the final instance nuke is the only other escape hatch.
-	assert(task_atomic_load(&w->close_head) == TASK_CLOSE_EMPTY);
+	// A worker that ran must never be destroyed with a deferred close still
+	// pinned: that task would have no route to teardown.  A worker that was
+	// created but never started has no thread to drain its list; its tasks are
+	// reaped by instance_nuke_tasks() after every worker has been released, so
+	// the stale index list is simply discarded here.
+	if (was_started) {
+		assert(task_atomic_load(&w->close_head) == TASK_CLOSE_EMPTY);
+	} else {
+		task_atomic_store(&w->close_head, TASK_CLOSE_EMPTY);
+	}
 
 	// Remove from instance's list of IO workers
 	if (w->type == WORKER_TYPE_IO) {
@@ -2438,7 +2440,6 @@ instance_tfd_pool_init(struct instance *i, uint32_t pool_size)
 	}
 	pool_size = (uint32_t)wanted;
 
-	i->tfd_pool_used = 0;
 	i->tfd_pool_size = pool_size;
 
 	// Grow the persistent per-slot generation table if necessary.  The table is

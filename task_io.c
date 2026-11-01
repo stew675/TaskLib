@@ -433,7 +433,7 @@ task_create(struct instance *i, int type, int fd, struct worker *w, void *close_
 	t->type = type;
 	task_atomic_store(&t->stride->close_cb, close_cb);
 	task_atomic_store(&t->stride->close_cb_data, close_cb_data);
-	task_atomic_inc(&w->num_tasks);
+	__atomic_add_fetch(&w->num_tasks, 1, __ATOMIC_RELAXED);
 
 	// task_get_free_tfd() already locked the task for us
 	return t;

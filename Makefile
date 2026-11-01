@@ -46,6 +46,11 @@ check:		$(TASK_DEPS)
 check-asan:	$(TASK_DEPS)
 		CC="$(GCC)" EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" ./tests/run.sh
 
+# ThreadSanitizer is diagnostic: the adaptive ticket locks and a few
+# intentionally race-tolerant loads may produce reports that need triage.
+check-tsan:	$(TASK_DEPS)
+		CC="$(GCC)" EXTRA_CFLAGS="-fsanitize=thread -fno-omit-frame-pointer" ./tests/run.sh
+
 clean:
 	rm -f echoes echoes-asan echoes-prof load_gen load_gen-asan load_gen-prof
 	rm -f *.gcda *.gcno *.gcov *.gcov.* *.gcov-* gmon.out core
